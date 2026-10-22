@@ -2084,16 +2084,60 @@ class ModuleSideEffectsRule:
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
     fixable: ClassVar[bool] = False
     declarative_calls: tuple[str, ...] = (
-        "getLogger", "compile", "TypeVar", "ParamSpec", "NewType", "TypeAliasType",
-        "ContextVar", "Lock", "RLock", "APIRouter", "partial", "UUID", "Option",
-        "lazy_import", "frozenset", "tuple", "dict", "set", "list", "Path",
-        "namedtuple", "NamedTuple", "MappingProxyType", "field", "cast", "object",
-        "deque", "defaultdict", "Counter", "OrderedDict", "import_module", "mark",
-        "skipif", "usefixtures", "fixture", "param", "parametrize", "datetime",
-        "timedelta", "date", "Enum", "auto", "Config", "dataclass", "Final",
-        "join", "len", "maketrans", "fromkeys", "sorted", "range", "default_rng",
+        "getLogger",
+        "compile",
+        "TypeVar",
+        "ParamSpec",
+        "NewType",
+        "TypeAliasType",
+        "ContextVar",
+        "Lock",
+        "RLock",
+        "APIRouter",
+        "partial",
+        "UUID",
+        "Option",
+        "lazy_import",
+        "frozenset",
+        "tuple",
+        "dict",
+        "set",
+        "list",
+        "Path",
+        "namedtuple",
+        "NamedTuple",
+        "MappingProxyType",
+        "field",
+        "cast",
+        "object",
+        "deque",
+        "defaultdict",
+        "Counter",
+        "OrderedDict",
+        "import_module",
+        "mark",
+        "skipif",
+        "usefixtures",
+        "fixture",
+        "param",
+        "parametrize",
+        "datetime",
+        "timedelta",
+        "date",
+        "Enum",
+        "auto",
+        "Config",
+        "dataclass",
+        "Final",
+        "join",
+        "len",
+        "maketrans",
+        "fromkeys",
+        "sorted",
+        "range",
+        "default_rng",
         "count",
-    )  # fmt: skip
+    )
     """Callee names whose module-level call builds a value rather than acting."""
 
     def check(self, unit: Unit, /) -> Sequence[Finding]:
@@ -3332,6 +3376,65 @@ class SuppressionFormRule:
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
+class FmtDirectiveRule:
+    """No ``# fmt: skip`` / ``# fmt: off``: shape the code so ruff's layout reads.
+
+    A formatter opt-out exempts the line from the 88-column budget too, since
+    E501 is off and ruff format is what enforces the width; a skipped line
+    can grow without bound. The one exemption is the polyglot header, where
+    ``# fmt: off`` keeps ruff from rewriting the shell preamble the ``cli``
+    skill pins (``_POLYGLOT_HEADER``).
+    """
+
+    name: ClassVar[str] = "fmt-directive"
+    kinds: ClassVar[frozenset[str]] = frozenset({"python"})
+    fixable: ClassVar[bool] = False
+
+    def check(self, unit: Unit, /) -> Sequence[Finding]:
+        """Report each formatter directive outside the polyglot header.
+
+        Args:
+          unit: The file under inspection.
+
+        Returns:
+          findings: One per directive, in source order.
+
+        """
+        if "fmt:" not in unit.source:
+            return ()
+        header = _polyglot_header_rows(unit.source.splitlines())
+        return tuple(
+            Finding(
+                path=unit.path,
+                line=tok.start[0],
+                rule=self.name,
+                message=(
+                    "formatter opt-out; delete it and reshape the code so "
+                    "`ruff format`'s own layout reads (name a constant, split "
+                    "a helper, build the table from data)"
+                ),
+            )
+            for tok in unit.tokens
+            if tok.type == tokenize.COMMENT
+            and _FMT_DIRECTIVE.search(tok.string)
+            and tok.start[0] not in header
+        )
+
+    def fix(self, unit: Unit, /) -> str | None:
+        """No autofix: dropping the directive reflows code ruff must format.
+
+        Args:
+          unit: The file under inspection.
+
+        Returns:
+          rewritten: The full new source, or None when nothing changes.
+
+        """
+        del unit
+        return None
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
 class AnnotationImportRule:
     """A heavy module imported only for annotations lives under ``TYPE_CHECKING``.
 
@@ -4017,9 +4120,16 @@ class LoggingFstringRule:
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
     fixable: ClassVar[bool] = True
     methods: tuple[str, ...] = (
-        "debug", "info", "warning", "warn", "error", "exception", "critical",
-        "fatal", "log",
-    )  # fmt: skip
+        "debug",
+        "info",
+        "warning",
+        "warn",
+        "error",
+        "exception",
+        "critical",
+        "fatal",
+        "log",
+    )
     """Logger methods whose first positional is a lazily-formatted message."""
 
     def check(self, unit: Unit, /) -> Sequence[Finding]:
@@ -4838,11 +4948,27 @@ _RUFF_NOQA_HEADER = re.compile(
 )
 _SENTENCE_END: Final = (".", ":", "?", "!", ")", '"', "`", "--")
 _EXEMPT_PREFIXES: Final = (
-    "!", "noqa", "type:", "pyright:", "ruff:", "fmt:", "vim:", "copybarista:",
-    "house-ignore", "TODO", "FIXME", "NOTE",
-    "isort:", "pragma:", "shellcheck", "mypy:", "ty:", "pyrefly:", "nosec",
+    "!",
+    "noqa",
+    "type:",
+    "pyright:",
+    "ruff:",
+    "fmt:",
+    "vim:",
+    "copybarista:",
+    "house-ignore",
+    "TODO",
+    "FIXME",
+    "NOTE",
+    "isort:",
+    "pragma:",
+    "shellcheck",
+    "mypy:",
+    "ty:",
+    "pyrefly:",
+    "nosec",
     "codespell:",
-)  # fmt: skip
+)
 _LOWER_WORD = re.compile(r"([a-z]+)[,.:;]?")
 _BANNER = re.compile(r"^[-=\u2500]{2,}(?:\s.*\s[-=\u2500]{2,})?\.?$")
 """A ``# -- title ----`` section divider; a ruler, not a sentence."""
@@ -4867,6 +4993,9 @@ _SUPPRESSION = re.compile(
     r"|(?:pyright|ty|pyrefly):\s*ignore\[[^\]]*\]"
     r"|house-ignore\[[^\]]*\])",
 )
+_FMT_DIRECTIVE = re.compile(r"#\s*fmt:\s*(?:skip|off|on)\b")
+"""A ruff/black formatter directive, ``on`` included: it only pairs an ``off``."""
+
 _REASON_AFTER = re.compile(r"\s*--\s+\S.*?\.\s*(?:#|$)")
 """The tail a suppression must carry: ``-- Reason.`` ending before the line or next ``#``."""
 
@@ -8078,3 +8207,25 @@ def _listed(value: object) -> list[object]:
         return from_plain(value, list[object], default=[])
     except ReadError:
         return []
+
+
+def _polyglot_header_rows(lines: Sequence[str]) -> frozenset[int]:
+    """Return the 1-based rows of a polyglot header's ``fmt: off`` and ``fmt: on``."""
+    start = next(
+        (
+            i
+            for i, line in enumerate(lines[:-1])
+            if line.startswith(_POLYGLOT_HEADER[0])
+            and lines[i + 1] == _POLYGLOT_HEADER[1]
+        ),
+        None,
+    )
+    if start is None:
+        return frozenset[int]()
+    close = next(
+        (j for j in range(start + 2, len(lines)) if lines[j].startswith("'''")),
+        len(lines),
+    )
+    after = close + 1
+    paired = after < len(lines) and _FMT_DIRECTIVE.search(lines[after]) is not None
+    return frozenset({start + 1, after + 1} if paired else {start + 1})
