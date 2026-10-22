@@ -219,6 +219,7 @@ def default_rules() -> tuple[Rule, ...]:
             houselint_rules.CommentSentenceRule(),
             houselint_rules.CliShapeRule(),
             houselint_rules.SuppressionFormRule(),
+            houselint_rules.FmtDirectiveRule(),
             houselint_rules.AnnotationImportRule(),
             houselint_rules.FinalInlineRule(),
             houselint_rules.SingleUseHelperRule(),

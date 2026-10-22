@@ -30,6 +30,7 @@ from codedoctor.lint.houselint_rules import (
     DottedImportRule,
     EmDashRule,
     FinalInlineRule,
+    FmtDirectiveRule,
     ForwarderHelperRule,
     GetLoggerNameRule,
     ImportAliasRule,
@@ -133,6 +134,7 @@ def test_every_new_rule_is_registered_and_satisfies_the_protocol() -> None:
     assert len(names) == len(set(names))
     assert "emdash" in names
     assert "module-side-effects" in names
+    assert "fmt-directive" in names
 
 
 # -- emdash ------------------------------------------------------------------
@@ -3326,6 +3328,77 @@ def test_suppression_form_ignores_prose_mentioning_noqa(tmp_path: Path) -> None:
         SuppressionFormRule(),
         '"""Write ``# noqa: E501`` to silence the line-length check."""\n',
     )
+
+
+# -- fmt-directive ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "x = [1,   2]  # fmt: skip\n",
+        "x = [1,   2]  # fmt:skip\n",
+        "x = [1,   2]  # fmt: skip  # -- Hand-aligned.\n",
+        "# fmt: off\nx = [1,   2]\n# fmt: on\n",
+        "def f() -> None:\n    # fmt: off\n    x = [1,   2]\n",
+        "x = [1,   2]  # noqa: E501 -- Wide.  # fmt: skip\n",
+    ],
+)
+def test_fmt_directive_flags_each_formatter_opt_out(tmp_path: Path, body: str) -> None:
+    findings = _findings(tmp_path, FmtDirectiveRule(), body)
+    assert [f.line for f in findings] == [
+        n for n, line in enumerate(body.splitlines(), start=1) if "fmt:" in line
+    ]
+    assert all("ruff format" in f.message for f in findings)
+
+
+def test_fmt_directive_exempts_the_polyglot_header(tmp_path: Path) -> None:
+    """The ``cli`` skill pins ``# fmt: off`` so ruff keeps the shell preamble."""
+    body = (
+        "#!/bin/sh\n"
+        "# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.\n"
+        "# fmt: off\n"
+        "'''' 2>/dev/null #\n"
+        'exec uv run python3 "$0" "$@"\n'
+        "Doc.\n"
+        "'''\n"
+        "# fmt: on\n"
+        "x = 1\n"
+    )
+    assert not _findings(tmp_path, FmtDirectiveRule(), body)
+
+
+def test_fmt_directive_flags_an_opt_out_after_the_header(tmp_path: Path) -> None:
+    body = (
+        "#!/bin/sh\n"
+        "# fmt: off\n"
+        "'''' 2>/dev/null #\n"
+        "'''\n"
+        "# fmt: on\n"
+        "x = [1,   2]  # fmt: skip\n"
+    )
+    assert [f.line for f in _findings(tmp_path, FmtDirectiveRule(), body)] == [6]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "x = 1\n",
+        '"""Write ``# fmt: skip`` to keep a line."""\n',
+        "x = '# fmt: off\\n'\n",
+        "# The fmt: skip directive is banned here.\n",
+    ],
+)
+def test_fmt_directive_ignores_mentions_and_clean_files(
+    tmp_path: Path,
+    body: str,
+) -> None:
+    assert not _findings(tmp_path, FmtDirectiveRule(), body)
+
+
+def test_fmt_directive_has_no_fix(tmp_path: Path) -> None:
+    """Dropping the directive reflows the code; ruff, not houselint, does that."""
+    assert _fixed(tmp_path, FmtDirectiveRule(), "x = [1,   2]  # fmt: skip\n") is None
 
 
 # -- annotation-import -----------------------------------------------------
