@@ -84,10 +84,15 @@ Issues = "https://github.com/rekursiv-ai/codedoctor/issues"
 Changelog = "https://github.com/rekursiv-ai/codedoctor/releases"
 
 [project.optional-dependencies]
-# The `mutation` gate.
+# The `coverage_floor` gate.
+coverage = [
+    "coverage>=7.16.2",
+]
+# The `mutation` gate. Its pytest plugins import pytest.
 mutation = [
     "libcst",
     "mutmut>=3.7.0",
+    "pytest>=7.0",
     "tomlkit>=0.15.1",
     "wrapt",
 ]
@@ -108,8 +113,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["codedoctor"]
-# The vendored pytest harness imports pytest, a test-group dependency.
-exclude = ["**/*_test.py", "**/conftest.py", "codedoctor/lib/testing/**"]
+# The vendored pytest harness imports pytest, a test-group dependency; the
+# gates' stand-ins serve only their tests.
+exclude = ["**/*_test.py", "**/conftest.py", "codedoctor/lib/testing/**", "codedoctor/gate/fakes.py"]
 artifacts = ["codedoctor/py.typed"]
 
 [tool.hatch.build.targets.sdist]

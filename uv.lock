@@ -240,9 +240,13 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+coverage = [
+    { name = "coverage" },
+]
 mutation = [
     { name = "libcst" },
     { name = "mutmut" },
+    { name = "pytest" },
     { name = "tomlkit" },
     { name = "wrapt" },
 ]
@@ -320,15 +324,17 @@ typecheck = [
 
 [package.metadata]
 requires-dist = [
+    { name = "coverage", marker = "extra == 'coverage'", specifier = ">=7.16.2" },
     { name = "libcst", marker = "extra == 'mutation'" },
     { name = "mutmut", marker = "extra == 'mutation'", specifier = ">=3.7.0" },
+    { name = "pytest", marker = "extra == 'mutation'", specifier = ">=7.0" },
     { name = "rignore", specifier = ">=0.8.1" },
     { name = "tomlkit", marker = "extra == 'mutation'", specifier = ">=0.15.1" },
     { name = "treekle", git = "https://github.com/rekursiv-ai/treekle?branch=main" },
     { name = "typing-extensions" },
     { name = "wrapt", marker = "extra == 'mutation'" },
 ]
-provides-extras = ["mutation"]
+provides-extras = ["coverage", "mutation"]
 
 [package.metadata.requires-dev]
 debug = [

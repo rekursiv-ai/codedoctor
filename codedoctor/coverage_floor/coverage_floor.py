@@ -33,7 +33,7 @@ from coverage import results
 
 import coverage
 
-from codedoctor.lib.testing.resources import kernel_pins
+from codedoctor.lib.kernel_pins import kernel_pins
 from codedoctor.lib.worker_count import capped_workers, default_workers, worker_count
 
 
