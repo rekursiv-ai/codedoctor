@@ -476,7 +476,7 @@ back(id, depth) AS (
     -- The suffix match is anchored on a COMPONENT BOUNDARY, via `_boundary`:
     -- a dotted module path is a sequence of components, not a string, and a
     -- bare `LIKE '%' || name` matched any tail -- importing stdlib `types`
-    -- claimed `trackinizer/trax/run/custom_types.py`, `time` claimed
+    -- claimed `endpoints/claude/custom_types.py`, `time` claimed
     -- `sagent/types/runtime.py`. Same defect as the `replace(path, '.py', '')`
     -- above, one operand over.
     AND (
