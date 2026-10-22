@@ -371,7 +371,7 @@ def test_an_import_matches_a_whole_module_component_not_a_bare_suffix(
     `custom_types.py` ends in those same five characters, so an unanchored
     suffix match reported the import as satisfied and admitted the edge. Real
     instance: importing `types` claimed
-    `trackinizer/trax/run/custom_types.py`, and importing `time` claimed
+    `endpoints/claude/custom_types.py`, and importing `time` claimed
     `sagent/types/runtime.py`. 13 of 133 admitted rows on this repository.
 
     Uses the AMBIGUOUS `Widget`, since that is the only path where the import
