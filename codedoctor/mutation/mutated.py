@@ -88,7 +88,7 @@ import tomlkit
 from codedoctor.affected.affected import harvest
 from codedoctor.lib import pyproject_flags
 from codedoctor.lib.files import tempclaim, walk
-from codedoctor.lib.testing.resources import kernel_pins
+from codedoctor.lib.kernel_pins import kernel_pins
 from codedoctor.lib.worker_count import capped_workers, default_workers, worker_count
 
 
