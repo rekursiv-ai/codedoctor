@@ -1,0 +1,468 @@
+# NEVER EDIT THIS FILE!
+
+# Universal Style and Quality Enforcement
+# Pre-commit/pre-push checks _and_ source-of-truth for Github workflows.
+#
+# Usage:
+#   The `pre-commit` dependency group supplies every tool the hooks below
+#   invoke. Naming it explicitly is belt-and-braces, NOT a requirement: uv
+#   defaults `default-groups` to `["dev"]`, and pyproject's `dev` includes
+#   `pre-commit`, so a bare `uv run` already resolves the tools (verified on a
+#   scratch project). Name it anyway so the command does not depend on that
+#   chain staying intact.
+#
+#     uv --quiet run --frozen --group pre-commit pre-commit install
+#     uv --quiet run --frozen --group pre-commit pre-commit autoupdate
+#     uv --quiet run --frozen --group pre-commit pre-commit run --all-files
+#
+#   May need: git config --unset-all core.hooksPath
+#     if: [ERROR] Cowardly refusing to install hooks with `core.hooksPath` set.
+#
+#   Stages. `default_stages: [pre-commit]` below means a bare `run` sees only
+#   the pre-commit hooks; the heavy ones (ty-check-global, basedpyright-global,
+#   pytest*) declare `stages: [pre-push]` and need it named explicitly:
+#
+#     uv --quiet run --frozen --group pre-commit pre-commit run --all-files
+#     uv --quiet run --frozen --group pre-commit pre-commit run --all-files --hook-stage pre-push
+#     uv --quiet run --frozen --group pre-commit pre-commit run --all-files --hook-stage commit-msg
+#
+#   Always pass --files or --all-files. Bare `run` (and the hook `git commit`
+#   fires on a dirty tree) STASHES your changes -- a git mutation, and this
+#   worktree is shared.
+#
+#
+#   NUL-delimited, per AGENTS.md: a path containing a space becomes two
+#   arguments under `$(...)` or a bare `xargs`, and a rename record yields the
+#   name that no longer exists.
+#
+#   # Harvest all changed files from the perspective of CWD.
+#     git -C "$(git rev-parse --show-toplevel)" diff -z --name-only --diff-filter=d HEAD \
+#       | xargs -0 --no-run-if-empty uv --quiet run --frozen --group pre-commit pre-commit run --files
+#
+#   # Run only the files from the CWD.
+#     git --no-pager diff -z --name-only --cached --relative \
+#       | xargs -0 --no-run-if-empty uv --quiet run --frozen --group pre-commit pre-commit run --files
+#
+#   # Run all the files from CWD.
+#     uv --quiet run --frozen --group pre-commit pre-commit run --files $(git ls-files .)
+#
+#   One hook at a time, by id (`ruff-check`, `ty-check`, `pytest-global`, ...):
+#     uv --quiet run --frozen --group pre-commit pre-commit run ruff-check --all-files
+#     uv --quiet run --frozen --group pre-commit pre-commit run pytest-global --hook-stage pre-push
+#
+#   Force full pytest tiers despite testmon's warm dependency database:
+#     PYTEST_FORCE_ALL=1 uv --quiet run --frozen --group pre-commit pre-commit run pytest-global --hook-stage pre-push
+#
+#   Individual tests: the pytest hooks take no test selector, so call pytest
+#   directly.
+#
+#     uv --quiet run --frozen --group pre-commit pytest path/to/thing_test.py
+#     uv --quiet run --frozen --group pre-commit pytest path/to/thing_test.py::test_name
+#     uv --quiet run --frozen --group pre-commit pytest -k some_substring path/to/
+#     uv --quiet run --frozen --group pre-commit pytest -n 5 path/to/
+#
+#   Marker tiers mirror the pytest-slow-global / -ci-smoke-global /
+#   -integration-global hooks; the
+#   default `-m` filter lives in pyproject addopts, so ask for them by name:
+#
+#     uv --quiet run --frozen --group pre-commit pytest -m slow path/to/
+#
+#   Skipping. SKIP takes hook ids, comma-separated, and reports "Skipped":
+#
+#     SKIP=ruff-check uv --quiet run --frozen --group pre-commit pre-commit run --all-files
+#     SKIP=pytest-global,pytest-slow-global uv --quiet run --frozen --group pre-commit pre-commit run --hook-stage pre-push --all-files
+#
+#   `git commit --no-verify` / `git push --no-verify` bypass every hook. Both
+#   are a last resort, not a way past a red gate -- the gates are house rules
+#   (see AGENTS.md "Never suppress gates"). Fix the code the hook protects.
+#   The legitimate use is an unrelated pre-existing failure blocking an
+#   urgent unrelated commit; say so in the commit message when you do it.
+#
+#
+# On Source of Truthness:
+#
+#   Preferred location for any tool setting, in order:
+#     pyproject.toml  >  .pre-commit-config.yaml  >  .github/workflows/ci.yml
+#
+#   Put a setting as high in this chain as the tool allows. Only drop to a
+#   lower file when the higher one cannot express it (e.g. a CLI-only flag with
+#   no config key). pyproject.toml holds tool config; .pre-commit-config.yaml
+#   is the sole source for how hooks run (thread/worker counts, heap caps);
+#   .github/workflows/ci.yml only invokes the hooks and must not redefine
+#   any of these.
+#
+#
+# Design Philosophy;
+#
+#   Only fail if there's things which cannot be auto-fixed.
+#   Hooks fix files in place; if anything changes, pre-commit reports
+#   "files were modified" and the commit is aborted. Run `git add -u`
+#   then re-commit -- the second attempt always passes.
+#
+# See also:
+#
+#   https://pre-commit.com
+#   https://pre-commit.com/hooks.html
+#   https://learn.scientific-python.org/development/guides/style/
+
+fail_fast: false
+default_stages: [pre-commit]
+
+repos:
+
+  # === Pre-Commit Gates =======================================================
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+
+      - id: end-of-file-fixer
+        name: end-of-file-fixer
+        stages: [pre-commit]
+        exclude: |
+          (?x)^(
+            (.*/)?third_party/
+          )
+
+      - id: trailing-whitespace
+        name: trailing-whitespace
+        stages: [pre-commit]
+        exclude: |
+          (?x)^(
+            (.*/)?third_party/
+          )
+
+      - id: check-added-large-files
+        name: check-added-large-files
+        stages: [pre-commit]
+        args: [--maxkb=800, --enforce-all]
+        exclude: |
+          (?x)^(
+            uv\.lock
+            |typings/
+            |(.*/)?chrome/chrome_(desktop|android)_useragents\.txt
+          )
+
+      - id: check-merge-conflict
+        name: check-merge-conflict
+        stages: [pre-commit]
+        args: [--assume-in-merge]
+
+      - id: check-yaml
+        name: check-yaml
+        stages: [pre-commit]
+
+      - id: check-toml
+        name: check-toml
+        stages: [pre-commit]
+
+  # Type-checks `${{ }}` expressions, action inputs, runner labels, and `run:`
+  # shell. A workflow expression error fails the job in 0s with no log, so
+  # nothing downstream catches it; `check-yaml` only proves the file parses.
+  # Self-selects on `^\.github/workflows/`.
+  #
+  # `actionlint`, not `-docker`/`-system`: only the golang hook provisions
+  # itself. `-docker` needs a daemon this host lacks, `-system` a hand-installed
+  # binary -- both fail closed on a fresh checkout, which is how the tool went
+  # uninstalled while the docs cited it.
+  #
+  # SC2016 only: the export workflows single-quote
+  # `--validation-command 'wheel="$wheel" ...'` deliberately -- those `$` belong
+  # to the inner shell, so "expressions don't expand" inverts the intent. Every
+  # other shellcheck rule stays live, and shellcheck runs only where installed,
+  # so this is stricter on CI than on a dev box.
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+        name: actionlint
+        stages: [pre-commit]
+        args: [-ignore, "SC2016:"]
+
+  # Validates uv.lock matches pyproject.toml (no network needed).
+  # Run `uv lock` manually when changing dependencies.
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.12.17
+    hooks:
+
+      - id: uv-lock
+        name: uv-lock
+        stages: [pre-commit]
+        files: ^(pyproject\.toml|uv\.lock)$
+
+  - repo: local
+    hooks:
+      # Worker counts. Every heavy hook below sizes its own pool with
+      # `gate.workers`, which falls back to
+      # `codedoctor.lib.worker_count.default_workers`, whose docstring derives the
+      # formula, and runs below interactive priority. Overrides, most specific
+      # first: `WORKERS_<HOOK_ID>` (`WORKERS_PYTEST_GLOBAL=1`),
+      # then `WORKERS_DEFAULT`. Per hook is what CI needs: the integration tier
+      # holds ~1.8 GB of torch/jax per worker and OOM-killed a 2-vCPU runner at
+      # two, while a type checker on the same box wants more.
+      #
+      - id: codespell
+        name: codespell
+        language: system
+        stages: [pre-commit]
+        types_or: [python, markdown, jupyter, shell]
+        entry: uv --quiet run --frozen --group pre-commit codespell
+        args: [-w]
+        exclude: |
+          (?x)^(
+            typings/
+            |(.*/)?third_party/
+            |docs/symbols\.md
+          )
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.8
+    hooks:
+      # Exclusions defined in pyproject.toml.
+      #
+      # `require_serial: true` on all: ruff is rayon-parallel, so pre-commit's
+      # argv partitioning stacks cpu_count saturating processes on top. Cheap
+      # here (sub-second tree-wide), same defect `basedpyright` below documents.
+      #
+      # format -> check --fix -> format, deliberately. COM812 is enabled so
+      # that any bracket the formatter wraps gets a trailing comma and is
+      # exploded one-element-per-line. The formatter's hug layout has no
+      # trailing comma, so COM812 only fires AFTER a format pass; the second
+      # format honors the comma it added. The single check->format order
+      # upstream documents converges only on the next commit attempt.
+      # COM812 is ignored in pyproject.toml (it makes `ruff format` warn) and
+      # selected only here: format -> fix (adds trailing comma to compact
+      # multi-line args) -> format (explodes them one-per-line). Dropping
+      # `--extend-select COM812` silently loses that explosion (ruff#9216).
+      - id: ruff-format
+        name: ruff-format-pre
+        stages: [pre-commit]
+        require_serial: true
+        types_or: [python, pyi, jupyter]
+      - id: ruff-check
+        name: ruff-check
+        stages: [pre-commit]
+        require_serial: true
+        types_or: [python, pyi, jupyter]
+        args: [--fix, --extend-select, COM812]
+      - id: ruff-format
+        name: ruff-format
+        stages: [pre-commit]
+        require_serial: true
+        types_or: [python, pyi, jupyter]
+
+  - repo: local
+    hooks:
+      # No official ty hook yet (https://github.com/astral-sh/ty/issues/269).
+      # The `typecheck` module holds these gates: each runs once over the
+      # files its `-spool` twin collected, sizes its own workers, and drops
+      # what `[tool.pyrefly] project-excludes` names. `pyrefly-check` checks
+      # the files `ty-check` checked, so a graph walk runs once.
+      #
+      # Each twin's `alias` is its gate's id, so `pre-commit run ty-check`
+      # selects both; a gate whose spool was never written fails rather than
+      # pass on nothing.
+      #
+      # `require_serial: true`: the checkers saturate every core alone, and
+      # pre-commit would otherwise run cpu_count of them at once.
+      - id: ty-check-spool
+        name: ty-check-spool
+        alias: ty-check
+        language: system
+        stages: [pre-commit]
+        require_serial: true
+        types_or: [python, pyi]
+        entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate spool ty-check
+      - id: ty-check
+        name: ty-check
+        language: system
+        stages: [pre-commit]
+        require_serial: true
+        pass_filenames: false
+        # See `superseded-at-pre-push` at the head of the Pre-Push Gates section.
+        alias: superseded-at-pre-push
+        types_or: [python, pyi]
+        entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.typecheck ty-check
+      # Off: `pyrefly-check` is the checker. Run with `--hook-stage manual`.
+      # Named files bypass pyproject's `[tool.basedpyright] exclude`, so the
+      # twin's exclude mirrors it.
+      - id: basedpyright-spool
+        name: basedpyright-spool
+        alias: basedpyright
+        language: system
+        stages: [manual]
+        require_serial: true
+        types_or: [python, pyi]
+        entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate spool basedpyright
+        exclude: |
+          (?x)^(
+            typings/
+            |(.*/)?third_party/
+          )
+      - id: basedpyright
+        name: basedpyright
+        language: system
+        stages: [manual]
+        # Pre-commit discards a PASSING hook's output (see the Pre-Push Gates
+        # note on `verbose`); this keeps basedpyright's summary line visible.
+        verbose: true
+        require_serial: true
+        pass_filenames: false
+        types_or: [python, pyi]
+        entry: >-
+          env NODE_OPTIONS=--max-old-space-size=2048
+          uv --quiet run --frozen --group pre-commit python -m codedoctor.typecheck
+          basedpyright
+      # Default type checker; `basedpyright` above runs only under
+      # `--hook-stage manual`.
+      - id: pyrefly-check-spool
+        name: pyrefly-check-spool
+        alias: pyrefly-check
+        language: system
+        stages: [pre-commit]
+        require_serial: true
+        types_or: [python, pyi]
+        entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate spool pyrefly-check
+      - id: pyrefly-check
+        name: pyrefly-check
+        language: system
+        stages: [pre-commit]
+        require_serial: true
+        pass_filenames: false
+        # See `superseded-at-pre-push` at the head of the Pre-Push Gates section.
+        alias: superseded-at-pre-push
+        types_or: [python, pyi]
+        entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.typecheck pyrefly-check
+  - repo: local
+    hooks:
+      # Each heavy hook below is a `-spool` twin, which collects pre-commit's
+      # file chunks, then the hook, which runs once over all of them through
+      # the `gate` or `testing` module at this machine's worker count.
+      #
+      # Runs the tests PAIRED with each changed file (`x_test.py`, `test_x.py`,
+      # beside it or under `tests/`), then applies `fail_under` to the changed
+      # sources alone. ~1s, versus the whole suite at pre-push. Green with no
+      # pair found means "untested", acceptable only because pre-push is the
+      # gate. Exit 5 (nothing collected) passes: a selection whose every test
+      # carries a deselected marker is not a failure.
+      #
+      #
+      # `-n` only from 16 test files (SIDECAR_XDIST_MIN overrides): xdist's ~5s
+      # startup lost below that on the 16-thread workstation at 5 workers.
+      #
+      #   files    8    12    16    20    60
+      #   serial  5.7s  7.6s  6.8s  12.4s 27.8s
+      #   -n5     8.1s  9.0s  7.5s   8.0s 16.3s
+      #
+      # Coverage targets are directories, never dotted modules: coverage
+      # imports a dotted target's package before collection, and a package
+      # importing torch then fails every later torch import.
+      - id: pytest-spool
+        name: pytest-spool
+        # `run pytest` selects this twin too, so its spool exists.
+        alias: pytest
+        language: system
+        stages: [pre-commit]
+        require_serial: true
+        types: [python]
+        entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.gate spool pytest
+      - id: pytest
+        name: pytest
+        language: system
+        stages: [pre-commit]
+        require_serial: true
+        pass_filenames: false
+        # A passing hook's output is discarded otherwise, which made "did any
+        # test run at all?" unanswerable from a green line.
+        verbose: true
+        # See `superseded-at-pre-push` at the head of the Pre-Push Gates section.
+        alias: superseded-at-pre-push
+        types: [python]
+        entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing pytest
+  # === Pre-Push Gates =========================================================
+  #
+  # To enable:  uv run pre-commit install --hook-type pre-push
+  # To disable: uv run pre-commit uninstall --hook-type pre-push
+  #
+  # `ty-check`, `pyrefly-check` and `pytest` above each answer a strictly weaker
+  # question than a hook here, so all three carry
+  # `alias: superseded-at-pre-push` -- a plain `SKIP=` selector letting a lane
+  # that runs the pre-push tier drop them in one token, with no hook ids to
+  # drift. pre-commit skips every hook sharing an alias.
+  #
+  # Not cosmetic: the per-file `basedpyright` turned repo-wide when CI's
+  # periodic lane ran the commit stage `--all-files` (passing filenames also
+  # voids pyproject's excludes), and on a 2-vCPU runner it blew the 30-minute
+  # job cap while `basedpyright-global` answered the same question in 12.
+  #
+  # The pytest tiers are defined in the `testing` module's `tiers.py`: each
+  # tier's marker, empty-collection tolerance and capability guard, and the
+  # rules for when testmon may select. `verbose: true` because pre-commit prints
+  # a PASSING hook's output only under it, and every tier runs for minutes.
+
+  - repo: local
+    hooks:
+      - id: ty-check-global
+        name: ty-check-global
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-push]
+        entry: uv --quiet run --frozen --group pre-commit ty check
+        # Exclusions defined in pyproject.toml.
+
+      - id: basedpyright-global
+        name: basedpyright-global
+        language: system
+        always_run: true
+        pass_filenames: false
+        # Off: `pyrefly-check-global` is the checker. Run with `--hook-stage manual`.
+        stages: [manual]
+        entry: >-
+          env NODE_OPTIONS=--max-old-space-size=2048
+          uv --quiet run --frozen --group pre-commit python -m codedoctor.gate
+          threaded basedpyright-global -- basedpyright --threads={workers}
+
+      - id: pyrefly-check-global
+        name: pyrefly-check-global
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-push]
+        entry: >-
+          uv --quiet run --frozen --group pre-commit python -m codedoctor.gate
+          threaded pyrefly-check-global -- pyrefly check --threads={workers}
+
+      - id: pytest-global
+        name: pytest-global
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-push]
+        verbose: true
+        entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing tier pytest-global
+      - id: pytest-slow-global
+        name: pytest-slow-global
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-push]
+        verbose: true
+        entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing tier pytest-slow-global
+      - id: pytest-ci-smoke-global
+        name: pytest-ci-smoke-global
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-push]
+        verbose: true
+        entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing tier pytest-ci-smoke-global
+      - id: pytest-integration-global
+        name: pytest-integration-global
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-push]
+        verbose: true
+        entry: uv --quiet run --frozen --group pre-commit python -m codedoctor.testing tier pytest-integration-global
+# NEVER EDIT THIS FILE!

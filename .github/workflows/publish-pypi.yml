@@ -1,0 +1,46 @@
+name: Publish Python package
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Build and publish package to PyPI
+    runs-on: ubuntu-latest
+    # Bounded so a hung publish fails in minutes, not at the 6h default.
+    timeout-minutes: 20
+    environment: pypi
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+
+      - name: Build package
+        run: uv build --out-dir dist
+
+      - name: Validate built package
+        run: |
+          uv run python -c "import codedoctor; print(codedoctor.__file__)"
+
+      # Resolve the wheel against PyPI alone -- a symbol that exists only on
+      # treekle main fails HERE, before an irreversible upload, instead of in a
+      # user's `pip install`.
+      - name: Validate against published dependencies
+        run: |
+          wheels=(dist/codedoctor-*.whl)
+          uv run --isolated --with "${wheels[0]}" python -P -c "import codedoctor"
+
+      - name: Publish package
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          skip-existing: true
