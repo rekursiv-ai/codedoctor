@@ -3,7 +3,7 @@
 All notable codedoctor changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.1.1 - 2026-10-21
 
 ### Added
 

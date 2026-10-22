@@ -3,7 +3,7 @@
 
 [project]
 name = "codedoctor"
-version = "0.1.0"
+version = "0.1.1"
 description = "Pre-commit gates that run each heavy check once, sized to the machine."
 readme = "README.md"
 requires-python = ">=3.12"
