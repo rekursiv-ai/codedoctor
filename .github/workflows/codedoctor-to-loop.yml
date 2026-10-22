@@ -1,7 +1,7 @@
 # DO NOT EDIT -- generated from external-to-internal.yml.tmpl and this
 # package's sync config. Hand edits are overwritten; change
 # the template, the generator, or the sync config instead.
-name: "Codedoctor to Loop"
+name: "CodeDoctor to Loop"
 
 on:
   pull_request:
@@ -27,7 +27,7 @@ concurrency:
 
 jobs:
   import-change:
-    name: "Codedoctor to Loop into source"
+    name: "CodeDoctor to Loop into source"
     runs-on: ubuntu-latest
     # Bounded so a hung step fails in minutes, not at the 6h default.
     timeout-minutes: 45
@@ -38,7 +38,7 @@ jobs:
       TARGET_PROJECT_PATH: ${{ vars.COPYBARISTA_TARGET_PROJECT_PATH }}
       COPYBARISTA_TOOL_PROJECT_PATH: ${{ vars.COPYBARISTA_TOOL_PROJECT_PATH }}
       COPYBARISTA_IMPORT_BRANCH_PREFIX: "codedoctor/import/"
-      COPYBARISTA_SYNC_LABEL: "Codedoctor"
+      COPYBARISTA_SYNC_LABEL: "CodeDoctor"
       COPYBARISTA_SYNC_USER_NAME: "copybarista"
       COPYBARISTA_SYNC_USER_EMAIL: "rekursiv-bot@rekursiv.ai"
 
