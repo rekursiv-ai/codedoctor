@@ -55,4 +55,4 @@ jobs:
           uv run python -c "import codedoctor"
           rm -rf dist
           uv build --out-dir dist
-          wheels=(dist/codedoctor-*.whl); wheel="${wheels[0]}"; uv run --isolated --with "$wheel" --with "treekle @ git+https://github.com/rekursiv-ai/treekle@main" python -P -c "import codedoctor; print(codedoctor.__file__)"
+          wheels=(dist/codedoctor-*.whl); wheel="${wheels[0]}"; uv run --isolated --with "$wheel" python -P -c "import codedoctor; print(codedoctor.__file__)"
