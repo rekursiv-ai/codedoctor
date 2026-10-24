@@ -1022,7 +1022,7 @@ def test_missing_paired_tests_fails_without_running_a_repository_suite(
     _git(root, "init", "-q")
     (root / "pkg/fresh.py").write_text(_TWO_FUNCTIONS)
     monkeypatch.chdir(root)
-    monkeypatch.setattr(sys, "argv", ["mutated", "pkg/fresh.py"])
+    monkeypatch.setattr(sys, "argv", ["mutated", "--blocking", "pkg/fresh.py"])
 
     assert mutated.main() == 1
     captured = capsys.readouterr()
@@ -1052,7 +1052,7 @@ def test_a_surviving_mutant_is_reported_with_its_diff(
         "def test_first():\n    assert isinstance(first(2), int)\n",
     )
     monkeypatch.chdir(root)
-    monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py"])
+    monkeypatch.setattr(sys, "argv", ["mutated", "--blocking", "pkg/mod.py"])
 
     assert mutated.main() == 1
 
@@ -1945,7 +1945,53 @@ def test_main_reports_snapshot_preparation_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """An unusable snapshot fails its file, reported with the error's type."""
-    monkeypatch.chdir(tmp_path)
+    _unusable_snapshot(tmp_path, monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["mutated", "--blocking", "pkg/mod.py"])
+    assert mutated.main() == 1
+    captured = capsys.readouterr()
+    assert "mutation: pkg/mod.py: OSError: no snapshot\n" in captured.err
+    assert "  pkg/mod.py\n" in captured.out
+
+
+@pytest.mark.parametrize(
+    ("argv", "variable", "status"),
+    [
+        ([], None, 0),
+        ([], "0", 0),
+        ([], "yes", 0),
+        ([], "1", 1),
+        (["--blocking"], None, 1),
+    ],
+    ids=["unset", "zero", "not-a-count", "set", "flag"],
+)
+def test_a_finding_fails_the_run_only_when_blocking_is_on(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    argv: list[str],
+    variable: str | None,
+    status: int,
+) -> None:
+    if variable is None:
+        monkeypatch.delenv("PRECOMMIT_MUTATION_BLOCKING", raising=False)
+    else:
+        monkeypatch.setenv("PRECOMMIT_MUTATION_BLOCKING", variable)
+    _unusable_snapshot(tmp_path, monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["mutated", *argv, "pkg/mod.py"])
+
+    assert mutated.main() == status
+    out = capsys.readouterr().out
+    # Either way the finding is printed; advice says so instead of failing.
+    assert "  pkg/mod.py\n" in out
+    assert ("mutation: advisory, so nothing above fails this run" in out) is (
+        status == 0
+    )
+
+
+def _unusable_snapshot(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Select one function of ``pkg/mod.py`` whose snapshot cannot be laid out."""
+    monkeypatch.chdir(root)
     monkeypatch.setattr(mutated, "copy_template", Mock())
     monkeypatch.setattr(mutated, "_paired_tests", Mock(return_value=("t.py",)))
     monkeypatch.setattr(
@@ -1958,11 +2004,6 @@ def test_main_reports_snapshot_preparation_error(
         "copy_snapshot",
         Mock(side_effect=OSError("no snapshot")),
     )
-    monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py"])
-    assert mutated.main() == 1
-    captured = capsys.readouterr()
-    assert "mutation: pkg/mod.py: OSError: no snapshot\n" in captured.err
-    assert "  pkg/mod.py\n" in captured.out
 
 
 def test_an_unparsable_paired_test_fails_its_file_in_one_line(
@@ -1993,7 +2034,7 @@ def test_an_unparsable_paired_test_fails_its_file_in_one_line(
     )
     snapshot = Mock()
     monkeypatch.setattr(mutated, "copy_snapshot", snapshot)
-    monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py"])
+    monkeypatch.setattr(sys, "argv", ["mutated", "--blocking", "pkg/mod.py"])
 
     assert mutated.main() == 1
 

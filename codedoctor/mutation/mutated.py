@@ -18,12 +18,18 @@ single core, so more parents, not more children per parent, raise
 throughput. A line is written as each file finishes, and every surviving
 mutant is reported with its diff.
 
+Findings are advice: they are printed and the run exits 0, unless --blocking
+is given or PRECOMMIT_MUTATION_BLOCKING holds a positive integer; then any
+finding exits 1. A run that cannot select functions or lay out its snapshots
+exits 1 either way.
+
 Examples:
   mutated
   mutated pkg/lib
   mutated pkg/serialize.py
   mutated --explain pkg/serialize.py
   mutated --emit filters pkg/serialize.py
+  mutated --blocking pkg/serialize.py
 
 """
 
@@ -86,6 +92,7 @@ import libcst as cst
 import tomlkit
 
 from codedoctor.affected.affected import harvest
+from codedoctor.gate.gate import positive
 from codedoctor.lib import pyproject_flags
 from codedoctor.lib.files import tempclaim, walk
 from codedoctor.lib.kernel_pins import kernel_pins
@@ -99,7 +106,8 @@ def main() -> int:
     """Mutate-test the functions in the named files.
 
     Returns:
-      status: Zero on success; nonzero on failed or inconclusive mutations.
+      status: Nonzero when the run could not start, or when blocking is on and
+        it found failed or inconclusive mutations; zero otherwise.
 
     """
     parser = argparse.ArgumentParser(
@@ -163,7 +171,14 @@ def main() -> int:
     except (OSError, subprocess.CalledProcessError) as error:
         sys.stderr.write(f"mutation: cannot prepare the snapshot: {error}\n")
         return 1
-    return _print_reports(reports)
+    found = _print_reports(reports)
+    if found and not flags.blocking:
+        print(
+            "mutation: advisory, so nothing above fails this run; "
+            "PRECOMMIT_MUTATION_BLOCKING=1 makes it fail.",
+        )
+        return 0
+    return found
 
 
 def mutable_sources(root: Path) -> tuple[str, ...]:
@@ -656,6 +671,7 @@ class _Flags(Protocol):
     workers: int | None
     emit: str
     explain: bool
+    blocking: bool
 
 
 def _parse_args(
@@ -734,6 +750,12 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "--explain",
         action="store_true",
         help="Write the selected functions to stderr.",
+    )
+    parser.add_argument(
+        "--blocking",
+        action="store_true",
+        default=bool(positive(os.environ.get("PRECOMMIT_MUTATION_BLOCKING", ""))),
+        help="Exit 1 on any finding (default: PRECOMMIT_MUTATION_BLOCKING, or off).",
     )
 
 
