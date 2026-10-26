@@ -58,6 +58,7 @@ from codedoctor.lint.houselint_rules import (
     TempfilePrefixRule,
     TensorValueGuardRule,
     TmpLiteralRule,
+    TreekleTorchLoadRule,
     UnderscoreParamRule,
     UserdirsNamespaceRule,
     UserdirsWrapperRule,
@@ -4637,6 +4638,84 @@ def test_assert_is_reported_and_raised(tmp_path: Path) -> None:
         "def f(x: int) -> None:\n"
         "    if x <= 0:\n"
         '        raise ValueError("Expected x > 0.")\n'
+    )
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        "from_plain(torch.load(path), Corpus)",
+        "from_plain(cast(object, torch.load(path)), Corpus)",
+        "from_plain(\n    torch.load(path, weights_only=True),\n    dict[str, object],\n)",
+    ],
+)
+def test_treekle_over_a_torch_load_is_reported(tmp_path: Path, read: str) -> None:
+    body = f"corpus = {read}\n"
+    assert [f.line for f in _findings(tmp_path, TreekleTorchLoadRule(), body)] == [1]
+    assert _fixed(tmp_path, TreekleTorchLoadRule(), body) is None
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        "from_plain(state, dict[str, object])",
+        "from_plain(state['step']['model'], dict[str, Tensor])",
+        "from_plain(state.get('model'), dict[str, Tensor])",
+    ],
+)
+def test_treekle_over_a_payload_bound_to_a_name_is_reported(
+    tmp_path: Path,
+    read: str,
+) -> None:
+    body = f"state = torch.load(path, weights_only=True)\nmodel = {read}\n"
+    assert [f.line for f in _findings(tmp_path, TreekleTorchLoadRule(), body)] == [2]
+
+
+def test_a_to_plain_field_of_a_payload_is_not_reported(tmp_path: Path) -> None:
+    body = (
+        "payload = torch.load(path, weights_only=True)\n"
+        "config = from_plain(payload['config'], Model.Config, allow_imports=True)\n"
+    )
+    assert not _findings(tmp_path, TreekleTorchLoadRule(), body)
+
+
+def test_a_name_bound_to_a_plain_tree_is_not_reported(tmp_path: Path) -> None:
+    body = (
+        "state = torch.load(path)\n"
+        "config = json.loads(text)\n"
+        "model = from_plain(config['model'], Model)\n"
+    )
+    assert not _findings(tmp_path, TreekleTorchLoadRule(), body)
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        "cast(Corpus, torch.load(path))",
+        "from_plain(json.loads(text), Corpus)",
+        "from_plain(payload['config'], FPNet.Config)",
+    ],
+)
+def test_a_cast_load_or_a_plain_tree_read_is_not_reported(
+    tmp_path: Path,
+    read: str,
+) -> None:
+    body = f"corpus = {read}\n"
+    assert not _findings(tmp_path, TreekleTorchLoadRule(), body)
+
+
+def test_a_marked_assert_is_left_for_its_author(tmp_path: Path) -> None:
+    """``house-ignore[assert]`` keeps a check ``-O`` may drop; the fix skips it."""
+    body = (
+        "def f(x: float) -> None:\n"
+        "    assert x >= 0  # house-ignore[assert] -- Suppressible on purpose.\n"
+        "    assert x < 9\n"
+    )
+    assert _fixed(tmp_path, AssertRule(), body) == (
+        "def f(x: float) -> None:\n"
+        "    assert x >= 0  # house-ignore[assert] -- Suppressible on purpose.\n"
+        "    if x >= 9:\n"
+        '        raise ValueError("Expected x < 9.")\n'
     )
 
 

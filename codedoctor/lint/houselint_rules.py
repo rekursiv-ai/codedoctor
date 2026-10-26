@@ -36,6 +36,7 @@ import tokenize
 
 from treekle import ReadError, from_plain, json_loads
 
+from codedoctor.lint import house_ignore
 from codedoctor.lint.houselint_types import Finding, Unit, _tokenize
 
 
@@ -4040,6 +4041,11 @@ class AssertRule:
         for node in unit.nodes(ast.Assert):
             if _is_isinstance_test(node.test):
                 continue
+            # A marked assert is kept on purpose -- a check ``-O`` may drop,
+            # such as the non-negative base ahead of ``cast(float, x ** k)``.
+            here = Finding(path=unit.path, line=node.lineno, rule=self.name, message="")
+            if not house_ignore.apply(unit, [here], active=frozenset()):
+                continue
             end = node.end_lineno or node.lineno
             # The rewrite replaces whole lines, so an assert sharing a line
             # with other code (``if x: assert y``, ``assert y; z = 1``) is
@@ -4102,6 +4108,88 @@ class AssertRule:
                 f"{indent}    raise {exception}({message})\n",
             ]
         return "".join(lines)
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class TreekleTorchLoadRule:
+    """A ``torch.load`` payload is cast to its type, never read with ``from_plain``.
+
+    ``torch.load`` returns what ``torch.save`` pickled: tensors, not a plain
+    tree. ``from_plain`` over it checks only that a leaf is a ``Tensor`` --
+    never its shape, dtype or device -- while it drops keys the target does
+    not declare and refuses a file that lacks one, so a corpus written by an
+    older or newer writer stops loading. One ``cast(T, torch.load(...))`` to
+    the writer's ``TypedDict`` states the contract and reads every version; a
+    lone tensor narrows with ``isinstance``. The older spelling,
+    ``from_plain(cast(object, torch.load(...)), T)``, is the same read, and
+    so is a payload bound to a name first and read through it
+    (``state = torch.load(...)``, then ``from_plain(state["model"], T)``).
+    ``from_plain`` reads only what ``to_plain`` wrote, so a read with
+    ``allow_imports=True`` passes: only ``to_plain`` writes the ``py/*`` tags
+    that flag lets name code, as a payload's ``to_plain(config)`` field does.
+    """
+
+    name: ClassVar[str] = "treekle-torch-load"
+    kinds: ClassVar[frozenset[str]] = frozenset({"python"})
+    fixable: ClassVar[bool] = False
+
+    def check(self, unit: Unit, /) -> Sequence[Finding]:
+        """Report each ``from_plain`` whose input is a ``torch.load`` payload.
+
+        Args:
+          unit: The file under inspection.
+
+        Returns:
+          findings: One per violation, in source order.
+
+        """
+        if "torch.load" not in unit.source or "from_plain" not in unit.source:
+            return ()
+        loaded = {
+            target.id
+            for node in unit.nodes(ast.Assign, ast.AnnAssign)
+            if node.value is not None and _is_torch_load(node.value)
+            for target in (
+                node.targets if isinstance(node, ast.Assign) else [node.target]
+            )
+            if isinstance(target, ast.Name)
+        }
+        return tuple(
+            Finding(
+                path=unit.path,
+                line=call.lineno,
+                rule=self.name,
+                message=(
+                    "from_plain over a torch.load payload checks no shape and "
+                    "rejects older files; write cast(T, torch.load(...)) with the "
+                    "writer's TypedDict"
+                ),
+            )
+            for call in unit.nodes(ast.Call)
+            if isinstance(call.func, ast.Name)
+            and call.func.id == "from_plain"
+            and call.args
+            and (_is_torch_load(call.args[0]) or _read_root(call.args[0]) in loaded)
+            and not any(
+                keyword.arg == "allow_imports"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+                for keyword in call.keywords
+            )
+        )
+
+    def fix(self, unit: Unit, /) -> str | None:
+        """No autofix: the target type moves into a cast the author places.
+
+        Args:
+          unit: The file under inspection.
+
+        Returns:
+          rewritten: The full new source, or None when nothing changes.
+
+        """
+        del unit
+        return None
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -4547,6 +4635,36 @@ def _is_super_only(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     if node.args.kwarg:
         params.append(f"**{node.args.kwarg.arg}")
     return forwarded == params or forwarded == [f"{p}={p}" for p in params]
+
+
+def _is_torch_load(node: ast.expr) -> bool:
+    """Whether ``node`` is ``torch.load(...)``, bare or inside a ``cast``."""
+    if not isinstance(node, ast.Call):
+        return False
+    if _call_text(node) == "cast" and len(node.args) == 2:
+        return _is_torch_load(node.args[1])
+    return _call_text(node) == "torch.load"
+
+
+def _read_root(node: ast.expr) -> str:
+    """Return the name a read of ``node`` starts from, through subscripts, ``.get`` and casts."""
+    while True:
+        if isinstance(node, ast.Subscript | ast.Attribute):
+            node = node.value
+        elif (
+            isinstance(node, ast.Call)
+            and _call_text(node) == "cast"
+            and len(node.args) == 2
+        ):
+            node = node.args[1]
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+        ):
+            node = node.func.value
+        else:
+            return node.id if isinstance(node, ast.Name) else ""
 
 
 def _is_isinstance_test(test: ast.expr) -> bool:
