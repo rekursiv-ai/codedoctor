@@ -226,6 +226,7 @@ def default_rules() -> tuple[Rule, ...]:
             houselint_rules.ForwarderHelperRule(),
             houselint_rules.LazyImportCostRule(),
             houselint_rules.AssertRule(),
+            houselint_rules.TreekleTorchLoadRule(),
             houselint_rules.LoggingFstringRule(),
         ),
     )
@@ -715,9 +716,11 @@ def _lint_path(
             continue
         # A fixer never rewrites what its own check passes (the rules tests
         # assert it per fixture), and most files are clean, so the check
-        # gates the fix. Measured: fix cost 10-50x check on clean files.
+        # gates the fix. Measured: fix cost 10-50x check on clean files. A
+        # finding a house-ignore marker suppresses does not open the gate:
+        # the rewrite would leave that marker pointing at nothing.
         checked[rule.name] = rule.check(unit)
-        if not checked[rule.name]:
+        if not house_ignore.apply(unit, checked[rule.name], active=frozenset()):
             continue
         rewritten = rule.fix(unit)
         if rewritten is None:

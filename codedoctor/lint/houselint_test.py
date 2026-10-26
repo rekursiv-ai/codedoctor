@@ -395,6 +395,22 @@ def test_a_fix_runs_before_the_check_that_would_report_it(tmp_path: Path) -> Non
     assert findings == ()
 
 
+def test_a_marked_finding_does_not_open_the_fix_gate(tmp_path: Path) -> None:
+    """A fix over a suppressed finding would orphan the marker that kept it."""
+    body = "value = 12345  # house-ignore[digits] -- Kept as written.\n"
+    path = _write(tmp_path, body)
+
+    findings, written = run(
+        [path],
+        active=(DigitsRule(),),
+        fixing=frozenset({"digits"}),
+    )
+
+    assert path.read_text() == body
+    assert written == ()
+    assert findings == ()
+
+
 def test_a_check_without_fix_reports_and_leaves_the_file(tmp_path: Path) -> None:
     path = _write(tmp_path, "value = 12345\n")
     digits = DigitsRule()
