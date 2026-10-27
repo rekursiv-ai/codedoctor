@@ -593,27 +593,51 @@ def fork_safe_env(
     *,
     platform: str = sys.platform,
 ) -> dict[str, str]:
-    """Return ``environ`` with macOS's system proxy lookup turned off.
+    """Return ``environ`` with every request off the machine sent to a dead proxy.
 
     Mutmut forks one child per mutant from a process that has already run the
-    tests. On macOS an HTTP client built in that child reads the system proxy
-    settings through SystemConfiguration, which is not fork-safe: the child
-    dies with SIGSEGV and the mutant is reported inconclusive, as every
-    mutant whose tests build knowbuddy's Discord client was. ``urllib`` skips
-    that lookup whenever any ``*_proxy`` variable is set, so ``no_proxy=*``
-    is added when none is; a variable already set already skips it.
+    tests, and on macOS the system code a request reaches in that child is not
+    fork-safe, so the child dies and the mutant is reported inconclusive:
+
+    - Reading the system proxy settings through SystemConfiguration dies with
+      SIGSEGV, as every mutant whose tests build knowbuddy's Discord client
+      did. ``urllib`` reads them only when no ``*_proxy`` variable is set.
+    - A mutant that drops a test's fake transport sends a real request, and
+      checking its certificate through ``truststore`` and the Security
+      framework dies with SIGABRT, though the tests would kill that mutant.
+
+    Each proxy variable names a port on this machine nothing listens on, so
+    such a request is refused before it resolves a name or starts TLS, and the
+    mutant fails its tests as it would anywhere else. ``localhost`` stays
+    direct for tests that serve on it. A proxy the environment names is
+    replaced: requests through it would reach the Security framework too.
 
     Args:
       environ: The environment to copy.
       platform: The ``sys.platform`` to build it for.
 
     Returns:
-      env: A copy that names a proxy variable on macOS.
+      env: A copy whose proxy variables, on macOS, name the dead proxy.
 
     """
-    if platform != "darwin" or any(name.lower().endswith("_proxy") for name in environ):
+    if platform != "darwin":
         return dict(environ)
-    return {**environ, "no_proxy": "*"}
+    dead = "http://127.0.0.1:9"
+    proxies = {
+        "http_proxy": dead,
+        "https_proxy": dead,
+        "all_proxy": dead,
+        "no_proxy": "localhost,127.0.0.1,::1",
+    }
+    return {
+        **{
+            name: value
+            for name, value in environ.items()
+            if not name.lower().endswith("_proxy")
+        },
+        **proxies,
+        **{name.upper(): value for name, value in proxies.items()},
+    }
 
 
 def mutant_outcomes(
