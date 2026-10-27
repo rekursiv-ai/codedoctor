@@ -7,6 +7,7 @@ from multiprocessing.context import ForkContext
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol, cast
 from unittest.mock import Mock
+from urllib import request
 
 import argparse
 import ast
@@ -2207,29 +2208,51 @@ def test_snapshot_math_libraries_run_single_threaded() -> None:
     assert environ == {"PATH": "/bin", "OMP_NUM_THREADS": "64"}
 
 
-def test_a_mac_with_no_proxy_variable_skips_the_system_proxy_lookup() -> None:
-    environ = {"PATH": "/bin"}
+@pytest.mark.parametrize(
+    "environ",
+    [
+        {"PATH": "/bin"},
+        {"PATH": "/bin", "HTTPS_PROXY": "http://proxy:3128", "no_proxy": "*"},
+    ],
+)
+def test_a_mac_sends_every_request_off_the_machine_to_a_dead_proxy(
+    environ: dict[str, str],
+) -> None:
+    before = dict(environ)
+    dead = "http://127.0.0.1:9"
+    local = "localhost,127.0.0.1,::1"
 
     assert fork_safe_env(environ, platform="darwin") == {
         "PATH": "/bin",
-        "no_proxy": "*",
+        "http_proxy": dead,
+        "https_proxy": dead,
+        "all_proxy": dead,
+        "no_proxy": local,
+        "HTTP_PROXY": dead,
+        "HTTPS_PROXY": dead,
+        "ALL_PROXY": dead,
+        "NO_PROXY": local,
     }
-    assert environ == {"PATH": "/bin"}
+    assert environ == before
 
 
-@pytest.mark.parametrize(
-    ("platform", "environ"),
-    [
-        ("darwin", {"PATH": "/bin", "HTTPS_PROXY": "http://proxy:3128"}),
-        ("darwin", {"PATH": "/bin", "no_proxy": "localhost"}),
-        ("linux", {"PATH": "/bin"}),
-    ],
-)
-def test_a_named_proxy_or_another_platform_keeps_the_environment(
-    platform: str,
-    environ: dict[str, str],
+def test_another_platform_keeps_the_environment() -> None:
+    environ = {"PATH": "/bin", "HTTPS_PROXY": "http://proxy:3128"}
+    assert fork_safe_env(environ, platform="linux") == environ
+
+
+def test_urllib_sends_a_remote_request_to_the_dead_proxy_and_localhost_direct(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert fork_safe_env(environ, platform=platform) == environ
+    # HTTP clients such as httpx read their proxies through urllib.
+    for name in [name for name in os.environ if name.lower().endswith("_proxy")]:
+        monkeypatch.delenv(name)
+    for name, value in fork_safe_env({}, platform="darwin").items():
+        monkeypatch.setenv(name, value)
+
+    assert request.getproxies()["https"] == "http://127.0.0.1:9"
+    assert not request.proxy_bypass("github.com")
+    assert request.proxy_bypass("localhost")
 
 
 def test_a_crash_tail_keeps_pytest_failure_lines_above_the_tail() -> None:
@@ -2329,14 +2352,11 @@ def test_mutmut_retries_segfaulted_and_unrun_mutants_once(
             "pkg.mod.x_other__mutmut_1": -11,
         },
     )
+    loaded = Mock(return_value=data)
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(mutated, "copy_snapshot", Mock())
     monkeypatch.setattr(mutated, "_paired_tests", Mock(return_value=("t.py",)))
-    monkeypatch.setitem(
-        mutated.__dict__,
-        "SourceFileMutationData",
-        Mock(return_value=data),
-    )
+    monkeypatch.setitem(mutated.__dict__, "SourceFileMutationData", loaded)
     monkeypatch.setattr(
         mutated,
         "_collect",
@@ -2364,6 +2384,15 @@ def test_mutmut_retries_segfaulted_and_unrun_mutants_once(
         "pkg.mod.x_f__mutmut_1",
         "pkg.mod.x_f__mutmut_2",
     ]
+    assert run.call_args_list[1].kwargs == {
+        "capture_output": True,
+        "check": False,
+        "cwd": snapshot,
+        "env": single,
+        "text": True,
+    }
+    loaded.assert_called_once_with(path=snapshot / "mutants" / "pkg/mod.py")
+    data.load.assert_called_once_with()
 
 
 def test_a_mutmut_crash_reports_the_tail_of_its_output(
