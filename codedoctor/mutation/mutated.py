@@ -7,6 +7,8 @@ and a named file is mutated as given. Mutates every function under
 [tool.mutmut] source_paths by default; --function-sample-rate keeps a seeded
 fraction of them, rounded up, and --max-functions-sampled caps that count.
 Mutmut skips decorated functions other than class and static methods.
+--prefer-changed BASE samples the functions changed since commit BASE before
+any other; without it, every function is as likely as any.
 The project root is the nearest
 pyproject.toml; flag defaults come from [tool.mutated] in the nearest
 pyproject.toml that has one, and flags override them.
@@ -55,12 +57,14 @@ from unicodedata import normalize
 import argparse
 import ast
 import bisect
+import contextlib
 import hashlib
 import io
 import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -121,6 +125,11 @@ def main() -> int:
             walk.expand(flags.paths, suffixes={".py"}),
             root=root,
         )
+        preferred = (
+            frozenset()
+            if flags.prefer_changed is None
+            else changed_functions(root, base=flags.prefer_changed, files=named)
+        )
         filters, candidates = select_functions(
             root,
             files=named,
@@ -129,8 +138,9 @@ def main() -> int:
             rate=flags.function_sample_rate,
             most=flags.max_functions_sampled,
             workers=workers,
+            preferred=preferred,
         )
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
         sys.stderr.write(f"mutation: cannot select functions: {error}\n")
         return 1
     if skipped := candidates - len(filters):
@@ -242,6 +252,61 @@ def function_filters(
             configuration._config = previous  # noqa: SLF001 -- mutmut exposes no way to restore its configuration.
 
 
+def changed_functions(root: Path, *, base: str, files: list[str]) -> frozenset[str]:
+    """Return a filter for each function in ``files`` whose lines differ from ``base``.
+
+    A file git does not track is new, so every function in it differs.
+
+    Args:
+      root: Project root, inside a git checkout.
+      base: The commit to compare the working tree with.
+      files: Root-relative paths to look in.
+
+    Returns:
+      filters: One ``__mutmut_*`` pattern per changed function.
+
+    Raises:
+      subprocess.CalledProcessError: Git could not compare against ``base``.
+
+    """
+    names = [path for path in files if path.endswith(".py")]
+    if not names:
+        return frozenset[str]()
+    diff = subprocess.run(  # noqa: S603 -- git from PATH; derived arguments.
+        ["git", "diff", "--unified=0", "--no-color", base, "--", *names],  # noqa: S607 -- git from PATH.
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    tracked = subprocess.run(  # noqa: S603 -- git from PATH; derived arguments.
+        ["git", "ls-files", "--", *names],  # noqa: S607 -- git from PATH.
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    changed: defaultdict[str, list[range]] = defaultdict(list)
+    path = ""
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            path = line.removeprefix("+++ b/") if line != "+++ /dev/null" else ""
+        elif line.startswith("@@") and path:
+            start, _, count = line.split()[2].removeprefix("+").partition(",")
+            first = int(start)
+            # A deletion (count 0) changed the line it sits between.
+            changed[path].append(range(first, first + max(int(count or 1), 1)))
+    for untracked in set(names) - set(tracked):
+        changed[untracked].append(range(1, 2**31))
+    return frozenset(
+        get_mutant_name(Path(path), mutant_method_name=f"{name}__mutmut_*")
+        for path, spans in changed.items()
+        if (root / path).is_file()
+        for name, lines in _function_lines(root / path)
+        if any(span.start < lines.stop and lines.start < span.stop for span in spans)
+    )
+
+
 def select_functions(
     root: Path,
     *,
@@ -251,6 +316,7 @@ def select_functions(
     rate: float,
     most: int | None,
     workers: int = 1,
+    preferred: frozenset[str] = frozenset(),
 ) -> tuple[tuple[str, ...], int]:
     """Return ``sample(function_filters(...))`` and how many functions it drew from.
 
@@ -268,6 +334,8 @@ def select_functions(
       rate: Fraction of the mutable functions to keep, rounded up.
       most: Most functions to keep, or None for no cap.
       workers: Cap on processes to parse the files over.
+      preferred: Filters ranked ahead of every other, such as the functions a
+        change touched; the seed orders each group.
 
     Returns:
       filters: The sampled filters, sorted.
@@ -280,10 +348,10 @@ def select_functions(
     if most is None:
         found = check(files=files)
         size = sample_size(len(found), rate=rate, most=most)
-        return sample(found, seed=seed, size=size), len(found)
+        return sample(found, seed=seed, size=size, preferred=preferred), len(found)
     by_file = _declared_by_file(root, files=files, sources=sources, workers=workers)
     owner = {name: path for path, names in by_file.items() for name in names}
-    ranked = sorted(owner, key=partial(_rank, seed=seed))
+    ranked = sorted(owner, key=partial(_rank, seed=seed, preferred=preferred))
     # The least count of mutable functions whose sample is ``most`` long.
     enough = math.floor((most - 1) / Fraction(str(rate))) + 1
     order = list(dict.fromkeys(owner[name] for name in ranked))
@@ -328,6 +396,7 @@ def sample(
     *,
     seed: str,
     size: int,
+    preferred: frozenset[str] = frozenset(),
 ) -> tuple[str, ...]:
     """Keep the ``size`` filters whose seeded hashes are lowest (bottom-k).
 
@@ -340,6 +409,7 @@ def sample(
       filters: Candidate filters.
       seed: Varies the sample between changes; CI passes the PR number.
       size: Most filters to keep.
+      preferred: Filters kept before any other.
 
     Returns:
       sample: The kept filters, sorted.
@@ -354,7 +424,7 @@ def sample(
     """
     if size < 0:
         raise ValueError("sample size must be nonnegative")
-    ranked = sorted(filters, key=partial(_rank, seed=seed))
+    ranked = sorted(filters, key=partial(_rank, seed=seed, preferred=preferred))
     return tuple(sorted(ranked[:size]))
 
 
@@ -441,6 +511,12 @@ def run_shard(
             snapshot=snapshot,
             template=template,
             workers=workers,
+        )
+    except subprocess.TimeoutExpired as error:
+        return ShardReport(
+            source=shard.source,
+            failure=f"mutation: {shard.source}: mutmut ran past its "
+            f"{error.timeout:g} s limit",
         )
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return ShardReport(
@@ -690,6 +766,7 @@ def mutant_outcomes(
 class _Flags(Protocol):
     paths: list[Path]
     seed: str
+    prefer_changed: str | None
     function_sample_rate: float
     max_functions_sampled: int | None
     workers: int | None
@@ -747,6 +824,11 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "--seed",
         default=os.environ.get("PRECOMMIT_MUTATION_SEED", ""),
         help="Sampling seed (default: PRECOMMIT_MUTATION_SEED, or empty).",
+    )
+    parser.add_argument(
+        "--prefer-changed",
+        metavar="BASE",
+        help="Sample the functions changed since commit BASE first (default: none).",
     )
     parser.add_argument(
         "--function-sample-rate",
@@ -891,7 +973,7 @@ def _mutate(
     # function keys for clean tests. Exact names take its suffix-stripping
     # branch, so include one representative per function for that lookup.
     selectors = (*shard.filters, *(f.removesuffix("*") + "1" for f in shard.filters))
-    completed = subprocess.run(  # noqa: S603 -- fixed executable, derived filters.
+    completed = _run_mutmut(
         [
             sys.executable,
             "-m",
@@ -901,11 +983,8 @@ def _mutate(
             str(workers),
             *selectors,
         ],
-        capture_output=True,
-        check=False,
         cwd=snapshot,
         env=fork_safe_env(single_threaded_env(os.environ)),
-        text=True,
     )
     if completed.returncode:
         return ShardReport(
@@ -942,14 +1021,40 @@ def _retry_inconclusive(snapshot: Path, *, shard: Shard) -> None:
         and (code is None or status_by_exit_code[code] == "segfault")
     )
     if names:
-        subprocess.run(  # noqa: S603 -- fixed executable, derived mutant names.
+        _ = _run_mutmut(
             [sys.executable, "-m", "mutmut", "run", "--max-children", "1", *names],
-            capture_output=True,
-            check=False,
             cwd=snapshot,
             env=fork_safe_env(single_threaded_env(os.environ)),
-            text=True,
         )
+
+
+# Its own session, so a run past its limit is killed with every worker it
+# forked: killing mutmut alone would leave them testing, and holding its pipes.
+def _run_mutmut(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout_sec: float = 900.0,
+) -> subprocess.CompletedProcess[str]:
+    """Run ``argv`` to its end, or kill it and all it started after ``timeout_sec``."""
+    with subprocess.Popen(  # noqa: S603 -- fixed executable, derived arguments.
+        argv,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    ) as process:
+        try:
+            out, err = process.communicate(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            _ = process.communicate()
+            raise
+    return subprocess.CompletedProcess(argv, process.returncode, out, err)
 
 
 # Spinner frames are dropped. A failed stats run dumps pytest's whole log before
@@ -1242,9 +1347,36 @@ def _map_files[T](
         )
 
 
-def _rank(name: str, *, seed: str) -> bytes:
-    """Return ``name``'s seeded bottom-k sampling key."""
-    return hashlib.sha256(f"{seed}\0{name}".encode()).digest()
+def _rank(
+    name: str,
+    *,
+    seed: str,
+    preferred: frozenset[str] = frozenset(),
+) -> tuple[bool, bytes]:
+    """Return ``name``'s sampling key: preferred first, then by seeded hash."""
+    return name not in preferred, hashlib.sha256(f"{seed}\0{name}".encode()).digest()
+
+
+def _function_lines(path: Path) -> list[tuple[str, range]]:
+    """Return each function mutmut names in ``path``, with the lines it spans."""
+    try:
+        tree = ast.parse(path.read_bytes())
+    except (OSError, SyntaxError):
+        return []
+    found: list[tuple[str, range]] = []
+    for top in tree.body:
+        members = top.body if isinstance(top, ast.ClassDef) else [top]
+        for member in members:
+            if not isinstance(member, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            name = (
+                f"x{CLASS_NAME_SEPARATOR}{top.name}{CLASS_NAME_SEPARATOR}{member.name}"
+                if isinstance(top, ast.ClassDef)
+                else f"x_{member.name}"
+            )
+            first = min([member.lineno, *(d.lineno for d in member.decorator_list)])
+            found.append((name, range(first, (member.end_lineno or member.lineno) + 1)))
+    return found
 
 
 def _file_filters(path: str, *, root: Path) -> tuple[str, ...]:
