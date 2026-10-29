@@ -307,7 +307,16 @@ def test_each_group_pins_openblas_before_numpy_loads(
     "case",
     [
         (["pkg/m.py"], 1, "coverage-floor: pkg/m.py has no sidecar test\n"),
-        (["pkg/__init__.py", "pkg/__main__.py", "pkg/gone.py"], 0, ""),
+        (
+            [
+                "pkg/__init__.py",
+                "pkg/__main__.py",
+                "pkg/gone.py",
+                "pkg/third_party/vendored.py",
+            ],
+            0,
+            "",
+        ),
     ],
     ids=["untested", "exempt"],
 )
@@ -324,6 +333,7 @@ def test_a_floored_source_without_a_sidecar_fails_and_runs_nothing(
             "pkg/__init__.py": "X = 1\n",
             "pkg/__main__.py": "X = 1\n",
             "pkg/m.py": _SOURCE,
+            "pkg/third_party/vendored.py": _SOURCE,
         },
     )
     monkeypatch.chdir(tmp_path)

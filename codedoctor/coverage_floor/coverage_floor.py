@@ -6,7 +6,8 @@ Takes the changed paths as arguments. A source under a floored prefix (one
 run fails when a test fails or a floored unit is below its floor: each
 changed source under ``--scope file``, or the changed sources of one
 directory pooled under ``--scope directory``. A floored source without a
-sidecar fails, save ``__init__.py`` and ``__main__.py``.
+sidecar fails, save ``__init__.py`` and ``__main__.py``. Vendored sources,
+anything under a ``third_party/`` directory, are never floored.
 
 Examples:
   python -m codedoctor.coverage_floor --floor pkg/=100 -- pkg/a.py
@@ -97,7 +98,8 @@ def sidecars(
 
     Args:
       paths: Changed repo-relative paths.
-      floored: Directory prefixes, each ending in ``/``, whose sources count.
+      floored: Directory prefixes, each ending in ``/``, whose sources count,
+        save those under a ``third_party/`` directory.
 
     Returns:
       sources: Each floored, non-test source with at least one sidecar.
@@ -111,7 +113,11 @@ def sidecars(
     untested: list[str] = []
     for path in paths:
         name = Path(path)
-        if _is_test(name) or not path.startswith(floored):
+        if (
+            _is_test(name)
+            or not path.startswith(floored)
+            or "third_party" in name.parts
+        ):
             continue
         found = [
             str(candidate)
