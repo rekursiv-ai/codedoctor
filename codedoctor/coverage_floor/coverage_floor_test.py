@@ -70,6 +70,7 @@ def test_sidecars_pair_floored_sources_with_every_spelling(
             "pkg/tests/c_test.py",
             "pkg/tests/test_c.py",
         ],
+        ["cfg/untested.py"],
     )
 
 
@@ -300,6 +301,71 @@ def test_each_group_pins_openblas_before_numpy_loads(
 
     [env] = envs
     assert (env["OPENBLAS_CORETYPE"], env["OPENBLAS_NUM_THREADS"]) == (expected, "1")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        (["pkg/m.py"], 1, "coverage-floor: pkg/m.py has no sidecar test\n"),
+        (["pkg/__init__.py", "pkg/__main__.py", "pkg/gone.py"], 0, ""),
+    ],
+    ids=["untested", "exempt"],
+)
+def test_a_floored_source_without_a_sidecar_fails_and_runs_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: tuple[list[str], int, str],
+) -> None:
+    paths, status, shown = case
+    _tree(
+        tmp_path,
+        {
+            "pkg/__init__.py": "X = 1\n",
+            "pkg/__main__.py": "X = 1\n",
+            "pkg/m.py": _SOURCE,
+        },
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["coverage_floor", "--floor", "pkg/=100", "--", *paths],
+    )
+    run = Mock()
+    monkeypatch.setattr(coverage_floor, "run_groups", run)
+
+    assert coverage_floor.main() == status
+    assert capsys.readouterr().out == shown
+    run.assert_not_called()
+
+
+@pytest.mark.cli_python_subprocess
+def test_a_source_its_sidecar_never_runs_is_below_the_floor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _tree(
+        tmp_path,
+        {
+            "pyproject.toml": "[tool.pytest.ini_options]\npythonpath = ['.']\n",
+            "pkg/__init__.py": "",
+            "pkg/m.py": _SOURCE,
+            "pkg/m_test.py": "def test_nothing():\n    assert True\n",
+        },
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["coverage_floor", "--floor", "pkg/=100", "--", "pkg/m.py"],
+    )
+
+    assert coverage_floor.main() == 1
+    assert capsys.readouterr().out == (
+        "coverage-floor: pkg/m.py at 0% is below 100%; missed 1-4\n"
+    )
 
 
 def test_main_without_a_floored_sidecar_runs_nothing(

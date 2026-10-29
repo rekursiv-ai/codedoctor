@@ -5,8 +5,8 @@ Takes the changed paths as arguments. A source under a floored prefix (one
 ``test_x.py``, or either under ``tests/``) has that test run with its directory measured. The
 run fails when a test fails or a floored unit is below its floor: each
 changed source under ``--scope file``, or the changed sources of one
-directory pooled under ``--scope directory``. A source without a sidecar is
-skipped.
+directory pooled under ``--scope directory``. A floored source without a
+sidecar fails, save ``__init__.py`` and ``__main__.py``.
 
 Examples:
   python -m codedoctor.coverage_floor --floor pkg/=100 -- pkg/a.py
@@ -55,7 +55,12 @@ def main() -> int:
     _add_arguments(parser)
     flags = cast(Flags, parser.parse_args())
     floors = dict(flags.floor)
-    sources, tests = sidecars(flags.paths, floored=tuple(floors))
+    sources, tests, untested = sidecars(flags.paths, floored=tuple(floors))
+    if untested:
+        sys.stdout.writelines(
+            f"coverage-floor: {path} has no sidecar test\n" for path in untested
+        )
+        return 1
     if not sources:
         return 0
     # One line per broken sidecar: pytest's collection traceback is 30 lines
@@ -87,8 +92,8 @@ def sidecars(
     paths: Iterable[str],
     *,
     floored: tuple[str, ...],
-) -> tuple[list[str], list[str]]:
-    """Return the changed floored sources that have a sidecar, and those sidecars.
+) -> tuple[list[str], list[str], list[str]]:
+    """Return the changed floored sources that have a sidecar, those sidecars, and the rest.
 
     Args:
       paths: Changed repo-relative paths.
@@ -97,10 +102,13 @@ def sidecars(
     Returns:
       sources: Each floored, non-test source with at least one sidecar.
       tests: Every sidecar of those sources, in order, deduplicated.
+      untested: Each floored, non-test source on disk with no sidecar, save
+        ``__init__.py`` and ``__main__.py``.
 
     """
     sources: list[str] = []
     tests: dict[str, None] = {}
+    untested: list[str] = []
     for path in paths:
         name = Path(path)
         if _is_test(name) or not path.startswith(floored):
@@ -118,7 +126,9 @@ def sidecars(
         if found:
             sources.append(path)
             tests.update(dict.fromkeys(found))
-    return sources, list(tests)
+        elif name.is_file() and name.name not in ("__init__.py", "__main__.py"):
+            untested.append(path)
+    return sources, list(tests), untested
 
 
 def groups(tests: Sequence[str], *, count: int) -> list[list[str]]:
@@ -212,8 +222,6 @@ def report(
     # source against every measured file, 3.7s for 472 sources. A source the
     # data never saw is left out, exactly as `include` leaves it out.
     morfs = [source for source in sources if str(Path(source).resolve()) in measured]
-    if not morfs:
-        return False
     # No table: printing one re-read every source, 10s of an --all-files run, and
     # each unit below its floor already names its missed lines.
     units: dict[str, tuple[float, int, int, list[str]]] = {}
