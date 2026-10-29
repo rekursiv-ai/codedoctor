@@ -126,7 +126,7 @@ def main() -> int:
             root=root,
         )
         preferred = (
-            frozenset()
+            frozenset[str]()
             if flags.prefer_changed is None
             else changed_functions(root, base=flags.prefer_changed, files=named)
         )
@@ -297,7 +297,7 @@ def changed_functions(root: Path, *, base: str, files: list[str]) -> frozenset[s
             # A deletion (count 0) changed the line it sits between.
             changed[path].append(range(first, first + max(int(count or 1), 1)))
     for untracked in set(names) - set(tracked):
-        changed[untracked].append(range(1, 2**31))
+        changed[untracked].append(range(1, 1 << 31))
     return frozenset(
         get_mutant_name(Path(path), mutant_method_name=f"{name}__mutmut_*")
         for path, spans in changed.items()

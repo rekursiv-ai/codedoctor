@@ -70,11 +70,11 @@ def parse_args(
         default = cast(object, action.default)
         # An unset (None) default takes its type from the flag's converter: a
         # type itself, or the type a converter function returns.
-        expected = (
-            _converted(action.type) or type(default)
-            if default is None
-            else type(default)
-        )
+        expected = _converted(action.type) if default is None else type(default)
+        if expected is None:
+            parser.error(
+                f"{where} {key}: its flag declares no default or typed converter",
+            )
         if isinstance(value, bool) is not (expected is bool) or not isinstance(
             value,
             expected,
@@ -93,7 +93,10 @@ def _converted(converter: object) -> type | None:
         return converter
     if not callable(converter):
         return None
-    returned = inspect.signature(converter, eval_str=True).return_annotation
+    returned = cast(
+        object,
+        inspect.signature(converter, eval_str=True).return_annotation,
+    )
     return returned if isinstance(returned, type) else None
 
 
