@@ -206,6 +206,51 @@ def test_an_unset_flag_takes_its_table_type_from_a_converter_function(
     assert "workers: expected int, got str" in capsys.readouterr().err
 
 
+def test_the_table_is_found_from_the_cwd_without_a_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _pyproject(tmp_path, '[tool.tool]\nselect = "a"\n')
+    monkeypatch.chdir(tmp_path)
+
+    flags, root = pyproject_flags.parse_args(_parser(), tool="tool", argv=[])
+
+    assert (vars(flags)["select"], root) == ("a", tmp_path)
+
+
+def test_a_set_default_types_the_table_over_its_converter(tmp_path: Path) -> None:
+    """An ``append`` flag converts each item, but the table holds the whole list."""
+    parser = _parser()
+    parser.add_argument("--tag", action="append", type=str, default=[])
+    _pyproject(tmp_path, '[tool.tool]\ntag = ["a"]\n')
+
+    flags, _ = pyproject_flags.parse_args(
+        parser,
+        tool="tool",
+        argv=[],
+        start=tmp_path,
+    )
+
+    assert vars(flags)["tag"] == ["a"]
+
+
+def test_a_flag_with_no_default_or_typed_converter_is_a_usage_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = _parser()
+    parser.add_argument("--name")
+    path = _pyproject(tmp_path, '[tool.tool]\nname = "x"\n')
+
+    with pytest.raises(SystemExit):
+        pyproject_flags.parse_args(parser, tool="tool", argv=[], start=tmp_path)
+
+    assert (
+        f"{path} [tool.tool] name: its flag declares no default or typed converter"
+        in capsys.readouterr().err
+    )
+
+
 def test_an_int_is_not_accepted_for_a_bool_flag(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

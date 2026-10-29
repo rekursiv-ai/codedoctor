@@ -2467,7 +2467,9 @@ def test_mutmut_retries_segfaulted_and_unrun_mutants_once(
     snapshot.mkdir()
     filters = ("pkg.mod.x_f__mutmut_*",)
     run = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+    load = Mock()
     data = Mock(
+        load=load,
         exit_code_by_key={
             "pkg.mod.x_f__mutmut_1": -11,
             "pkg.mod.x_f__mutmut_2": None,
@@ -2509,7 +2511,7 @@ def test_mutmut_retries_segfaulted_and_unrun_mutants_once(
     ]
     assert run.call_args_list[1].kwargs == {"cwd": snapshot, "env": single}
     loaded.assert_called_once_with(path=snapshot / "mutants" / "pkg/mod.py")
-    data.load.assert_called_once_with()
+    load.assert_called_once_with()
 
 
 def test_a_mutmut_crash_reports_the_tail_of_its_output(
