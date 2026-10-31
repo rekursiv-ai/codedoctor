@@ -12,19 +12,10 @@ machine and below interactive priority.
 ## Quick Start
 
 ```bash
-# Mac:
-#   # Required for quick install.
-#   brew install uv
-
-# Ubuntu/Debian:
-#   # Required for quick install.
-#   sudo apt-get install -y curl
-#   curl -LsSf https://astral.sh/uv/install.sh | sh
-
 uv add --dev codedoctor
-
-# Alternatively: python -m pip install codedoctor
 ```
+
+See [Install](#install) for additional details.
 
 pre-commit calls a hook once per chunk of file names, so `--all-files` starts a
 type checker or pytest several times over. Each heavy gate here is two hooks: a
@@ -75,3 +66,25 @@ every gate and is the fullest example.
 
 Worker counts: `WORKERS_<HOOK_ID>` wins, then `WORKERS_DEFAULT`, then a count
 derived from the machine's cores and free memory.
+
+## Install
+
+```bash
+uv add --dev codedoctor
+```
+
+If you're missing `uv`,
+- Mac
+  ```bash
+  brew install uv
+  ```
+- Linux
+  ```bash
+  sudo apt install -y curl
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ```
+
+Or with pip,
+```bash
+python -m pip install codedoctor
+```
