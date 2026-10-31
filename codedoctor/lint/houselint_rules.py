@@ -1850,6 +1850,67 @@ class NegativeBoolParamRule:
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
+class FluentNameRule:
+    """A function names what it returns, not how its call reads (STYLE.md Code Style).
+
+    ``schema_of(Arguments)`` reads as a phrase, but ``schema_of`` alone says
+    neither what schema nor of what; ``json_schema`` does. Only a trailing
+    ``of`` or ``for`` is reported; inside a name (``wait_for_ready``) a
+    preposition still reads as an action. A test's name is a sentence about
+    behavior, and a method ``@override`` marks keeps its base's name.
+    """
+
+    name: ClassVar[str] = "fluent-name"
+    kinds: ClassVar[frozenset[str]] = frozenset({"python"})
+    fixable: ClassVar[bool] = False
+    endings: tuple[str, ...] = ("_of", "_for")
+    """Name endings that make a name a phrase."""
+
+    verbs: tuple[str, ...] = ("wait_for",)
+    """Endings that are a verb's own phrase, as ``asyncio.wait_for`` spells it."""
+
+    def check(self, unit: Unit, /) -> Sequence[Finding]:
+        """Report each function whose name ends in a preposition.
+
+        Args:
+          unit: The file under inspection.
+
+        Returns:
+          findings: One per violation, in source order.
+
+        """
+        if not any(f"{e}(" in unit.source for e in self.endings):
+            return ()
+        return tuple(
+            Finding(
+                path=unit.path,
+                line=node.lineno,
+                rule=self.name,
+                message=f"{node.name} names how a call reads, not what it returns;"
+                " name the thing (STYLE.md Code Style)",
+            )
+            for node in unit.nodes(*_DEF_KINDS)
+            if node.name.endswith(self.endings)
+            and not node.name.endswith(self.verbs)
+            and not node.name.startswith(("__", "test_"))
+            and not _has_decorator(node, "override")
+        )
+
+    def fix(self, unit: Unit, /) -> str | None:
+        """No autofix: a new name is a judgement, and it has call sites.
+
+        Args:
+          unit: The file under inspection.
+
+        Returns:
+          rewritten: The full new source, or None when nothing changes.
+
+        """
+        del unit
+        return None
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
 class AllReexportRule:
     """A non-``__init__`` ``__all__`` lists only names the module defines."""
 
@@ -5796,7 +5857,7 @@ def _inline_call(node: ast.FunctionDef, call: ast.Call, unit: Unit) -> str | Non
         return None
     # A call site already inside an f-string cannot host a reflowed
     # expression: the quotes it carries would close the enclosing string.
-    if isinstance(_parent_of(unit, call), ast.FormattedValue):
+    if isinstance(_parent_node(unit, call), ast.FormattedValue):
         return None
     starts = _line_starts(unit.source)
     text = ast.get_source_segment(unit.source, expr)
@@ -5824,7 +5885,7 @@ def _inline_call(node: ast.FunctionDef, call: ast.Call, unit: Unit) -> str | Non
     # conditional or lambda that any neighbour would rebind. As a call
     # argument, a subscript index, or a statement's value it is already
     # delimited, and a redundant pair leaves ``UP034`` for the author.
-    parent = _parent_of(unit, call)
+    parent = _parent_node(unit, call)
     delimited = isinstance(
         parent,
         ast.Call
@@ -5910,7 +5971,7 @@ def _atomic(expr: ast.expr) -> str:
     return f"({text})"
 
 
-def _parent_of(unit: Unit, target: ast.AST) -> ast.AST | None:
+def _parent_node(unit: Unit, target: ast.AST) -> ast.AST | None:
     """Return the node whose direct child is ``target``."""
     return unit.parents.get(target)
 
