@@ -584,7 +584,7 @@ def _honor_house_ignore(
         relative = houselint._relative(path, config_root)  # noqa: SLF001 -- same path view.
         if any(entry.matches(relative) for entry in exclude):
             continue
-        unit = houselint.unit_for(path)
+        unit = houselint.read_unit(path)
         if not isinstance(unit, Unit):
             continue
         absolute = path.absolute()
