@@ -10,6 +10,7 @@ from importlib import util
 from pathlib import Path
 from typing import Final
 
+import os
 import subprocess
 import sys
 
@@ -83,6 +84,39 @@ def test_a_patched_is_compiling_does_not_hide_stats(
     mutmut_dynamo.pytest_configure()
 
     assert trampoline.get_mutant_under_test() == "stats"
+
+
+def test_the_stats_phase_is_kept_from_a_child_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child records nothing, and finds no mutmut config from its own cwd."""
+    monkeypatch.setattr(
+        trampoline,
+        "get_mutant_under_test",
+        trampoline.get_mutant_under_test,
+    )
+    monkeypatch.setattr(trampoline, "_mutant_under_test", None)
+    monkeypatch.setenv("MUTANT_UNDER_TEST", "stats")
+    mutmut_dynamo.pytest_configure()
+
+    assert os.environ.get("MUTANT_UNDER_TEST") is None
+    assert trampoline.get_mutant_under_test() == "stats"
+
+
+@pytest.mark.parametrize("name", ["", "fail", "loop.mod.x_f__mutmut_1"])
+def test_a_child_still_runs_the_mutant_or_failure_under_test(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    monkeypatch.setattr(
+        trampoline,
+        "get_mutant_under_test",
+        trampoline.get_mutant_under_test,
+    )
+    monkeypatch.setenv("MUTANT_UNDER_TEST", name)
+    mutmut_dynamo.pytest_configure()
+
+    assert os.environ.get("MUTANT_UNDER_TEST") == name
 
 
 if __name__ == "__main__":
