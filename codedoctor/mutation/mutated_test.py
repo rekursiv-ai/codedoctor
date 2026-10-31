@@ -82,7 +82,7 @@ def _runnable(root: Path, *, source_paths: str = '["pkg"]') -> None:
     (root / ".gitignore").write_text("runtime/\n")
 
 
-def _report_for(root: Path, *, shard: Shard, **_: object) -> ShardReport:
+def _empty_report(root: Path, *, shard: Shard, **_: object) -> ShardReport:
     """Stand in for ``run_shard``: an empty report for ``shard``'s file."""
     del root
     return ShardReport(source=shard.source)
@@ -1454,7 +1454,7 @@ def test_main_runs_each_file_alone_within_the_worker_budget(
     filters = ("pkg.a.x_f__mutmut_*", "pkg.b.x_f__mutmut_*", "pkg.b.x_g__mutmut_*")
     select = Mock(return_value=filters)
     monkeypatch.setattr(mutated, "function_filters", select)
-    run = Mock(side_effect=_report_for)
+    run = Mock(side_effect=_empty_report)
     monkeypatch.setattr(mutated, "run_shard", run)
     monkeypatch.setattr(mutated, "copy_template", Mock())
     pool = Mock(wraps=ThreadPoolExecutor)
