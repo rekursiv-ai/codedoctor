@@ -200,6 +200,7 @@ def default_rules() -> tuple[Rule, ...]:
             houselint_rules.GetLoggerNameRule(),
             houselint_rules.NestedTryRule(),
             houselint_rules.NegativeBoolParamRule(),
+            houselint_rules.FluentNameRule(),
             houselint_rules.AllReexportRule(),
             houselint_rules.InitFacadeRule(),
             houselint_rules.DefOrderRule(),
@@ -306,7 +307,7 @@ def run(
     return tuple(findings), tuple(compress(paths, (wrote for _, wrote in results)))
 
 
-def unit_for(path: Path, /, *, reporter: str = "houselint") -> Unit | Finding | None:
+def read_unit(path: Path, /, *, reporter: str = "houselint") -> Unit | Finding | None:
     """Build a Unit carrying every view its kind admits, or say why it could not.
 
     Takes no view selection. A ``.py`` or ``.pyi`` file gets all three views;
@@ -701,7 +702,7 @@ def _lint_path(
     applies = tuple(rule for rule in active if rule.name not in silenced)
     if not applies:
         return (), False
-    built = unit_for(path)
+    built = read_unit(path)
     if built is None:
         return (), False
     if isinstance(built, Finding):

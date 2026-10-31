@@ -240,14 +240,14 @@ def test_a_file_that_never_parsed_may_still_be_fixed(tmp_path: Path) -> None:
 def test_shipped_kinds_are_python_pyi_and_jupyter(tmp_path: Path) -> None:
     """The kinds are pre-commit's ``identify`` tags, as the hook's ``types_or``."""
     kinds = {
-        name: houselint.unit_for(_write(tmp_path, "x = 1\n", name=name))
+        name: houselint.read_unit(_write(tmp_path, "x = 1\n", name=name))
         for name in ("m.py", "m.pyi")
     }
     assert {name: getattr(unit, "kind", None) for name, unit in kinds.items()} == {
         "m.py": "python",
         "m.pyi": "pyi",
     }
-    notebook = houselint.unit_for(_write(tmp_path, "{}", name="n.ipynb"))
+    notebook = houselint.read_unit(_write(tmp_path, "{}", name="n.ipynb"))
     assert isinstance(notebook, Unit)
     assert notebook.kind == "jupyter"
 
@@ -572,10 +572,10 @@ def test_an_unscoped_exclude_never_opens_the_file(
     """Ruff's ``exclude``: a path every rule skips is not even read."""
     path = _write(tmp_path, "BAD\n", name="drop_test.py")
 
-    def refusing_unit_for(path: Path, /, *, reporter: str = "houselint") -> None:
+    def refusing_read_unit(path: Path, /, *, reporter: str = "houselint") -> None:
         raise AssertionError(f"opened {path} for {reporter}")
 
-    monkeypatch.setattr(houselint, "unit_for", refusing_unit_for)
+    monkeypatch.setattr(houselint, "read_unit", refusing_read_unit)
 
     findings, _ = run(
         [path],
@@ -794,7 +794,7 @@ def test_a_rule_builds_only_the_views_it_reads(
     """
     path = _write(tmp_path, body)
     rule = next(r for r in houselint.default_rules() if r.name == rule_name)
-    unit = houselint.unit_for(path)
+    unit = houselint.read_unit(path)
     assert isinstance(unit, Unit)
     tokenized: list[str] = []
     real_tokenize = houselint_types._tokenize
@@ -854,7 +854,7 @@ def test_a_notebook_is_fixed_without_any_declared_view(tmp_path: Path) -> None:
     """``needs`` describes the PYTHON path; a notebook works from ``source``.
 
     A notebook has no single token stream -- each cell is tokenized on its
-    own -- so ``unit_for`` leaves ``tokens`` empty for one. The rule must
+    own -- so ``read_unit`` leaves ``tokens`` empty for one. The rule must
     therefore not depend on a declared view to fix a notebook.
     """
     notebook = _write(
@@ -862,7 +862,7 @@ def test_a_notebook_is_fixed_without_any_declared_view(tmp_path: Path) -> None:
         json.dumps({"cells": [{"cell_type": "code", "source": ["x = 12345\n"]}]}),
         name="n.ipynb",
     )
-    unit = houselint.unit_for(notebook)
+    unit = houselint.read_unit(notebook)
     assert isinstance(unit, Unit)
     assert unit.tokens == ()
 
@@ -1064,7 +1064,7 @@ def test_an_unsized_workers_flag_means_serial(
 def _dataclass_findings(tmp_path: Path, body: str) -> Sequence[Finding]:
     """Run DataclassRule over ``body`` and return its findings."""
     path = _write(tmp_path, body)
-    unit = houselint.unit_for(path)
+    unit = houselint.read_unit(path)
     assert isinstance(unit, Unit)
     return DataclassRule().check(unit)
 
@@ -1082,7 +1082,7 @@ def test_missing_kwargs_are_reported(tmp_path: Path) -> None:
 def _staticmethod_findings(tmp_path: Path, body: str) -> Sequence[Finding]:
     """Run StaticMethodRule over ``body`` and return its findings."""
     path = _write(tmp_path, body)
-    unit = houselint.unit_for(path)
+    unit = houselint.read_unit(path)
     assert isinstance(unit, Unit)
     return StaticMethodRule().check(unit)
 
@@ -1117,7 +1117,7 @@ def test_the_fix_rewrites_every_parameter_shape(tmp_path: Path) -> None:
         "        return k\n"
     )
     path = _write(tmp_path, body)
-    unit = houselint.unit_for(path)
+    unit = houselint.read_unit(path)
     assert isinstance(unit, Unit)
     fixed = StaticMethodRule().fix(unit)
     assert fixed is not None
@@ -1166,7 +1166,7 @@ def test_a_local_staticmethod_call_binding_becomes_a_forwarding_classmethod(
         "class A:\n"
         "    cost = staticmethod(price)\n",
     )
-    unit = houselint.unit_for(path)
+    unit = houselint.read_unit(path)
     assert isinstance(unit, Unit)
     fixed = StaticMethodRule().fix(unit)
     assert fixed is not None
@@ -1183,7 +1183,7 @@ def test_a_local_staticmethod_call_binding_becomes_a_forwarding_classmethod(
     assert isinstance(rewritten_class, type)
     assert getattr(rewritten_class, "cost")(1, 2, 3, k=4, z=5) == 15  # noqa: B009 -- The test accesses a dynamically generated fixture attribute whose name is supplied by the rewritten source.
     assert _write(tmp_path, fixed) == path
-    refixed = houselint.unit_for(path)
+    refixed = houselint.read_unit(path)
     assert isinstance(refixed, Unit)
     assert StaticMethodRule().fix(refixed) is None
 
@@ -1196,7 +1196,7 @@ def test_an_imported_staticmethod_call_binding_is_not_autofixed(
         tmp_path,
         "from os.path import join\n\nclass A:\n    cost = staticmethod(join)\n",
     )
-    unit = houselint.unit_for(path)
+    unit = houselint.read_unit(path)
     assert isinstance(unit, Unit)
     assert StaticMethodRule().fix(unit) is None
 
@@ -1211,7 +1211,7 @@ def test_an_autograd_staticmethod_is_not_autofixed(tmp_path: Path) -> None:
         "    def forward(ctx: object, x: int) -> int:\n"
         "        return x\n",
     )
-    unit = houselint.unit_for(path)
+    unit = houselint.read_unit(path)
     assert isinstance(unit, Unit)
     assert StaticMethodRule().fix(unit) is None
 
@@ -1222,7 +1222,7 @@ def test_the_fix_is_idempotent(tmp_path: Path) -> None:
         tmp_path,
         "class A:\n    @classmethod\n    def f(cls) -> int:\n        return 1\n",
     )
-    unit = houselint.unit_for(path)
+    unit = houselint.read_unit(path)
     assert isinstance(unit, Unit)
     assert StaticMethodRule().fix(unit) is None
 
@@ -1418,7 +1418,7 @@ _CONFIG_HEADER = (
 def _globals_findings(tmp_path: Path, body: str) -> Sequence[Finding]:
     """Run ConfigGlobalsRule over ``body`` and return its findings."""
     path = _write(tmp_path, body)
-    unit = houselint.unit_for(path)
+    unit = houselint.read_unit(path)
     assert isinstance(unit, Unit)
     return ConfigGlobalsRule().check(unit)
 
@@ -1616,7 +1616,7 @@ def test_config_bases_setting_narrows_which_classes_are_configs(
 ) -> None:
     """The base list is a field, so a project with other bases can retarget."""
     path = _write(tmp_path, _CONFIG_HEADER + "        dim: int = DEFAULT_DIM\n")
-    unit = houselint.unit_for(path)
+    unit = houselint.read_unit(path)
     assert isinstance(unit, Unit)
 
     assert ConfigGlobalsRule().check(unit)
@@ -1632,7 +1632,7 @@ def test_config_bases_setting_narrows_which_classes_are_configs(
 def _regrouped(tmp_path: Path, body: str, name: str = "mod.py") -> str | None:
     """Run DigitsRule's fixer over ``body`` and return its rewrite."""
     path = _write(tmp_path, body, name=name)
-    unit = houselint.unit_for(path)
+    unit = houselint.read_unit(path)
     assert isinstance(unit, Unit)
     return DigitsRule().fix(unit)
 
@@ -1686,7 +1686,7 @@ def test_a_float_is_left_alone(tmp_path: Path) -> None:
 
 def test_min_digits_setting_changes_the_threshold(tmp_path: Path) -> None:
     path = _write(tmp_path, "value = 1234\n")
-    unit = houselint.unit_for(path)
+    unit = houselint.read_unit(path)
     assert isinstance(unit, Unit)
 
     assert DigitsRule().fix(unit) is None
@@ -1785,7 +1785,7 @@ def test_a_notebook_carries_no_python_only_view(tmp_path: Path) -> None:
         name="n.ipynb",
     )
 
-    unit = houselint.unit_for(notebook)
+    unit = houselint.read_unit(notebook)
 
     assert isinstance(unit, Unit)
     assert unit.tokens == ()
@@ -1983,7 +1983,7 @@ def test_fix_all_names_every_fixable_selected_rule() -> None:
 def test_a_config_base_is_matched_whole_not_as_a_substring(tmp_path: Path) -> None:
     """``"ig" in ("Fig",)`` must never be what decides a class is a Config."""
     path = _write(tmp_path, _CONFIG_HEADER + "        dim: int = DEFAULT_DIM\n")
-    unit = houselint.unit_for(path)
+    unit = houselint.read_unit(path)
     assert isinstance(unit, Unit)
 
     assert not ConfigGlobalsRule(config_bases=("ig",)).check(unit)
@@ -2108,7 +2108,7 @@ class _StubRule(_Counting):
 def test_a_rule_that_declares_pyi_parses_and_checks_stubs(tmp_path: Path) -> None:
     stub = _write(tmp_path, "x: int\n", name="m.pyi")
 
-    unit = houselint.unit_for(stub)
+    unit = houselint.read_unit(stub)
     assert isinstance(unit, Unit)
     assert isinstance(unit.tree, ast.Module)
     assert unit.tokens
@@ -2746,7 +2746,7 @@ def test_an_unimported_name_spelled_dataclass_is_not_checked(tmp_path: Path) -> 
 
 def _rule_unit(tmp_path: Path, source: str, name: str = "mod.py") -> Unit:
     """Build a Unit for a rule fixture."""
-    unit = houselint.unit_for(_write(tmp_path, source, name=name))
+    unit = houselint.read_unit(_write(tmp_path, source, name=name))
     assert isinstance(unit, Unit)
     return unit
 
@@ -2908,7 +2908,7 @@ def test_cli_shape_fix_repairs_main_and_polyglot_header(tmp_path: Path) -> None:
         "    main()\n",
         name="tool.py",
     )
-    unit = houselint.unit_for(path)
+    unit = houselint.read_unit(path)
     assert isinstance(unit, Unit)
     rewritten = rule.fix(unit)
     assert rewritten is not None
@@ -2944,7 +2944,7 @@ def test_nested_import_shape_and_noqa_are_distinguished(tmp_path: Path) -> None:
 def test_dispatch_skips_unknown_suffix_and_reports_missing_path(tmp_path: Path) -> None:
     """Unknown suffixes skip silently; missing selected files report a finding."""
     unknown = _write(tmp_path, "BAD\n", name="notes.txt")
-    assert houselint.unit_for(unknown) is None
+    assert houselint.read_unit(unknown) is None
     findings, written = run(
         [unknown],
         active=(_Counting(),),
@@ -3618,13 +3618,13 @@ def test_a_failed_write_is_one_dispatcher_finding_on_line_one(tmp_path: Path) ->
 def test_an_unreadable_path_is_one_finding_naming_the_os_error(tmp_path: Path) -> None:
     missing = tmp_path / "gone.py"
 
-    assert houselint.unit_for(missing) == Finding(
+    assert houselint.read_unit(missing) == Finding(
         path=missing,
         line=1,
         rule="houselint",
         message="cannot read: No such file or directory",
     )
-    assert houselint.unit_for(missing, reporter="other") == Finding(
+    assert houselint.read_unit(missing, reporter="other") == Finding(
         path=missing,
         line=1,
         rule="other",
@@ -3636,7 +3636,7 @@ def test_an_undecodable_file_is_one_finding_naming_the_byte(tmp_path: Path) -> N
     path = tmp_path / "mod.py"
     path.write_bytes(b"x = 1\n# \xe9\n")
 
-    assert houselint.unit_for(path, reporter="other") == Finding(
+    assert houselint.read_unit(path, reporter="other") == Finding(
         path=path,
         line=1,
         rule="other",
