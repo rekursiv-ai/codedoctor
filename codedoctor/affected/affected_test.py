@@ -9,6 +9,7 @@ from unittest.mock import Mock
 
 import argparse
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -16,7 +17,7 @@ import threading
 
 import pytest
 
-from codedoctor.affected import affected
+from codedoctor.affected import affected, backbone
 from codedoctor.affected.affected import _collection_patterns, _skipped, harvest
 
 
@@ -703,9 +704,9 @@ def test_a_torn_derived_build_is_retried_not_cached_as_done(tmp_path: Path) -> N
     connection.commit()
     connection.close()
 
-    assert affected._ensure_derived(database) is None
+    assert affected.ensure_derived(database) is None
     # The retry must REBUILD rather than trust the first attempt's debris.
-    assert affected._ensure_derived(database) is None
+    assert affected.ensure_derived(database) is None
     assert sorted(path.name for path in tmp_path.iterdir()) == ["partial.db"]
 
 
@@ -1715,6 +1716,7 @@ def test_main_prints_only_the_selection(
         del args, kwargs
         return ["x.py"]
 
+    _recorded_harvest(monkeypatch)
     monkeypatch.setattr(affected, "harvest", harvest_stub)
     monkeypatch.setattr(sys, "argv", ["affected", "--", "x.py"])
     assert affected.main() == 0
@@ -1889,13 +1891,16 @@ def test_globs_accepts_lists_and_falls_back_for_other_values() -> None:
     assert affected._globs(None, default=["x"]) == ["x"]
 
 
-def test_selector_method_without_class_owner_uses_file_selector() -> None:
+def test_selector_method_without_class_owner_uses_file_selector(
+    tmp_path: Path,
+) -> None:
     """A method without a class edge remains directly selectable."""
-    connection = sqlite3.connect(":memory:")
-    connection.executescript(
-        "CREATE TABLE nodes (id TEXT, name TEXT, kind TEXT);"
-        "CREATE TABLE edges (source TEXT, target TEXT, kind TEXT)",
-    )
+    database = _graph(tmp_path / "index.db", nodes=[])
+    derived = affected.ensure_derived(database)
+    assert derived is not None
+    connection = sqlite3.connect(database)
+    connection.execute("ATTACH DATABASE ? AS derived", (str(derived),))
+    affected._lay_over(connection, None)
     try:
         assert (
             affected._selector(
@@ -1929,15 +1934,24 @@ def test_an_absent_skip_names_no_token(
     assert not _skipped(token)
 
 
-def _recorded_harvest(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
-    """Replace ``harvest`` with a recorder of its keyword arguments."""
+def _recorded_harvest(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    overlay: Path | None = None,
+) -> list[dict[str, object]]:
+    """Replace ``harvest`` with a recorder; the graph reads as current, with ``overlay``."""
     calls: list[dict[str, object]] = []
 
     def recorded(database: Path, **kwargs: object) -> list[str]:
         calls.append({"database": database, **kwargs})
         return []
 
+    def current(caches: Path, **_: object) -> tuple[str, Path | None]:
+        del caches
+        return ("", overlay)
+
     monkeypatch.setattr(affected, "harvest", recorded)
+    monkeypatch.setattr(backbone, "overlay_problem", current)
     return calls
 
 
@@ -1980,7 +1994,8 @@ def test_flag_defaults_and_types(monkeypatch: pytest.MonkeyPatch) -> None:
         "files": [],
         "diff": None,
         "emit": "nodeids",
-        "database": ".codegraph/codegraph.db",
+        "caches": "/opt/scratch/caches/codegraph",
+        "database": "",
         "depth": 1,
         "skip_token": "harvest-affected",
         "workers": 1,
@@ -2015,7 +2030,7 @@ def test_help_documents_every_flag(
     text = " ".join(capsys.readouterr().out.split())
 
     for expected in (
-        "Reads `.codegraph/codegraph.db` read-only; `codegraph sync` is the writer.",
+        "Reads the shared backbone with this worktree's overlay laid over it,",
         "python -m codedoctor.affected --diff /dev/stdin lib.py",
         "files Changed repository-relative paths.",
         "--diff PATH Unified diff naming the changed lines, e.g. /dev/stdin.",
@@ -2085,6 +2100,39 @@ def test_globs_split_a_word_list_and_ignore_other_values() -> None:
     assert affected._globs(3, default=["x"]) == ["x"]
 
 
+def test_a_module_row_names_its_package_not_its_root() -> None:
+    assert affected._module_rows([("a/b/c.py",), ("top.py",)]) == [
+        ("a/b/c.py", "a.b.c", "a.b"),
+        ("top.py", "top", ""),
+    ]
+
+
+def test_one_worker_walks_every_seed_on_one_attached_handle(tmp_path: Path) -> None:
+    """Attaching twice raises `database derived is already in use`.
+
+    Swallowed as a read failure, that dropped every seed after a worker's first
+    to its sidecar.
+    """
+    database = _graph(
+        tmp_path / "backbone.db",
+        nodes=[
+            ("n:a", "function", "a", "a.py", 1),
+            ("n:b", "function", "b", "b.py", 1),
+            ("n:ta", "function", "test_a", "t_test.py", 1),
+            ("n:tb", "function", "test_b", "t_test.py", 11),
+        ],
+        edges=[("n:ta", "n:a", "calls"), ("n:tb", "n:b", "calls")],
+    )
+
+    assert harvest(
+        database,
+        changed=["a.py", "b.py"],
+        depth=1,
+        emit="nodeids",
+        workers=1,
+    ) == ["t_test.py::test_a", "t_test.py::test_b"]
+
+
 def test_a_stub_dependent_is_a_file_to_check(tmp_path: Path) -> None:
     """A dependent ``.pyi`` is type-checked like a ``.py``; other files are not."""
     database = tmp_path / "codegraph.db"
@@ -2134,6 +2182,545 @@ def test_every_sidecar_spelling_pairs_with_its_source(
     (tmp_path / sidecar).touch()
 
     assert affected._sidecars([changed]) == [Path(sidecar)]
+
+
+# `(id, kind, name, file_path, start_line)`; `qualified_name` is the name, and every
+# symbol spans five lines. Ids differ between the two indexes on purpose: CodeGraph
+# hashes the LINE into each id, so an edited file's symbols come back renamed.
+type _Node = tuple[str, str, str, str, int]
+
+
+def _graph(
+    database: Path,
+    *,
+    nodes: Sequence[_Node],
+    edges: Sequence[tuple[str, str, str]] = (),
+    refs: Sequence[tuple[str, str, str]] = (),
+) -> Path:
+    """Write a CodeGraph-shaped index; ``refs`` are ``(caller, name_tail, file)`` calls."""
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        "CREATE TABLE nodes (id TEXT PRIMARY KEY, kind TEXT, name TEXT,"
+        " file_path TEXT, qualified_name TEXT, start_line INTEGER, end_line INTEGER);"
+        "CREATE TABLE edges (source TEXT, target TEXT, kind TEXT);"
+        "CREATE TABLE unresolved_refs (from_node_id TEXT, reference_name TEXT,"
+        " reference_kind TEXT, file_path TEXT, name_tail TEXT);",
+    )
+    connection.executemany(
+        "INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            (i, kind, name, path, name, line, line + 4)
+            for i, kind, name, path, line in nodes
+        ],
+    )
+    connection.executemany("INSERT INTO edges VALUES (?, ?, ?)", edges)
+    connection.executemany(
+        "INSERT INTO unresolved_refs VALUES (?, ?, 'calls', ?, ?)",
+        [(caller, tail, path, tail) for caller, tail, path in refs],
+    )
+    connection.commit()
+    connection.close()
+    return database
+
+
+def _overlay(
+    tmp_path: Path,
+    *,
+    changed: Sequence[str],
+    nodes: Sequence[_Node] = (),
+    edges: Sequence[tuple[str, str, str]] = (),
+    refs: Sequence[tuple[str, str, str]] = (),
+) -> Path:
+    """Write an overlay as `codegraph_sync` publishes one: indexed, then stamped."""
+    overlay = _graph(tmp_path / "overlay.db", nodes=nodes, edges=edges, refs=refs)
+    backbone.stamp(overlay, sha="a" * 40, fingerprint="f", paths=changed)
+    return overlay
+
+
+def test_a_deleted_test_in_a_changed_file_is_never_selected(tmp_path: Path) -> None:
+    """The 2026-11-01 failure: pytest exited 4 on two tests the commit deleted.
+
+    The index still held `reread_test.py` as it was before the commit, so the
+    changed file's own seed rows named tests that no longer existed. The overlay
+    replaces every row of a changed file, deleted symbols included.
+    """
+    database = _graph(
+        tmp_path / "backbone.db",
+        nodes=[
+            ("old:helper", "function", "helper", "lib.py", 1),
+            ("old:gone", "function", "test_gone", "lib_test.py", 1),
+        ],
+        edges=[("old:gone", "old:helper", "calls")],
+    )
+    overlay = _overlay(
+        tmp_path,
+        changed=["lib.py", "lib_test.py"],
+        nodes=[
+            ("new:helper", "function", "helper", "lib.py", 3),
+            ("new:kept", "function", "test_kept", "lib_test.py", 7),
+        ],
+        edges=[("new:kept", "new:helper", "calls")],
+    )
+
+    for changed in (["lib.py"], ["lib_test.py"]):
+        assert harvest(
+            database,
+            changed=changed,
+            depth=1,
+            emit="nodeids",
+            overlay=overlay,
+        ) == ["lib_test.py::test_kept"]
+    assert harvest(database, changed=["lib_test.py"], depth=1, emit="nodeids") == [
+        "lib_test.py::test_gone",
+    ]
+
+
+def test_a_deleted_file_reaches_nothing(tmp_path: Path) -> None:
+    database = _graph(
+        tmp_path / "backbone.db",
+        nodes=[
+            ("old:helper", "function", "helper", "lib.py", 1),
+            ("old:gone", "function", "test_gone", "gone_test.py", 1),
+            ("old:kept", "function", "test_kept", "kept_test.py", 1),
+        ],
+        edges=[
+            ("old:gone", "old:helper", "calls"),
+            ("old:kept", "old:helper", "calls"),
+        ],
+    )
+    overlay = _overlay(
+        tmp_path,
+        changed=["lib.py", "gone_test.py"],
+        nodes=[("new:helper", "function", "helper", "lib.py", 9)],
+    )
+
+    assert harvest(
+        database,
+        changed=["lib.py"],
+        depth=1,
+        emit="nodeids",
+        overlay=overlay,
+    ) == ["kept_test.py::test_kept"]
+
+
+def test_an_unchanged_caller_still_reaches_an_edited_symbol(tmp_path: Path) -> None:
+    """The backbone's edge names the symbol's OLD id; the walk must follow it anyway.
+
+    `b.f` calls `a.g`. Editing `a.py` moves `g`, which re-hashes its id, so the
+    backbone edge points at an id the overlay no longer has. Two hops out, the
+    changed `c_test.py` calls `b.f` -- a call the overlay, indexed without `b.py`,
+    could only record unresolved.
+    """
+    database = _graph(
+        tmp_path / "backbone.db",
+        nodes=[
+            ("old:g", "function", "g", "a.py", 1),
+            ("old:f", "function", "f", "b.py", 1),
+            ("old:c", "function", "test_c", "c_test.py", 1),
+        ],
+        edges=[("old:f", "old:g", "calls")],
+    )
+    overlay = _overlay(
+        tmp_path,
+        changed=["a.py", "c_test.py"],
+        nodes=[
+            ("new:g", "function", "g", "a.py", 21),
+            ("new:c", "function", "test_c", "c_test.py", 1),
+            ("new:import", "import", "b", "c_test.py", 9),
+        ],
+        refs=[("new:c", "f", "c_test.py")],
+    )
+
+    assert harvest(
+        database,
+        changed=["a.py"],
+        depth=1,
+        emit="files",
+        overlay=overlay,
+    ) == [
+        "a.py",
+        "b.py",
+    ]
+    assert "c_test.py::test_c" in harvest(
+        database,
+        changed=["a.py"],
+        depth=2,
+        emit="nodeids",
+        overlay=overlay,
+    )
+
+
+def test_a_depth_three_walk_crosses_backbone_and_overlay_both_ways(
+    tmp_path: Path,
+) -> None:
+    """The type checkers walk 3 hops: overlay -> backbone -> overlay -> overlay.
+
+    Changed `a.py` defines `g`; unchanged `b.f` calls it (a backbone edge onto
+    `g`'s old id). Changed `c.h` calls `b.f`, which its overlay, indexed without
+    `b.py`, recorded only as unresolved. Changed `d_test.py` calls `c.h`.
+    """
+    database = _graph(
+        tmp_path / "backbone.db",
+        nodes=[
+            ("old:g", "function", "g", "a.py", 1),
+            ("old:f", "function", "f", "b.py", 1),
+            ("old:h", "function", "h", "c.py", 1),
+            ("old:d", "function", "test_d", "d_test.py", 1),
+        ],
+        edges=[("old:f", "old:g", "calls")],
+    )
+    overlay = _overlay(
+        tmp_path,
+        changed=["a.py", "c.py", "d_test.py"],
+        nodes=[
+            ("new:g", "function", "g", "a.py", 31),
+            ("new:h", "function", "h", "c.py", 41),
+            ("new:import", "import", "b", "c.py", 51),
+            ("new:d", "function", "test_d", "d_test.py", 61),
+        ],
+        edges=[("new:d", "new:h", "calls")],
+        refs=[("new:h", "f", "c.py")],
+    )
+
+    walked = {
+        depth: harvest(
+            database,
+            changed=["a.py"],
+            depth=depth,
+            emit="files",
+            overlay=overlay,
+        )
+        for depth in (1, 2, 3)
+    }
+
+    assert walked == {
+        1: ["a.py", "b.py"],
+        2: ["a.py", "b.py", "c.py"],
+        3: ["a.py", "b.py", "c.py", "d_test.py"],
+    }
+
+
+def test_an_unchanged_caller_reaches_a_new_symbol_it_could_not_bind(
+    tmp_path: Path,
+) -> None:
+    """A call into a symbol the backbone lacks sits in `unresolved_refs` until it lands."""
+    database = _graph(
+        tmp_path / "backbone.db",
+        nodes=[
+            ("old:g", "function", "g", "a.py", 1),
+            ("old:d", "function", "test_d", "d_test.py", 1),
+            ("old:import", "import", "a", "d_test.py", 9),
+        ],
+        refs=[("old:d", "fresh", "d_test.py")],
+    )
+    overlay = _overlay(
+        tmp_path,
+        changed=["a.py"],
+        nodes=[
+            ("old:g", "function", "g", "a.py", 1),
+            ("new:fresh", "function", "fresh", "a.py", 11),
+        ],
+    )
+
+    assert harvest(database, changed=["a.py"], depth=1, emit="nodeids") == []
+    assert harvest(
+        database,
+        changed=["a.py"],
+        depth=1,
+        emit="nodeids",
+        overlay=overlay,
+    ) == ["d_test.py::test_d"]
+
+
+def test_a_deleted_definition_makes_a_name_unique_again(tmp_path: Path) -> None:
+    """The unresolved arm admits only a name with ONE definition, counted after the overlay.
+
+    `helper` is defined in `lib.py` and `dup.py`, so the backbone refuses to bind
+    `e_test.py`'s unresolved call. Deleting `dup.py` leaves one definition.
+    """
+    database = _graph(
+        tmp_path / "backbone.db",
+        nodes=[
+            ("old:helper", "function", "helper", "lib.py", 1),
+            ("old:dup", "function", "helper", "dup.py", 1),
+            ("old:e", "function", "test_e", "e_test.py", 1),
+            ("old:import", "import", "lib", "e_test.py", 9),
+        ],
+        refs=[("old:e", "helper", "e_test.py")],
+    )
+    overlay = _overlay(tmp_path, changed=["dup.py"])
+
+    assert harvest(database, changed=["lib.py"], depth=1, emit="nodeids") == []
+    assert harvest(
+        database,
+        changed=["lib.py"],
+        depth=1,
+        emit="nodeids",
+        overlay=overlay,
+    ) == ["e_test.py::test_e"]
+
+
+def test_an_overlay_method_is_selected_through_its_overlay_class(
+    tmp_path: Path,
+) -> None:
+    database = _graph(
+        tmp_path / "backbone.db",
+        nodes=[("old:helper", "function", "helper", "lib.py", 1)],
+    )
+    overlay = _overlay(
+        tmp_path,
+        changed=["x_test.py"],
+        nodes=[
+            ("new:class", "class", "TestX", "x_test.py", 1),
+            ("new:method", "method", "test_m", "x_test.py", 2),
+        ],
+        edges=[
+            ("new:class", "new:method", "contains"),
+            ("new:method", "old:helper", "calls"),
+        ],
+    )
+
+    assert harvest(
+        database,
+        changed=["x_test.py"],
+        depth=1,
+        emit="nodeids",
+        overlay=overlay,
+    ) == ["x_test.py::TestX::test_m"]
+
+
+def _arm(sql: str, name: str) -> str:
+    """Return arm ``name`` of the walk, comments dropped and whitespace collapsed."""
+    body = sql.split(f"-- ARM {name}\n", 1)[1]
+    body = re.split(r"\n\s*UNION\n|\n\)\nSELECT", body, maxsplit=1)[0]
+    return " ".join(
+        " ".join(line.split("--", 1)[0] for line in body.splitlines()).split(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "tables", "only"),
+    [
+        (
+            "edges",
+            [("main.edges", "temp.oedges"), ("main.nodes", "temp.onodes")],
+            "AND source.file_path NOT IN (SELECT path FROM temp.changed) ",
+        ),
+        (
+            "refs",
+            [("derived.refs", "temp.orefs"), ("main.nodes", "temp.onodes")],
+            "AND unresolved_refs.file_path NOT IN (SELECT path FROM temp.changed) ",
+        ),
+    ],
+)
+def test_each_arm_pair_shares_one_admission_rule(
+    kind: str,
+    tables: list[tuple[str, str]],
+    only: str,
+) -> None:
+    """The backbone and overlay twins differ in their tables and one filter, nothing else.
+
+    They are written out rather than formatted from one template, so a fix to one
+    admission test that missed its twin would otherwise pass every walk test that
+    never crosses that arm.
+    """
+    sql = affected._walk()
+    backbone_arm = _arm(sql, f"{kind}/backbone")
+    for main_table, temp_table in tables:
+        backbone_arm = backbone_arm.replace(main_table, temp_table)
+
+    assert only in backbone_arm
+    assert backbone_arm.replace(only, "") == _arm(sql, f"{kind}/overlay")
+
+
+def test_a_graph_problem_is_reported_and_the_walk_falls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """A gate must never walk an index it cannot trust, and never do so silently."""
+    (tmp_path / "x_test.py").touch()
+    monkeypatch.delenv("SKIP", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["affected", "--caches", str(tmp_path / "caches"), "--", "x.py"],
+    )
+
+    assert affected.main() == 0
+    out, err = capfd.readouterr()
+    assert out == "x_test.py\n"
+    assert "No CodeGraph backbone" in err
+    assert "without the graph" in err
+
+
+def _stale_backbone(caches: Path) -> None:
+    """Publish a backbone in which ``x_test.py::test_x`` calls ``x.f``, and no overlay."""
+    database = backbone.backbone_database(caches)
+    database.parent.mkdir(parents=True)
+    _graph(
+        database,
+        nodes=[
+            ("n:f", "function", "f", "x.py", 1),
+            ("n:t", "function", "test_x", "x_test.py", 1),
+        ],
+        edges=[("n:t", "n:f", "calls")],
+    )
+    backbone.stamp(database, sha="a" * 40)
+
+
+def test_a_problem_with_a_readable_backbone_still_never_walks_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Without a current overlay the backbone may name deleted tests; it must not be walked."""
+    _stale_backbone(tmp_path / "caches")
+    (tmp_path / "x_test.py").touch()
+    monkeypatch.delenv("SKIP", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["affected", "--caches", str(tmp_path / "caches"), "--", "x.py"],
+    )
+
+    assert affected.main() == 0
+    out, err = capfd.readouterr()
+    assert out == "x_test.py\n"
+    assert "No overlay" in err
+
+
+@pytest.mark.cli_git
+def test_main_checks_the_overlay_against_the_real_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """Freshness is decided by asking git, not by trusting the stamp."""
+    caches = tmp_path / "caches"
+    _stale_backbone(caches)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)  # noqa: S607 -- git from PATH.
+    overlay = backbone.overlay_database(caches, root=tmp_path)
+    overlay.parent.mkdir(parents=True)
+    _graph(overlay, nodes=[])
+    backbone.stamp(overlay, sha="a" * 40, fingerprint="stale", paths=["x.py"])
+    monkeypatch.delenv("SKIP", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["affected", "--caches", str(caches), "--", "x.py"],
+    )
+
+    assert affected.main() == 0
+    assert "git fetch origin" in capfd.readouterr().err
+
+
+def test_a_skipped_graph_reads_and_reports_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """`SKIP` already chose the floor; checking the overlay would only add noise."""
+    monkeypatch.setenv("SKIP", "harvest-affected")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["affected", "--caches", str(tmp_path / "caches"), "--", "x.py"],
+    )
+
+    assert affected.main() == 0
+    assert capfd.readouterr().err == ""
+
+
+def test_the_derived_cache_is_built_beside_the_index_under_its_tmp_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rename onto the cache must not cross devices; /tmp is often its own.
+
+    The `tmp-` prefix is also what spares a concurrent builder's scratch file
+    from the stale-cache sweep.
+    """
+    database = _index(tmp_path)
+    seen: list[list[str]] = []
+    real = affected._build_derived
+
+    def spying(connection: sqlite3.Connection) -> None:
+        seen.append(sorted(path.name for path in tmp_path.iterdir()))
+        real(connection)
+
+    monkeypatch.setattr(affected, "_build_derived", spying)
+    builder = database.with_name(f"{database.name}.affected-tmp-other")
+    builder.touch()
+
+    cache = affected.ensure_derived(database)
+
+    (during,) = seen
+    (scratch,) = [
+        name
+        for name in during
+        if name.startswith(f"{database.name}.affected-tmp-") and name != builder.name
+    ]
+    assert scratch not in {path.name for path in tmp_path.iterdir()}
+    assert cache is not None
+    assert builder.exists()
+
+
+def test_the_derived_cache_is_group_readable_and_keyed_on_this_code(
+    tmp_path: Path,
+) -> None:
+    """Every user reads one shared cache; checkouts of other code keep their own."""
+    database = _index(tmp_path)
+    first = affected.ensure_derived(database)
+    assert first is not None
+    assert first.stat().st_mode & 0o777 == 0o664
+    index, code = first.name.removeprefix(f"{database.name}.affected-").split("-")
+    assert len(code) == 16
+    # Same index, other code: another checkout's cache, which this build must spare.
+    first.unlink()
+    sibling = database.with_name(f"{database.name}.affected-{index}-0000")
+    other = database.with_name(f"{database.name}.affected-ffff-0000")
+    sibling.touch()
+    other.touch()
+
+    assert affected.ensure_derived(database) == first
+    assert sibling.exists()
+    assert not other.exists()
+    with sqlite3.connect(database) as connection:
+        connection.execute("INSERT INTO edges VALUES ('n:a', 'n:b', 'calls')")
+    second = affected.ensure_derived(database)
+    assert second is not None
+    assert second.name.endswith(f"-{code}")
+    assert not first.exists()
+    assert not sibling.exists()
+
+
+def test_a_fresh_overlay_reaches_harvest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    found = tmp_path / "overlay.db"
+    calls = _recorded_harvest(monkeypatch, overlay=found)
+    monkeypatch.delenv("SKIP", raising=False)
+    monkeypatch.setattr(sys, "argv", ["affected", "--caches", "/c", "--", "x.py"])
+
+    assert affected.main() == 0
+    assert calls[0]["database"] == Path("/c/backbone/codegraph.db")
+    assert calls[0]["overlay"] == found
+    assert calls[0]["depth"] == 1
+
+
+def test_an_explicit_database_is_read_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--database` names an index to walk as it stands, with no overlay."""
+    calls = _recorded_harvest(monkeypatch)
+    monkeypatch.delenv("SKIP", raising=False)
+    monkeypatch.setattr(sys, "argv", ["affected", "--database", "x.db", "--", "x.py"])
+
+    assert affected.main() == 0
+    assert (calls[0]["database"], calls[0]["overlay"]) == (Path("x.db"), None)
 
 
 if __name__ == "__main__":
