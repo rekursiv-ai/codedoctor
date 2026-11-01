@@ -1742,6 +1742,38 @@ def test_a_users_text_conversion_does_not_hide_a_change(tmp_path: Path) -> None:
     }
 
 
+_CLASS_THEN_FUNCTION = """\
+class Holder:
+    LIMIT = 1
+    def method(self):
+        return 1
+def f(value):
+    return value
+TOP = 1
+"""
+
+
+def test_a_change_names_the_method_it_touched_and_not_the_function_before_it(
+    tmp_path: Path,
+) -> None:
+    """The method follows a class attribute; ``f`` ends the line before ``TOP``."""
+    root = _repo(tmp_path, body=_CLASS_THEN_FUNCTION)
+    shutil.rmtree(root / ".git")
+    _git(root, "init", "-q")
+    _git(root, "add", "-A")
+    _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base")
+    (root / "pkg/mod.py").write_text(
+        _CLASS_THEN_FUNCTION.replace("return 1", "return 2").replace(
+            "TOP = 1",
+            "TOP = 2",
+        ),
+    )
+
+    assert mutated.changed_functions(root, base="HEAD", files=["pkg/mod.py"]) == {
+        f"pkg.mod.x{CLASS_NAME_SEPARATOR}Holder{CLASS_NAME_SEPARATOR}method__mutmut_*",
+    }
+
+
 def test_a_change_is_found_in_a_project_below_the_git_root(tmp_path: Path) -> None:
     """Git names paths from its root; the project names them from its own."""
     root = _changed_repo(tmp_path, project="sub")
