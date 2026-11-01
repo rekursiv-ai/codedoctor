@@ -1730,6 +1730,18 @@ def test_a_users_diff_settings_do_not_hide_a_change(
     }
 
 
+def test_a_users_text_conversion_does_not_hide_a_change(tmp_path: Path) -> None:
+    """A converted diff numbers the converted lines, not the source's."""
+    root = _changed_repo(tmp_path)
+    (root / ".git/info").mkdir(exist_ok=True)
+    (root / ".git/info/attributes").write_text("*.py diff=blank\n")
+    _git(root, "config", "diff.blank.textconv", "true")
+
+    assert mutated.changed_functions(root, base="HEAD", files=["pkg/mod.py"]) == {
+        "pkg.mod.x_f7__mutmut_*",
+    }
+
+
 def test_a_change_is_found_in_a_project_below_the_git_root(tmp_path: Path) -> None:
     """Git names paths from its root; the project names them from its own."""
     root = _changed_repo(tmp_path, project="sub")
@@ -2456,7 +2468,7 @@ def test_a_mutmut_run_past_its_limit_is_stopped_with_what_it_started(
             ["/bin/sh", "-c", script],
             cwd=tmp_path,
             env=dict(os.environ),
-            timeout_sec=0.2,
+            timeout_sec=0.05,
         )
 
     # Not this process's child, so once killed it is gone when its parent reaps it.
@@ -2579,7 +2591,9 @@ def test_a_retry_past_its_limit_keeps_what_the_first_run_recorded(
     monkeypatch.setattr(mutated, "copy_snapshot", Mock())
     monkeypatch.setattr(mutated, "_paired_tests", Mock(return_value=("t.py",)))
     monkeypatch.setitem(
-        mutated.__dict__, "SourceFileMutationData", Mock(return_value=data)
+        mutated.__dict__,
+        "SourceFileMutationData",
+        Mock(return_value=data),
     )
     monkeypatch.setattr(mutated, "_collect", Mock(return_value=collected))
 
