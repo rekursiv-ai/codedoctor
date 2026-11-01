@@ -18,7 +18,8 @@ tests, so a broken test or crash costs only that file. Files run concurrently
 within --workers: one mutmut parent dispatches and records every mutant on a
 single core, so more parents, not more children per parent, raise
 throughput. A line is written as each file finishes, and every surviving
-mutant is reported with its diff.
+mutant is reported with its diff. --timeout-sec kills a mutmut run that
+takes longer, failing its file and no other; without it, runs have no limit.
 
 Findings are advice: they are printed and the run exits 0, unless --blocking
 is given or PRECOMMIT_MUTATION_BLOCKING holds a positive integer; then any
@@ -177,6 +178,7 @@ def main() -> int:
             shards=shards,
             children=children,
             parallel=parallel,
+            timeout_sec=flags.timeout_sec,
         )
     except (OSError, subprocess.CalledProcessError) as error:
         sys.stderr.write(f"mutation: cannot prepare the snapshot: {error}\n")
@@ -272,8 +274,23 @@ def changed_functions(root: Path, *, base: str, files: list[str]) -> frozenset[s
     names = [path for path in files if path.endswith(".py")]
     if not names:
         return frozenset[str]()
+    # Each option pins what a user's git config would change: the prefixes the
+    # parse strips, a diff program's output, and paths named from the git root.
     diff = subprocess.run(  # noqa: S603 -- git from PATH; derived arguments.
-        ["git", "diff", "--unified=0", "--no-color", base, "--", *names],  # noqa: S607 -- git from PATH.
+        [  # noqa: S607 -- git from PATH.
+            "git",
+            "diff",
+            "--unified=0",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--relative",
+            base,
+            "--",
+            *names,
+        ],
         cwd=root,
         capture_output=True,
         text=True,
@@ -490,6 +507,7 @@ def run_shard(
     snapshot: Path,
     template: Path,
     workers: int,
+    timeout_sec: float | None,
 ) -> ShardReport:
     """Mutate ``shard`` in ``snapshot``, collect every outcome, then delete it.
 
@@ -499,6 +517,7 @@ def run_shard(
       snapshot: Missing directory to run in; removed before returning.
       template: The project as laid out by ``copy_template``.
       workers: Mutants this shard runs concurrently.
+      timeout_sec: Most seconds each mutmut run may take; ``None`` is no limit.
 
     Returns:
       report: Outcomes and survivor diffs, or why there are none.
@@ -511,6 +530,7 @@ def run_shard(
             snapshot=snapshot,
             template=template,
             workers=workers,
+            timeout_sec=timeout_sec,
         )
     except subprocess.TimeoutExpired as error:
         return ShardReport(
@@ -767,6 +787,7 @@ class _Flags(Protocol):
     paths: list[Path]
     seed: str
     prefer_changed: str | None
+    timeout_sec: float | None
     function_sample_rate: float
     max_functions_sampled: int | None
     workers: int | None
@@ -831,6 +852,11 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         help="Sample the functions changed since commit BASE first (default: none).",
     )
     parser.add_argument(
+        "--timeout-sec",
+        type=float,
+        help="Kill a mutmut run past this many seconds (default: no limit).",
+    )
+    parser.add_argument(
         "--function-sample-rate",
         type=float,
         default=1.0,
@@ -890,6 +916,7 @@ def _run_shards(
     shards: tuple[Shard, ...],
     children: int,
     parallel: int,
+    timeout_sec: float | None,
 ) -> list[ShardReport]:
     """Run ``parallel`` shards at a time; report each one as it finishes."""
     # Mutmut writes `mutants/` into its working directory, so each shard runs
@@ -915,6 +942,7 @@ def _run_shards(
                 snapshot=base / str(index),
                 template=base / "template",
                 workers=children,
+                timeout_sec=timeout_sec,
             )
             for index, shard in enumerate(shards)
         ]
@@ -946,6 +974,7 @@ def _mutate(
     snapshot: Path,
     template: Path,
     workers: int,
+    timeout_sec: float | None,
 ) -> ShardReport:
     """Lay out ``snapshot``, run mutmut there, and read back what it recorded."""
     tests = _paired_tests(root, sources=(shard.source,))
@@ -985,6 +1014,7 @@ def _mutate(
         ],
         cwd=snapshot,
         env=fork_safe_env(single_threaded_env(os.environ)),
+        timeout_sec=timeout_sec,
     )
     if completed.returncode:
         return ShardReport(
@@ -993,7 +1023,7 @@ def _mutate(
             f"mutation: {shard.source}: mutmut exited {completed.returncode} "
             "before recording results; its output is above.",
         )
-    _retry_inconclusive(snapshot, shard=shard)
+    _retry_inconclusive(snapshot, shard=shard, timeout_sec=timeout_sec)
     return _collect(snapshot, shard=shard)
 
 
@@ -1010,8 +1040,17 @@ def _unparsable(root: Path, *, tests: tuple[str, ...]) -> list[str]:
     return errors
 
 
-def _retry_inconclusive(snapshot: Path, *, shard: Shard) -> None:
-    """Retry selected segfaulted and unrun mutants serially once."""
+def _retry_inconclusive(
+    snapshot: Path,
+    *,
+    shard: Shard,
+    timeout_sec: float | None,
+) -> None:
+    """Retry selected segfaulted and unrun mutants serially once; past the limit, stop.
+
+    The first run's results are already recorded; those the retry did not reach
+    stay inconclusive.
+    """
     data = SourceFileMutationData(path=snapshot / "mutants" / shard.source)
     data.load()
     names = tuple(
@@ -1021,11 +1060,13 @@ def _retry_inconclusive(snapshot: Path, *, shard: Shard) -> None:
         and (code is None or status_by_exit_code[code] == "segfault")
     )
     if names:
-        _ = _run_mutmut(
-            [sys.executable, "-m", "mutmut", "run", "--max-children", "1", *names],
-            cwd=snapshot,
-            env=fork_safe_env(single_threaded_env(os.environ)),
-        )
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            _ = _run_mutmut(
+                [sys.executable, "-m", "mutmut", "run", "--max-children", "1", *names],
+                cwd=snapshot,
+                env=fork_safe_env(single_threaded_env(os.environ)),
+                timeout_sec=timeout_sec,
+            )
 
 
 # Its own session, so a run past its limit is killed with every worker it
@@ -1035,7 +1076,7 @@ def _run_mutmut(
     *,
     cwd: Path,
     env: Mapping[str, str],
-    timeout_sec: float = 900.0,
+    timeout_sec: float | None,
 ) -> subprocess.CompletedProcess[str]:
     """Run ``argv`` to its end, or kill it and all it started after ``timeout_sec``."""
     with subprocess.Popen(  # noqa: S603 -- fixed executable, derived arguments.

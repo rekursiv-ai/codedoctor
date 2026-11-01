@@ -690,6 +690,7 @@ def test_selectors_run_clean_tests_for_only_the_exact_function(
             snapshot=tmp_path / "snapshot",
             template=tmp_path,
             workers=1,
+            timeout_sec=None,
         )
     argv = cast("list[str]", run.call_args.args[0])
     # Importing mutmut's CLI reads its config from the cwd, so it waits for the
@@ -1091,6 +1092,7 @@ def test_every_selected_function_must_be_exercised(
         snapshot=tmp_path / "snapshot",
         template=_template(root, tmp_path),
         workers=1,
+        timeout_sec=None,
     )
 
     assert report.failure == ""
@@ -1132,6 +1134,7 @@ def test_a_function_whose_mutants_are_all_killed_passes(tmp_path: Path) -> None:
         snapshot=tmp_path / "snapshot",
         template=_template(root, tmp_path),
         workers=1,
+        timeout_sec=None,
     )
 
     assert report == ShardReport(
@@ -1166,6 +1169,7 @@ def test_a_mutant_confined_to_a_cast_type_is_not_a_survivor(tmp_path: Path) -> N
         snapshot=tmp_path / "snapshot",
         template=_template(root, tmp_path),
         workers=1,
+        timeout_sec=None,
     )
 
     assert report.failure == ""
@@ -1194,6 +1198,7 @@ def test_an_unreachable_docstring_fallback_is_not_a_survivor(tmp_path: Path) -> 
         snapshot=tmp_path / "snapshot",
         template=_template(root, tmp_path),
         workers=1,
+        timeout_sec=None,
     )
 
     assert report.failure == ""
@@ -1466,6 +1471,8 @@ def test_main_runs_each_file_alone_within_the_worker_budget(
             "mutated",
             "--workers",
             str(workers),
+            "--timeout-sec",
+            "12",
             "--explain",
             "pkg/a.py",
             "pkg/b.py",
@@ -1473,6 +1480,7 @@ def test_main_runs_each_file_alone_within_the_worker_budget(
     )
 
     assert mutated.main() == 0
+    assert {call.kwargs["timeout_sec"] for call in run.call_args_list} == {12.0}
 
     assert (
         f"[mutated] 2 file(s), {parallel} at a time x {children} worker(s)\n"
@@ -1682,13 +1690,13 @@ def test_an_uncapped_sample_checks_every_file(tmp_path: Path) -> None:
 _MANY = "".join(f"def f{n}(value):\n    return value + {n}\n\n\n" for n in range(12))
 
 
-def _changed_repo(tmp_path: Path) -> Path:
-    """Return a git root whose ``pkg/mod.py`` changed ``f7`` since ``HEAD``."""
-    root = _repo(tmp_path, body=_MANY)
+def _changed_repo(tmp_path: Path, *, project: str = "") -> Path:
+    """Return a project, at ``project`` in a git root, whose ``f7`` changed since ``HEAD``."""
+    root = _repo(tmp_path / project, body=_MANY)
     shutil.rmtree(root / ".git")
-    _git(root, "init", "-q")
-    _git(root, "add", "-A")
-    _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base")
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base")
     source = root / "pkg/mod.py"
     source.write_text(_MANY.replace("value + 7\n", "value + 70\n"))
     return root
@@ -1703,6 +1711,32 @@ def test_the_functions_a_change_touched_are_named(tmp_path: Path) -> None:
         base="HEAD",
         files=["pkg/mod.py", "pkg/new.py"],
     ) == frozenset({"pkg.mod.x_f7__mutmut_*", "pkg.new.x_g__mutmut_*"})
+
+
+@pytest.mark.parametrize(
+    "setting",
+    ["diff.noprefix", "diff.mnemonicPrefix", "diff.external"],
+)
+def test_a_users_diff_settings_do_not_hide_a_change(
+    tmp_path: Path,
+    setting: str,
+) -> None:
+    """Each rewrites the ``+++ b/`` line, or the whole diff, that is parsed."""
+    root = _changed_repo(tmp_path)
+    _git(root, "config", setting, "true")
+
+    assert mutated.changed_functions(root, base="HEAD", files=["pkg/mod.py"]) == {
+        "pkg.mod.x_f7__mutmut_*",
+    }
+
+
+def test_a_change_is_found_in_a_project_below_the_git_root(tmp_path: Path) -> None:
+    """Git names paths from its root; the project names them from its own."""
+    root = _changed_repo(tmp_path, project="sub")
+
+    assert mutated.changed_functions(root, base="HEAD", files=["pkg/mod.py"]) == {
+        "pkg.mod.x_f7__mutmut_*",
+    }
 
 
 @pytest.mark.parametrize("most", [1, None])
@@ -1739,6 +1773,14 @@ def test_without_a_base_every_function_is_as_likely_as_any() -> None:
         ["--prefer-changed", "HEAD"],
     )
     assert flags.prefer_changed == "HEAD"
+
+
+def test_a_run_by_hand_has_no_limit_unless_given_one() -> None:
+    """The hook gives one so a hung run cannot hold it; a person can wait or stop it."""
+    flags, _ = mutated._parse_args(argparse.ArgumentParser(), ["pkg"])
+    assert flags.timeout_sec is None
+    flags, _ = mutated._parse_args(argparse.ArgumentParser(), ["--timeout-sec", "12"])
+    assert flags.timeout_sec == 12.0
 
 
 def test_parallel_selection_forks_one_process_per_file_up_to_the_cap(
@@ -2185,6 +2227,7 @@ def test_a_failing_file_does_not_stop_the_others(
         ),
         children=1,
         parallel=2,
+        timeout_sec=None,
     )
 
     by_source = {report.source: report for report in reports}
@@ -2214,6 +2257,7 @@ def test_each_file_reports_as_it_finishes(
         shards=(Shard(source="a.py", filters=("a.x_f*",)),),
         children=1,
         parallel=1,
+        timeout_sec=None,
     )
 
     assert capsys.readouterr().err == "[mutated] 1/1 a.py: 4 checked\n"
@@ -2243,6 +2287,7 @@ def test_a_killed_runs_snapshot_is_swept_by_the_next_run(
         shards=(Shard(source="a.py", filters=("a.x_f*",)),),
         children=1,
         parallel=1,
+        timeout_sec=None,
     )
 
     assert "mutated-killed" not in seen
@@ -2426,12 +2471,12 @@ def test_a_mutmut_run_past_its_limit_is_stopped_with_what_it_started(
         pytest.fail(f"the job {pid} outlived its run's limit")
 
 
-def test_a_mutmut_run_within_its_limit_returns_what_it_printed(tmp_path: Path) -> None:
+def test_a_mutmut_run_without_a_limit_returns_what_it_printed(tmp_path: Path) -> None:
     done = mutated._run_mutmut(
         ["/bin/sh", "-c", "echo out; echo err >&2; exit 3"],
         cwd=tmp_path,
         env=dict(os.environ),
-        timeout_sec=5.0,
+        timeout_sec=None,
     )
     assert (done.returncode, done.stdout, done.stderr) == (3, "out\n", "err\n")
 
@@ -2454,6 +2499,7 @@ def test_a_shard_past_its_limit_is_reported_and_costs_no_other(
         snapshot=tmp_path / "snapshot",
         template=tmp_path,
         workers=1,
+        timeout_sec=900.0,
     )
 
     assert report.failure == "mutation: pkg/mod.py: mutmut ran past its 900 s limit"
@@ -2494,11 +2540,13 @@ def test_mutmut_retries_segfaulted_and_unrun_mutants_once(
         snapshot=snapshot,
         template=tmp_path,
         workers=4,
+        timeout_sec=7.0,
     )
 
     assert run.call_count == 2
     single = fork_safe_env(single_threaded_env(os.environ))
     assert [call.kwargs["env"] for call in run.call_args_list] == [single, single]
+    assert [call.kwargs["timeout_sec"] for call in run.call_args_list] == [7.0, 7.0]
     assert run.call_args_list[1].args[0] == [
         sys.executable,
         "-m",
@@ -2509,9 +2557,43 @@ def test_mutmut_retries_segfaulted_and_unrun_mutants_once(
         "pkg.mod.x_f__mutmut_1",
         "pkg.mod.x_f__mutmut_2",
     ]
-    assert run.call_args_list[1].kwargs == {"cwd": snapshot, "env": single}
+    assert run.call_args_list[1].kwargs == {
+        "cwd": snapshot,
+        "env": single,
+        "timeout_sec": 7.0,
+    }
     loaded.assert_called_once_with(path=snapshot / "mutants" / "pkg/mod.py")
     load.assert_called_once_with()
+
+
+def test_a_retry_past_its_limit_keeps_what_the_first_run_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mutants it retried stay inconclusive; every other result stands."""
+    first = subprocess.CompletedProcess[str]([], 0, "", "")
+    run = Mock(side_effect=[first, subprocess.TimeoutExpired(["mutmut"], 7.0)])
+    data = Mock(exit_code_by_key={"pkg.mod.x_f__mutmut_1": None})
+    collected = ShardReport(source="pkg/mod.py", checked=3)
+    monkeypatch.setattr(mutated, "_run_mutmut", run)
+    monkeypatch.setattr(mutated, "copy_snapshot", Mock())
+    monkeypatch.setattr(mutated, "_paired_tests", Mock(return_value=("t.py",)))
+    monkeypatch.setitem(
+        mutated.__dict__, "SourceFileMutationData", Mock(return_value=data)
+    )
+    monkeypatch.setattr(mutated, "_collect", Mock(return_value=collected))
+
+    report = run_shard(
+        tmp_path,
+        shard=Shard(source="pkg/mod.py", filters=("pkg.mod.x_f__mutmut_*",)),
+        snapshot=tmp_path / "snapshot",
+        template=tmp_path,
+        workers=1,
+        timeout_sec=7.0,
+    )
+
+    assert report == collected
+    assert run.call_count == 2
 
 
 def test_a_mutmut_crash_reports_the_tail_of_its_output(
@@ -2530,6 +2612,7 @@ def test_a_mutmut_crash_reports_the_tail_of_its_output(
         snapshot=tmp_path / "snapshot",
         template=tmp_path,
         workers=5,
+        timeout_sec=None,
     )
 
     assert report.failure == (
@@ -2542,6 +2625,7 @@ def test_a_mutmut_crash_reports_the_tail_of_its_output(
     assert run.call_args.kwargs == {
         "cwd": tmp_path / "snapshot",
         "env": fork_safe_env(single_threaded_env(os.environ)),
+        "timeout_sec": None,
     }
 
 
