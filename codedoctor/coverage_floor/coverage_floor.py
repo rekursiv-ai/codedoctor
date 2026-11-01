@@ -7,7 +7,8 @@ run fails when a test fails or a floored unit is below its floor: each
 changed source under ``--scope file``, or the changed sources of one
 directory pooled under ``--scope directory``. A floored source without a
 sidecar fails, save ``__init__.py`` and ``__main__.py``. Vendored sources,
-anything under a ``third_party/`` directory, are never floored.
+anything under a ``third_party/`` directory, are never floored, nor are
+fixtures under a ``testdata/`` directory, which coverage omits.
 
 Examples:
   python -m codedoctor.coverage_floor --floor pkg/=100 -- pkg/a.py
@@ -99,7 +100,7 @@ def sidecars(
     Args:
       paths: Changed repo-relative paths.
       floored: Directory prefixes, each ending in ``/``, whose sources count,
-        save those under a ``third_party/`` directory.
+        save those under a ``third_party/`` or ``testdata/`` directory.
 
     Returns:
       sources: Each floored, non-test source with at least one sidecar.
@@ -117,6 +118,9 @@ def sidecars(
             _is_test(name)
             or not path.startswith(floored)
             or "third_party" in name.parts
+            # pyproject's coverage `omit` drops `*/testdata/*`: no run measures
+            # a fixture, so demanding its sidecar fails every one.
+            or "testdata" in name.parts
         ):
             continue
         found = [
