@@ -1,10 +1,13 @@
 """Print the reverse-dependency closure of the changed files, per CodeGraph.
 
-Reads `.codegraph/codegraph.db` read-only; `codegraph sync` is the writer.
-A file's symbols are all seeds unless --diff names its changed lines.
+Reads the shared backbone with this worktree's overlay laid over it, both
+read-only; `codegraph_sync` writes them. A stale or missing overlay is reported
+on stderr and the selection falls back to the paired tests. A file's symbols
+are all seeds unless --diff names its changed lines.
 
 Examples:
   python -m codedoctor.affected lib.py
+  python -m codedoctor.affected --database some/codegraph.db lib.py
   git diff -U0 -- lib.py | python -m codedoctor.affected --diff /dev/stdin lib.py
 
 """
@@ -25,12 +28,15 @@ import hashlib
 import os
 import re
 import sqlite3
+import sys
 import tempfile
 import threading
 import tomllib
 
 from treekle import ReadError, from_plain
 
+from codedoctor.affected import backbone
+from codedoctor.gate.gate import output_argv
 from codedoctor.lib.files import walk
 from codedoctor.lib.worker_count import worker_count
 
@@ -45,6 +51,7 @@ if TYPE_CHECKING:
 class _Flags(Protocol):
     skip_token: str
     depth: int
+    caches: str
     database: str
     files: list[str]
     diff: str | None
@@ -66,8 +73,24 @@ def main() -> int:
     )
     flags = _parse_args(parser)
     depth = 0 if _skipped(flags.skip_token) else flags.depth
+    database = Path(flags.database) if flags.database else None
+    overlay: Path | None = None
+    if database is None:
+        database = backbone.backbone_database(Path(flags.caches))
+        if depth > 0:
+            problem, overlay = backbone.overlay_problem(
+                Path(flags.caches),
+                root=Path.cwd(),
+                output=output_argv,
+            )
+            if problem:
+                # Depth 0 is the floor `SKIP` already selects: each changed file's
+                # paired tests, or the changed files themselves.
+                depth = 0
+                sys.stderr.write(f"affected: {problem} Selecting without the graph.\n")
     lines = harvest(
-        Path(flags.database),
+        database,
+        overlay=overlay,
         changed=flags.files,
         depth=depth,
         emit=flags.emit,
@@ -94,11 +117,16 @@ def harvest(
     workers: int = 1,
     saturated: bool = False,
     hunks: Mapping[str, Sequence[tuple[int, int]]] | None = None,
+    overlay: Path | None = None,
 ) -> list[str]:
     """Return the reverse-dependency closure of ``changed``, projected by ``emit``.
 
     Args:
       database: CodeGraph SQLite index.
+      overlay: A stamped index of only the files that differ from ``database``,
+        laid over it: every row of a file it names replaces that file's rows in
+        ``database``, deleted symbols and files included. None walks
+        ``database`` as it stands.
       changed: Repository-relative paths of the changed files.
       depth: Maximum reverse-dependency hops.
       emit: ``"nodeids"`` for pytest selectors, ``"files"`` for file paths.
@@ -156,7 +184,11 @@ def harvest(
     # `database.exists()` rather than opening one. Not `connections.handle()`: that would open a handle HERE, on the
     # main thread, which no worker can reuse -- one wasted open per run.
     connections = (
-        _Connections(database=database, derived=_ensure_derived(database))
+        _Connections(
+            database=database,
+            derived=ensure_derived(database),
+            overlay=overlay,
+        )
         if depth > 0 and seeded and database.exists()
         else None
     )
@@ -192,13 +224,15 @@ class _Connections:
     recreates a temp table for each seed, so two seeds on one connection would
     read each other's line ranges. That is the whole reason for the split, and
     it is a CORRECTNESS one. The derived tables are shared: each handle attaches
-    the one cache `_ensure_derived` built.
+    the one cache `ensure_derived` built. The overlay is copied into each
+    handle's temp tables, which it is small enough for.
     """
 
     database: Path
     # Attached read-only to every handle; ``None`` when the build failed, which
     # degrades every walk to the sidecar fallback.
     derived: Path | None
+    overlay: Path | None
     _local: threading.local = field(default_factory=threading.local)
     _opened: list[sqlite3.Connection] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -222,10 +256,10 @@ class _Connections:
         return cast(sqlite3.Connection | None, self._local.connection)
 
     def attach(self, connection: sqlite3.Connection) -> None:
-        """Attach the derived tables to ``connection`` once.
+        """Attach the derived tables and lay the overlay over ``connection`` once.
 
-        Raises ``sqlite3.Error`` on a missing or unreadable cache, which
-        ``_reachable`` turns into the sidecar fallback like any read failure.
+        Raises ``sqlite3.Error`` on a missing or unreadable cache or overlay,
+        which ``_harvest_seed`` turns into the sidecar fallback.
 
         Args:
           connection: This thread's index handle.
@@ -239,6 +273,7 @@ class _Connections:
             """ATTACH DATABASE ? AS derived""",
             (f"file:{pathname2url(str(self.derived))}?mode=ro",),
         )
+        _lay_over(connection, self.overlay)
         self._local.attached = True
 
     def close(self) -> None:
@@ -281,304 +316,40 @@ def _connect(database: Path) -> sqlite3.Connection | None:
         return None
 
 
-# ONE seed per call, which is also what makes the pool safe: the walk and the selector
-# phase both run on the handle this thread owns, and `_selectors` needs the same handle
-# the walk used to resolve owning classes.
-def _harvest_seed(
-    seed: str,
-    *,
-    connections: _Connections | None,
-    depth: int,
-    hunks: Mapping[str, Sequence[tuple[int, int]]],
-    emit: str,
-    patterns: tuple[list[str], list[str], list[str]],
-) -> set[str]:
-    """Return one seed's projected closure, walked on this worker's connection."""
-    connection = connections.handle() if connections else None
-    if connection and connections:
-        try:
-            connections.attach(connection)
-        except sqlite3.Error:
-            connection = None
-    rows = _reachable(connection, seed=seed, depth=depth, lines=hunks.get(seed, ()))
-    if emit == "files":
-        return {row[3] for row in rows if row[3].endswith((".py", ".pyi"))}
-    # The sidecar is a per-file fallback, not a union: when the graph names
-    # individual tests, adding the whole paired file would run every test in it.
-    # Measured over 60 commits, the graph alone reaches 100% median recall at
-    # depth 1.
-    return _selectors(connection, rows=rows, patterns=patterns) or {
-        str(pair) for pair in _sidecars([seed])
-    }
-
-
-def _selectors(
-    connection: sqlite3.Connection | None,
-    *,
-    rows: list[tuple[str, str, str, str]],
-    patterns: tuple[list[str], list[str], list[str]],
-) -> set[str]:
-    """Return the pytest selectors among ``rows``, dropping uncollectable ones."""
-    if not connection:
-        return set()
-    functions, classes, files = patterns
-    try:
-        # A set: the walk yields one row per depth at which a node was reached.
-        return {
-            selector
-            for node_id, kind, name, file_path in rows
-            if kind in {"function", "method"}
-            and _collected(name, functions)
-            # `python_files` too: a `test_*` helper in a non-test module yields
-            # a selector pytest collects nothing from, and one such selector
-            # takes the whole invocation down with it.
-            and any(fnmatch(Path(file_path).name, pattern) for pattern in files)
-            and (
-                selector := _selector(
-                    connection,
-                    node_id,
-                    kind=kind,
-                    name=name,
-                    file_path=file_path,
-                    classes=classes,
-                )
-            )
-        }
-    except sqlite3.Error:
-        return set()
-
-
-# Any unified diff: `git diff`, `diff -u`, or several concatenated, which union. Only
-# the new side matters, since the index describes the tree as it is now. `diff -u`
-# follows the name with a tab and a timestamp.
-def _parse_diff(diff: Path) -> dict[str, list[tuple[int, int]]]:
-    """Return ``path -> [(first, last)]`` new-side line ranges in ``diff``."""
-    spans: dict[str, list[tuple[int, int]]] = {}
-    path: str | None = None
-    for line in diff.read_bytes().decode().splitlines():
-        match = re.match(
-            r"\+\+\+ (?:b/)?([^\t]*)|@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@",
-            line,
-        )
-        if match is None:
-            continue
-        name, start, length = cast(tuple[str | None, str, str | None], match.groups())
-        if name is not None:
-            path = None if name == "/dev/null" else name
-        elif path is not None:
-            first = int(start)
-            # A pure deletion reports length 0 at the line it was cut from;
-            # the symbol that lost those lines still changed.
-            spans.setdefault(path, []).append(
-                (first, first + max(int(length or 1), 1) - 1),
-            )
-    return spans
-
-
-# A hook cannot ask pre-commit whether a sibling ran, but `SKIP` reaches every hook's
-# environment. Reading it is what lets one token disable the index for the whole tier:
-# skip the writer and the readers stop reading, rather than silently serving a stale
-# graph.
-def _skipped(token: str) -> bool:
-    """Report whether pre-commit's ``SKIP`` names ``token``."""
-    skip = os.environ.get("SKIP")
-    return skip is not None and token in {name.strip() for name in skip.split(",")}
-
-
-# The `tests/` candidate is a SIBLING of the source directory, not a root-level mirror
-# of its full path: a `tools/` package may keep its tests in `tools/tests/`, the one
-# exception the house style allows to the adjacent-sidecar rule.
-def _sidecars(changed: list[str]) -> list[Path]:
-    """Return the test files paired by name with ``changed``, where they exist."""
-    paired: list[Path] = []
-    for path in changed:
-        source = Path(path)
-        stem = source.stem.removesuffix("_test").removeprefix("test_")
-        paired.extend(
-            candidate
-            for candidate in (
-                source.with_name(f"{stem}_test.py"),
-                source.with_name(f"test_{stem}.py"),
-                source.parent / "tests" / f"{stem}_test.py",
-                source.parent / "tests" / f"test_{stem}.py",
-            )
-            if candidate.is_file()
-        )
-    return paired
-
-
-# ONE seed, never a list: `harvest` must know which changed file produced a hit so an
-# unindexed file still gets its own sidecar, and a batched query returns an
-# undifferentiated row set. Accepting a list is what let one indexed file suppress every
-# other file's fallback.
-#
-# ``lines`` rolls each changed hunk to the symbol whose body contains it, so depth means
-# "callers of what I changed" rather than "callers of anything in that file" -- editing
-# one function in a 71-symbol module otherwise seeded all 71 and returned their
-# dependents too. Empty ``lines`` seeds the whole file, which is what a new or wholly-
-# rewritten file needs.
-#
-# Swallows every ``sqlite3.Error`` for the reason ``_connect`` documents.
-def _reachable(
-    connection: sqlite3.Connection | None,
-    *,
-    seed: str,
-    depth: int,
-    lines: Sequence[tuple[int, int]] = (),
-    # `UNION`, not `UNION ALL`: the graph has cycles and only the deduplicating
-    # form terminates.
-    #
-    # `kind != 'file'` on the walk. A file node carries an `imports` edge per
-    # importer, so one hop through it reaches every importer of the whole file
-    # rather than of the changed symbol -- and two hops reach
-    # the shared test runner module, which 1454 files import.
-    #
-    # Two arms feed `back`: resolved `edges`, and the `unresolved_refs` rows
-    # CodeGraph recorded but could not bind. Each carries its own admission
-    # test, documented at the arm.
-    sql: str = """
-WITH RECURSIVE seed(id) AS (
-  SELECT nodes.id FROM nodes
-  LEFT JOIN touched ON touched.first <= nodes.end_line
-                   AND touched.last >= nodes.start_line
-  WHERE nodes.file_path = :seed AND nodes.kind != 'file'
-    AND (touched.first IS NOT NULL OR NOT :scoped)
-),
-back(id, depth) AS (
-  SELECT id, 0 FROM seed
-  UNION
-  SELECT edges.source, back.depth + 1
-  FROM edges
-  JOIN back ON edges.target = back.id
-  JOIN nodes source ON source.id = edges.source
-  JOIN nodes target ON target.id = edges.target
-  WHERE back.depth < :depth AND source.kind != 'file'
-    -- Traverse an edge to a MULTIPLY-DEFINED name only when the source file
-    -- imports the module that definition lives in. `codegraph node <name>`
-    -- answers such a name with every definition and "pick the one you need";
-    -- the edge carries one of them, and taking it unexamined put
-    -- `sift/pruning_test.py` in a `sessions/types.py` changeset though it
-    -- imports its `SystemMessage` from `trackinizer`. A name with ONE
-    -- definition is left alone: CodeGraph also resolves on constructor shape,
-    -- which is how an aliased import legitimately reaches another module.
-    -- Unless it is PRIVATE: CodeGraph bound every `self._clock()` in the tree
-    -- to the sole top-level `_clock`, and a `_name` is never aliased or
-    -- re-exported, so only an importer of its module can reach it.
-    --
-    -- `modules` is a Python-built derived table mapping `file_path -> dotted
-    -- module`, populated rather than derived here: SQL `replace(path, '.py',
-    -- '')` strips that substring ANYWHERE, turning `api.pyi` into `apii`.
-    --
-    -- `anycount` and `imports` are the same construct for the same reason:
-    -- correlated work the CTE would otherwise redo per candidate row. See
-    -- `_build_derived`.
-    --
-    -- The suffix match is anchored on a COMPONENT BOUNDARY, via `_boundary`:
-    -- a dotted module path is a sequence of components, not a string, and a
-    -- bare `LIKE '%' || name` matched any tail -- importing stdlib `types`
-    -- claimed `endpoints/claude/custom_types.py`, `time` claimed
-    -- `sagent/types/runtime.py`. Same defect as the `replace(path, '.py', '')`
-    -- above, one operand over.
-    AND (
-      source.file_path = target.file_path
-      OR ((SELECT n FROM anycount WHERE name = target.name) < 2
-          AND (substr(target.name, 1, 1) != '_'
-               -- `from pkg import mod` records only `pkg`.
-               OR EXISTS (
-                 SELECT 1 FROM imports imported
-                 JOIN modules ON modules.file_path = target.file_path
-                 WHERE imported.file_path = source.file_path
-                   AND (modules.package = imported.module
-                        OR modules.package LIKE imported.boundary ESCAPE '\\'))))
-      OR EXISTS (
-        SELECT 1 FROM imports imported
-        JOIN modules ON modules.file_path = target.file_path
-        WHERE imported.file_path = source.file_path
-          AND (modules.dotted = imported.module
-               OR modules.dotted LIKE imported.boundary ESCAPE '\\')
-      )
-    )
-  UNION
-  -- References CodeGraph SAW but could not bind: a call through a
-  -- dynamically imported module (`importlib.import_module("pkg.mod")`) lands
-  -- here rather than in `edges`.
-  --
-  -- The caller must IMPORT the defining module. Counting first-party
-  -- definitions is not enough: a stdlib or third-party callee has ZERO of
-  -- them, so any repo function sharing its name captures every such call --
-  -- adding `chain` to `sessions/fuse.py` pulled ten `itertools.chain` call
-  -- sites across craftax, priml, and sagent into that file's changeset.
-  --
-  -- Reads `refs`/`defcount`/`imports`, not `unresolved_refs`/`nodes` directly.
-  -- This arm was ~99% of the walk's runtime against the base tables; see
-  -- `_build_derived` for what each replaces and the measurement.
-  SELECT unresolved_refs.from_node_id, back.depth + 1
-  FROM refs AS unresolved_refs
-  JOIN nodes target ON target.id = back.id
-  JOIN back ON target.name = unresolved_refs.name_tail
-  JOIN modules ON modules.file_path = target.file_path
-  WHERE back.depth < :depth
-    AND target.kind IN ('function', 'method', 'class')
-    AND 1 = (SELECT n FROM defcount WHERE name = unresolved_refs.name_tail)
-    AND EXISTS (
-      SELECT 1 FROM imports imported
-      WHERE imported.file_path = unresolved_refs.file_path
-        AND (modules.dotted = imported.module
-             OR modules.dotted LIKE imported.boundary ESCAPE '\\')
-    )
-)
-SELECT nodes.id, nodes.kind, nodes.name, nodes.file_path
-FROM back JOIN nodes ON nodes.id = back.id
-""",
-) -> list[tuple[str, str, str, str]]:
-    """Return ``(id, kind, name, file_path)`` rows reachable from one seed file."""
-    if not connection:
-        return []
-    try:
-        _touched_table(connection, lines)
-        return cast(
-            list[tuple[str, str, str, str]],
-            connection.execute(
-                sql,
-                {"seed": seed, "depth": depth, "scoped": bool(lines)},
-            ).fetchall(),
-        )
-    except sqlite3.Error:
-        return []
-
-
-def _touched_table(
-    connection: sqlite3.Connection,
-    lines: Sequence[tuple[int, int]],
-) -> None:
-    """Replace the ``touched`` line-range table with this seed's hunks."""
-    connection.executescript(
-        """
-        DROP TABLE IF EXISTS temp.touched;
-        CREATE TEMP TABLE touched (first INTEGER, last INTEGER);
-        """,
-    )
-    connection.executemany("""INSERT INTO touched VALUES (?, ?)""", lines)
-
-
 # Built ONCE per index version into a file beside the index, then attached read-only by
 # every worker of every run. Building per connection cost 1.2s per worker, so a pool of
 # 8 took 9.3s against 1.4s serial -- workers made the harvest slower.
 #
 # The key covers the index file and its WAL (CodeGraph writes land in the WAL until a
-# checkpoint) plus this module, so a sync or a change to the build invalidates it. The
-# build goes to a private temp file and is renamed into place only once complete: a
-# build that dies partway publishes nothing, so no run can trust half the tables.
-def _ensure_derived(database: Path) -> Path | None:
-    """Return the derived-table cache for ``database``, building it if stale."""
+# checkpoint) plus this module's CONTENT, so a sync or a change to the build invalidates
+# it. Content, not mtime: every checkout of this module has its own mtime, and readers
+# of one shared backbone from several checkouts keyed on it each built an 88 MB copy
+# and deleted the others' -- so cleanup also spares a cache of the same index built by
+# other code. The build goes to a private temp file and is renamed into place only once
+# complete: a build that dies partway publishes nothing, so no run can trust half the
+# tables.
+#
+# Mode 0o664, set explicitly: `mkstemp` creates 0o600, which left a cache in the shared
+# backbone directory that only its builder could read.
+def ensure_derived(database: Path) -> Path | None:
+    """Return the derived-table cache for ``database``, building it if stale.
+
+    Args:
+      database: The CodeGraph index.
+
+    Returns:
+      cache: The derived tables' file; None when the build failed.
+
+    """
     stats = [
         (path.stat().st_size, path.stat().st_mtime_ns)
-        for path in (database, Path(f"{database}-wal"), _THIS)
+        for path in (database, Path(f"{database}-wal"))
         if path.exists()
     ]
-    key = hashlib.sha256(repr(stats).encode()).hexdigest()[:16]
+    index = hashlib.sha256(repr(stats).encode()).hexdigest()[:16]
+    code = hashlib.sha256(_THIS.read_bytes()).hexdigest()[:16]
     prefix = f"{database.name}.affected-"
-    cache = database.with_name(f"{prefix}{key}")
+    cache = database.with_name(f"{prefix}{index}-{code}")
     if cache.exists():
         return cache
     handle, scratch = tempfile.mkstemp(dir=database.parent, prefix=f"{prefix}tmp-")
@@ -596,12 +367,13 @@ def _ensure_derived(database: Path) -> Path | None:
             connection.commit()
         finally:
             connection.close()
+        Path(scratch).chmod(0o664)
         Path(scratch).replace(cache)
     except sqlite3.Error:
         Path(scratch).unlink(missing_ok=True)
         return None
     for stale in database.parent.glob(f"{prefix}*"):
-        if stale != cache and not stale.name.startswith(f"{prefix}tmp-"):
+        if not stale.name.startswith((f"{prefix}{index}-", f"{prefix}tmp-")):
             stale.unlink(missing_ok=True)
     return cache
 
@@ -631,15 +403,14 @@ def _build_derived(connection: sqlite3.Connection) -> None:
     )
     connection.executemany(
         """INSERT INTO modules VALUES (?, ?, ?)""",
-        (
-            (path, _dotted(path), _dotted(path).rpartition(".")[0])
-            for (path,) in cast(
+        _module_rows(
+            cast(
                 list[tuple[str]],
                 connection.execute(
                     """SELECT DISTINCT file_path FROM source.nodes
                     WHERE file_path LIKE '%.py' OR file_path LIKE '%.pyi'""",
                 ).fetchall(),
-            )
+            ),
         ),
     )
     connection.executescript(
@@ -662,21 +433,35 @@ def _build_derived(connection: sqlite3.Connection) -> None:
     )
     connection.executemany(
         """INSERT INTO imports VALUES (?, ?, ?)""",
-        (
-            # `_module(...)`, not the raw `qualified_name`: the walk's equality
-            # arm and its LIKE arm must test the SAME name. Storing the raw one
-            # left `impl = '.impl'` false for a relative import of a TOP-LEVEL
-            # module, which is the one case no tail pattern can cover either.
-            (path, _module(qualified_name), _boundary(qualified_name))
-            for path, qualified_name in cast(
+        _import_rows(
+            cast(
                 list[tuple[str, str]],
                 connection.execute(
                     """SELECT file_path, qualified_name FROM source.nodes
                     WHERE kind = 'import'""",
                 ).fetchall(),
-            )
+            ),
         ),
     )
+
+
+def _module_rows(paths: Sequence[tuple[str]]) -> list[tuple[str, str, str]]:
+    """Return ``(file_path, dotted, package)`` for each Python file in ``paths``."""
+    return [
+        (path, _dotted(path), _dotted(path).rpartition(".")[0]) for (path,) in paths
+    ]
+
+
+# `_module(...)`, not the raw `qualified_name`: the walk's equality arm and its LIKE arm
+# must test the SAME name. Storing the raw one left `impl = '.impl'` false for a
+# relative import of a TOP-LEVEL module, which is the one case no tail pattern can
+# cover either.
+def _import_rows(imports: Sequence[tuple[str, str]]) -> list[tuple[str, str, str]]:
+    """Return ``(file_path, module, boundary)`` for each import's qualified name."""
+    return [
+        (path, _module(qualified_name), _boundary(qualified_name))
+        for path, qualified_name in imports
+    ]
 
 
 def _dotted(path: str) -> str:
@@ -828,12 +613,19 @@ def _selector(
     """Return the pytest nodeid for this symbol, or empty when uncollectable."""
     if kind != "method":
         return f"{file_path}::{name}"
+    # Both indexes, as the walk reads them: an overlay method's class is an overlay row.
     row = cast(
         tuple[str] | None,
         connection.execute(
-            """SELECT nodes.name FROM edges JOIN nodes ON nodes.id = edges.source
-            WHERE edges.target = ? AND edges.kind = 'contains' AND nodes.kind = 'class'""",
-            (node_id,),
+            """SELECT owner.name FROM main.edges edges
+            JOIN main.nodes owner ON owner.id = edges.source
+            WHERE edges.target = :id AND edges.kind = 'contains' AND owner.kind = 'class'
+              AND owner.file_path NOT IN (SELECT path FROM temp.changed)
+            UNION ALL
+            SELECT owner.name FROM temp.oedges edges
+            JOIN temp.onodes owner ON owner.id = edges.source
+            WHERE edges.target = :id AND edges.kind = 'contains' AND owner.kind = 'class'""",
+            {"id": node_id},
         ).fetchone(),
     )
     if not row:
@@ -861,9 +653,14 @@ def _parse_args(
         help="Projection of the closure.",
     )
     parser.add_argument(
+        "--caches",
+        default="/opt/scratch/caches/codegraph",
+        help="CodeGraph caches holding the backbone and this worktree's overlay.",
+    )
+    parser.add_argument(
         "--database",
-        default=".codegraph/codegraph.db",
-        help="CodeGraph SQLite index.",
+        default="",
+        help="Walk this CodeGraph index alone, instead of backbone plus overlay.",
     )
     parser.add_argument(
         "--depth",
@@ -901,3 +698,488 @@ def _covers_universe(changed: Sequence[str]) -> bool:
     return bool(universe) and {p.as_posix() for p in universe} <= {
         Path(path).as_posix() for path in changed
     }
+
+
+# ONE seed per call, which is also what makes the pool safe: the walk and the selector
+# phase both run on the handle this thread owns, and `_selectors` needs the same handle
+# the walk used to resolve owning classes.
+def _harvest_seed(
+    seed: str,
+    *,
+    connections: _Connections | None,
+    depth: int,
+    hunks: Mapping[str, Sequence[tuple[int, int]]],
+    emit: str,
+    patterns: tuple[list[str], list[str], list[str]],
+) -> set[str]:
+    """Return one seed's projected closure, walked on this worker's connection."""
+    connection = connections.handle() if connections else None
+    if connection and connections:
+        try:
+            connections.attach(connection)
+        except sqlite3.Error:
+            connection = None  # pragma: no mutate -- "" is falsy too.
+    rows = _reachable(connection, seed=seed, depth=depth, lines=hunks.get(seed, ()))
+    if emit == "files":
+        return {row[3] for row in rows if row[3].endswith((".py", ".pyi"))}
+    # The sidecar is a per-file fallback, not a union: when the graph names
+    # individual tests, adding the whole paired file would run every test in it.
+    # Measured over 60 commits, the graph alone reaches 100% median recall at
+    # depth 1.
+    return _selectors(connection, rows=rows, patterns=patterns) or {
+        str(pair) for pair in _sidecars([seed])
+    }
+
+
+def _selectors(
+    connection: sqlite3.Connection | None,
+    *,
+    rows: list[tuple[str, str, str, str]],
+    patterns: tuple[list[str], list[str], list[str]],
+) -> set[str]:
+    """Return the pytest selectors among ``rows``, dropping uncollectable ones."""
+    if not connection:
+        return set()
+    functions, classes, files = patterns
+    try:
+        # A set: the walk yields one row per depth at which a node was reached.
+        return {
+            selector
+            for node_id, kind, name, file_path in rows
+            if kind in {"function", "method"}
+            and _collected(name, functions)
+            # `python_files` too: a `test_*` helper in a non-test module yields
+            # a selector pytest collects nothing from, and one such selector
+            # takes the whole invocation down with it.
+            and any(fnmatch(Path(file_path).name, pattern) for pattern in files)
+            and (
+                selector := _selector(
+                    connection,
+                    node_id,
+                    kind=kind,
+                    name=name,
+                    file_path=file_path,
+                    classes=classes,
+                )
+            )
+        }
+    except sqlite3.Error:
+        return set()
+
+
+# Any unified diff: `git diff`, `diff -u`, or several concatenated, which union. Only
+# the new side matters, since the index describes the tree as it is now. `diff -u`
+# follows the name with a tab and a timestamp.
+def _parse_diff(diff: Path) -> dict[str, list[tuple[int, int]]]:
+    """Return ``path -> [(first, last)]`` new-side line ranges in ``diff``."""
+    spans: dict[str, list[tuple[int, int]]] = {}
+    path: str | None = None
+    for line in diff.read_bytes().decode().splitlines():
+        match = re.match(
+            r"\+\+\+ (?:b/)?([^\t]*)|@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@",
+            line,
+        )
+        if match is None:
+            continue
+        name, start, length = cast(tuple[str | None, str, str | None], match.groups())
+        if name is not None:
+            path = None if name == "/dev/null" else name
+        elif path is not None:
+            first = int(start)
+            # A pure deletion reports length 0 at the line it was cut from;
+            # the symbol that lost those lines still changed.
+            spans.setdefault(path, []).append(
+                (first, first + max(int(length or 1), 1) - 1),
+            )
+    return spans
+
+
+# A hook cannot ask pre-commit whether a sibling ran, but `SKIP` reaches every hook's
+# environment. Reading it is what lets one token disable the index for the whole tier:
+# skip the writer and the readers stop reading, rather than silently serving a stale
+# graph.
+def _skipped(token: str) -> bool:
+    """Report whether pre-commit's ``SKIP`` names ``token``."""
+    skip = os.environ.get("SKIP")
+    return skip is not None and token in {name.strip() for name in skip.split(",")}
+
+
+# The `tests/` candidate is a SIBLING of the source directory, not a root-level mirror
+# of its full path: a `tools/` package may keep its tests in `tools/tests/`, the one
+# exception the house style allows to the adjacent-sidecar rule.
+def _sidecars(changed: list[str]) -> list[Path]:
+    """Return the test files paired by name with ``changed``, where they exist."""
+    paired: list[Path] = []
+    for path in changed:
+        source = Path(path)
+        stem = source.stem.removesuffix("_test").removeprefix("test_")
+        paired.extend(
+            candidate
+            for candidate in (
+                source.with_name(f"{stem}_test.py"),
+                source.with_name(f"test_{stem}.py"),
+                source.parent / "tests" / f"{stem}_test.py",
+                source.parent / "tests" / f"test_{stem}.py",
+            )
+            if candidate.is_file()
+        )
+    return paired
+
+
+# ONE seed, never a list: `harvest` must know which changed file produced a hit so an
+# unindexed file still gets its own sidecar, and a batched query returns an
+# undifferentiated row set. Accepting a list is what let one indexed file suppress every
+# other file's fallback.
+#
+# ``lines`` rolls each changed hunk to the symbol whose body contains it, so depth means
+# "callers of what I changed" rather than "callers of anything in that file" -- editing
+# one function in a 71-symbol module otherwise seeded all 71 and returned their
+# dependents too. Empty ``lines`` seeds the whole file, which is what a new or wholly-
+# rewritten file needs.
+#
+# Swallows every ``sqlite3.Error`` for the reason ``_connect`` documents.
+def _reachable(
+    connection: sqlite3.Connection | None,
+    *,
+    seed: str,
+    depth: int,
+    lines: Sequence[tuple[int, int]] = (),
+) -> list[tuple[str, str, str, str]]:
+    """Return ``(id, kind, name, file_path)`` rows reachable from one seed file."""
+    if not connection:
+        return []
+    try:
+        _touched_table(connection, lines)
+        return cast(
+            list[tuple[str, str, str, str]],
+            connection.execute(
+                _walk(),
+                {"seed": seed, "depth": depth, "scoped": bool(lines)},
+            ).fetchall(),
+        )
+    except sqlite3.Error:
+        return []
+
+
+# `UNION`, not `UNION ALL`: the graph has cycles and only the deduplicating form
+# terminates.
+#
+# `kind != 'file'` on the walk. A file node carries an `imports` edge per importer, so
+# one hop through it reaches every importer of the whole file rather than of the changed
+# symbol -- and two hops reach the shared test runner module, which 1454 files import.
+#
+# Two kinds of arm feed `back`: resolved `edges`, and the `unresolved_refs` rows
+# CodeGraph recorded but could not bind. Each kind carries its own admission test,
+# documented at its first arm, and runs TWICE: over the backbone (`main`, minus every
+# file the overlay replaces) and over the overlay (`temp`, laid in by `_lay_over`).
+# The twins differ ONLY in their tables and that one filter;
+# `test_each_arm_pair_shares_one_admission_rule` holds them to it.
+#
+# Explicit arms, never a merged VIEW of the two: a UNION ALL view joined inside the
+# recursive step defeats every index -- SQLite materializes it per statement -- and
+# measured 6.7s per seed against 0.05s on the 1 GB backbone. Written out, not
+# formatted from one template: the SQL stays a literal no injection lint has to trust.
+#
+# `back` carries each node's kind, name, and file so no step re-reads a node by id:
+# that lookup is what would need the merged view.
+def _walk() -> str:
+    """Return the walk's recursive SQL over the backbone and the overlay."""
+    return """
+WITH RECURSIVE seed(id, kind, name, file_path) AS (
+  SELECT nodes.id, nodes.kind, nodes.name, nodes.file_path FROM all_nodes nodes
+  LEFT JOIN touched ON touched.first <= nodes.end_line
+                   AND touched.last >= nodes.start_line
+  WHERE nodes.file_path = :seed AND nodes.kind != 'file'
+    AND (touched.first IS NOT NULL OR NOT :scoped)
+),
+back(id, depth, kind, name, file_path) AS (
+  SELECT id, 0, kind, name, file_path FROM seed
+  UNION
+  -- ARM edges/backbone
+  SELECT edges.source, back.depth + 1, source.kind, source.name, source.file_path
+  FROM main.edges edges
+  JOIN back ON edges.target = back.id
+  JOIN main.nodes source ON source.id = edges.source
+  WHERE back.depth < :depth AND source.kind != 'file'
+    AND source.file_path NOT IN (SELECT path FROM temp.changed)
+    -- Traverse an edge to a MULTIPLY-DEFINED name only when the source file
+    -- imports the module that definition lives in. `codegraph node <name>`
+    -- answers such a name with every definition and "pick the one you need";
+    -- the edge carries one of them, and taking it unexamined put
+    -- `sift/pruning_test.py` in a `sessions/types.py` changeset though it
+    -- imports its `SystemMessage` from `trackinizer`. A name with ONE
+    -- definition is left alone: CodeGraph also resolves on constructor shape,
+    -- which is how an aliased import legitimately reaches another module.
+    -- Unless it is PRIVATE: CodeGraph bound every `self._clock()` in the tree
+    -- to the sole top-level `_clock`, and a `_name` is never aliased or
+    -- re-exported, so only an importer of its module can reach it.
+    --
+    -- `all_modules` maps `file_path -> dotted module`, built in Python rather
+    -- than derived here: SQL `replace(path, '.py', '')` strips that substring
+    -- ANYWHERE, turning `api.pyi` into `apii`.
+    --
+    -- `all_anycount` and `all_imports` are the same construct for the same
+    -- reason: correlated work the CTE would otherwise redo per candidate row.
+    -- See `_build_derived`. Each is a view over the backbone's table and the
+    -- overlay's, read only from a correlated subquery, where SQLite pushes the
+    -- lookup into both halves and keeps their indexes.
+    --
+    -- The suffix match is anchored on a COMPONENT BOUNDARY, via `_boundary`:
+    -- a dotted module path is a sequence of components, not a string, and a
+    -- bare `LIKE '%' || name` matched any tail -- importing stdlib `types`
+    -- claimed `endpoints/claude/custom_types.py`, `time` claimed
+    -- `sagent/types/runtime.py`. Same defect as the `replace(path, '.py', '')`
+    -- above, one operand over.
+    AND (
+      source.file_path = back.file_path
+      OR ((SELECT n FROM all_anycount WHERE name = back.name) < 2
+          AND (substr(back.name, 1, 1) != '_'
+               -- `from pkg import mod` records only `pkg`.
+               OR EXISTS (
+                 SELECT 1 FROM all_imports imported
+                 JOIN all_modules modules ON modules.file_path = back.file_path
+                 WHERE imported.file_path = source.file_path
+                   AND (modules.package = imported.module
+                        OR modules.package LIKE imported.boundary ESCAPE '\\'))))
+      OR EXISTS (
+        SELECT 1 FROM all_imports imported
+        JOIN all_modules modules ON modules.file_path = back.file_path
+        WHERE imported.file_path = source.file_path
+          AND (modules.dotted = imported.module
+               OR modules.dotted LIKE imported.boundary ESCAPE '\\')
+      )
+    )
+  UNION
+  -- ARM edges/overlay
+  SELECT edges.source, back.depth + 1, source.kind, source.name, source.file_path
+  FROM temp.oedges edges
+  JOIN back ON edges.target = back.id
+  JOIN temp.onodes source ON source.id = edges.source
+  WHERE back.depth < :depth AND source.kind != 'file'
+    AND (
+      source.file_path = back.file_path
+      OR ((SELECT n FROM all_anycount WHERE name = back.name) < 2
+          AND (substr(back.name, 1, 1) != '_'
+               OR EXISTS (
+                 SELECT 1 FROM all_imports imported
+                 JOIN all_modules modules ON modules.file_path = back.file_path
+                 WHERE imported.file_path = source.file_path
+                   AND (modules.package = imported.module
+                        OR modules.package LIKE imported.boundary ESCAPE '\\'))))
+      OR EXISTS (
+        SELECT 1 FROM all_imports imported
+        JOIN all_modules modules ON modules.file_path = back.file_path
+        WHERE imported.file_path = source.file_path
+          AND (modules.dotted = imported.module
+               OR modules.dotted LIKE imported.boundary ESCAPE '\\')
+      )
+    )
+  UNION
+  -- ARM refs/backbone
+  -- References CodeGraph SAW but could not bind: a call through a dynamically
+  -- imported module (`importlib.import_module("pkg.mod")`) lands here rather
+  -- than in `edges`. So does every call from the overlay into the backbone,
+  -- which CodeGraph indexed without the callee in sight.
+  --
+  -- The caller must IMPORT the defining module. Counting first-party
+  -- definitions is not enough: a stdlib or third-party callee has ZERO of
+  -- them, so any repo function sharing its name captures every such call --
+  -- adding `chain` to `sessions/fuse.py` pulled ten `itertools.chain` call
+  -- sites across craftax, priml, and sagent into that file's changeset.
+  --
+  -- Reads `refs`/`defcount`/`imports`, not `unresolved_refs`/`nodes` directly.
+  -- This arm was ~99% of the walk's runtime against the base tables; see
+  -- `_build_derived` for what each replaces and the measurement.
+  SELECT unresolved_refs.from_node_id, back.depth + 1,
+         caller.kind, caller.name, caller.file_path
+  FROM derived.refs AS unresolved_refs
+  JOIN back ON back.name = unresolved_refs.name_tail
+  JOIN main.nodes caller ON caller.id = unresolved_refs.from_node_id
+  WHERE back.depth < :depth
+    AND unresolved_refs.file_path NOT IN (SELECT path FROM temp.changed)
+    AND back.kind IN ('function', 'method', 'class')
+    AND 1 = (SELECT n FROM all_defcount WHERE name = unresolved_refs.name_tail)
+    AND EXISTS (
+      SELECT 1 FROM all_imports imported
+      JOIN all_modules modules ON modules.file_path = back.file_path
+      WHERE imported.file_path = unresolved_refs.file_path
+        AND (modules.dotted = imported.module
+             OR modules.dotted LIKE imported.boundary ESCAPE '\\')
+    )
+  UNION
+  -- ARM refs/overlay
+  SELECT unresolved_refs.from_node_id, back.depth + 1,
+         caller.kind, caller.name, caller.file_path
+  FROM temp.orefs AS unresolved_refs
+  JOIN back ON back.name = unresolved_refs.name_tail
+  JOIN temp.onodes caller ON caller.id = unresolved_refs.from_node_id
+  WHERE back.depth < :depth
+    AND back.kind IN ('function', 'method', 'class')
+    AND 1 = (SELECT n FROM all_defcount WHERE name = unresolved_refs.name_tail)
+    AND EXISTS (
+      SELECT 1 FROM all_imports imported
+      JOIN all_modules modules ON modules.file_path = back.file_path
+      WHERE imported.file_path = unresolved_refs.file_path
+        AND (modules.dotted = imported.module
+             OR modules.dotted LIKE imported.boundary ESCAPE '\\')
+    )
+)
+SELECT id, kind, name, file_path FROM back
+"""
+
+
+def _touched_table(
+    connection: sqlite3.Connection,
+    lines: Sequence[tuple[int, int]],
+) -> None:
+    """Replace the ``touched`` line-range table with this seed's hunks."""
+    connection.executescript(
+        """
+        DROP TABLE IF EXISTS temp.touched;
+        CREATE TEMP TABLE touched (first INTEGER, last INTEGER);
+        """,
+    )
+    connection.executemany("""INSERT INTO touched VALUES (?, ?)""", lines)
+
+
+# Every table the walk reads beyond `main` and `derived`, created on every handle so the
+# walk has one shape whether or not an overlay exists; without one they stay empty and
+# the views pass the backbone's tables straight through.
+#
+# The overlay's ids are REMAPPED onto the backbone's before use. CodeGraph hashes the
+# start line into every id, so editing a file renames its symbols, and the backbone's
+# edges from unchanged callers then point at ids no overlay row carries. A symbol that
+# matches one backbone symbol of its file, kind, and qualified name takes that id;
+# anything ambiguous keeps its own and loses only those inbound edges.
+#
+# The counts are MERGED, not overlaid: a name's definitions span files, so the overlay
+# shifts the backbone's count by what its files add and what they replaced.
+def _lay_over(connection: sqlite3.Connection, overlay: Path | None) -> None:
+    """Create the overlay's temp tables and the merged views on ``connection``."""
+    connection.executescript(
+        """
+        CREATE TEMP TABLE changed (path TEXT PRIMARY KEY);
+        CREATE TEMP TABLE onodes (id TEXT PRIMARY KEY, kind TEXT, name TEXT,
+          file_path TEXT, start_line INTEGER, end_line INTEGER);
+        CREATE INDEX temp.ix_onodes ON onodes(file_path);
+        CREATE TEMP TABLE oedges (source TEXT, target TEXT, kind TEXT);
+        CREATE INDEX temp.ix_oedges ON oedges(target);
+        CREATE TEMP TABLE orefs (from_node_id TEXT, name_tail TEXT, file_path TEXT);
+        CREATE INDEX temp.ix_orefs ON orefs(name_tail);
+        CREATE TEMP TABLE oimports (file_path TEXT, module TEXT, boundary TEXT);
+        CREATE INDEX temp.ix_oimports ON oimports(file_path);
+        CREATE TEMP TABLE omodules (file_path TEXT PRIMARY KEY, dotted TEXT, package TEXT);
+        CREATE TEMP TABLE odefcount (name TEXT PRIMARY KEY, n INTEGER);
+        CREATE TEMP TABLE oanycount (name TEXT PRIMARY KEY, n INTEGER);
+        CREATE TEMP VIEW all_nodes AS
+          SELECT id, kind, name, file_path, start_line, end_line FROM main.nodes
+          WHERE file_path NOT IN (SELECT path FROM temp.changed)
+          UNION ALL SELECT id, kind, name, file_path, start_line, end_line FROM temp.onodes;
+        CREATE TEMP VIEW all_imports AS
+          SELECT file_path, module, boundary FROM derived.imports
+          WHERE file_path NOT IN (SELECT path FROM temp.changed)
+          UNION ALL SELECT file_path, module, boundary FROM temp.oimports;
+        CREATE TEMP VIEW all_modules AS
+          SELECT file_path, dotted, package FROM derived.modules
+          WHERE file_path NOT IN (SELECT file_path FROM temp.omodules)
+          UNION ALL SELECT file_path, dotted, package FROM temp.omodules;
+        CREATE TEMP VIEW all_defcount AS
+          SELECT name, n FROM derived.defcount
+          WHERE name NOT IN (SELECT name FROM temp.odefcount)
+          UNION ALL SELECT name, n FROM temp.odefcount;
+        CREATE TEMP VIEW all_anycount AS
+          SELECT name, n FROM derived.anycount
+          WHERE name NOT IN (SELECT name FROM temp.oanycount)
+          UNION ALL SELECT name, n FROM temp.oanycount;
+        """,
+    )
+    if overlay is None:
+        return
+    connection.execute(
+        """ATTACH DATABASE ? AS overlay""",
+        (f"file:{pathname2url(str(overlay))}?mode=ro",),
+    )
+    connection.executescript(
+        """
+        INSERT INTO temp.changed SELECT path FROM overlay.codedoctor_changed;
+        CREATE TEMP TABLE pairs AS
+          SELECT new.id AS new_id, old.id AS old_id
+          FROM overlay.nodes new JOIN main.nodes old
+            ON old.file_path = new.file_path AND old.kind = new.kind
+           AND old.qualified_name = new.qualified_name;
+        CREATE TEMP TABLE idmap AS
+          SELECT new_id, old_id FROM temp.pairs
+          WHERE new_id IN (SELECT new_id FROM temp.pairs GROUP BY new_id HAVING COUNT(*) = 1)
+            AND old_id IN (SELECT old_id FROM temp.pairs GROUP BY old_id HAVING COUNT(*) = 1);
+        CREATE INDEX temp.ix_idmap ON idmap(new_id);
+        INSERT OR IGNORE INTO temp.onodes
+          SELECT COALESCE(idmap.old_id, n.id), n.kind, n.name, n.file_path,
+                 n.start_line, n.end_line
+          FROM overlay.nodes n LEFT JOIN temp.idmap ON idmap.new_id = n.id;
+        INSERT INTO temp.oedges
+          SELECT COALESCE(s.old_id, e.source), COALESCE(t.old_id, e.target), e.kind
+          FROM overlay.edges e
+          LEFT JOIN temp.idmap s ON s.new_id = e.source
+          LEFT JOIN temp.idmap t ON t.new_id = e.target;
+        INSERT INTO temp.orefs
+          SELECT COALESCE(m.old_id, r.from_node_id), r.name_tail, r.file_path
+          FROM overlay.unresolved_refs r LEFT JOIN temp.idmap m ON m.new_id = r.from_node_id
+          WHERE r.reference_kind = 'calls';
+        WITH removed AS (
+          SELECT name, COUNT(DISTINCT file_path) AS n FROM main.nodes
+          WHERE file_path IN (SELECT path FROM temp.changed)
+            AND kind IN ('function', 'method', 'class')
+          GROUP BY name
+        ), added AS (
+          SELECT name, COUNT(DISTINCT file_path) AS n FROM temp.onodes
+          WHERE kind IN ('function', 'method', 'class') GROUP BY name
+        )
+        INSERT INTO temp.odefcount
+          SELECT names.name,
+                 COALESCE((SELECT n FROM derived.defcount base WHERE base.name = names.name), 0)
+                 - COALESCE(removed.n, 0) + COALESCE(added.n, 0)
+          FROM (SELECT name FROM removed UNION SELECT name FROM added) names
+          LEFT JOIN removed USING (name) LEFT JOIN added USING (name);
+        WITH removed AS (
+          SELECT name, COUNT(DISTINCT file_path) AS n FROM main.nodes
+          WHERE file_path IN (SELECT path FROM temp.changed) AND kind != 'import'
+          GROUP BY name
+        ), added AS (
+          SELECT name, COUNT(DISTINCT file_path) AS n FROM temp.onodes
+          WHERE kind != 'import' GROUP BY name
+        )
+        INSERT INTO temp.oanycount
+          SELECT names.name,
+                 COALESCE((SELECT n FROM derived.anycount base WHERE base.name = names.name), 0)
+                 - COALESCE(removed.n, 0) + COALESCE(added.n, 0)
+          FROM (SELECT name FROM removed UNION SELECT name FROM added) names
+          LEFT JOIN removed USING (name) LEFT JOIN added USING (name);
+        """,
+    )
+    connection.executemany(
+        """INSERT INTO temp.omodules VALUES (?, ?, ?)""",
+        _module_rows(
+            cast(
+                list[tuple[str]],
+                connection.execute(
+                    """SELECT DISTINCT file_path FROM overlay.nodes
+                    WHERE file_path LIKE '%.py' OR file_path LIKE '%.pyi'""",
+                ).fetchall(),
+            ),
+        ),
+    )
+    connection.executemany(
+        """INSERT INTO temp.oimports VALUES (?, ?, ?)""",
+        _import_rows(
+            cast(
+                list[tuple[str, str]],
+                connection.execute(
+                    """SELECT file_path, qualified_name FROM overlay.nodes
+                    WHERE kind = 'import'""",
+                ).fetchall(),
+            ),
+        ),
+    )
+    # The inserts opened an implicit transaction, which holds the overlay attached.
+    connection.commit()
+    connection.execute("""DETACH DATABASE overlay""")
