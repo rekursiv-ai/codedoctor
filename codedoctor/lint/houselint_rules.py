@@ -2398,12 +2398,15 @@ _INVERTED: dict[type[ast.cmpop], type[ast.cmpop]] = {
 _POLYGLOT_HEADER: Final = (
     "# fmt: off",
     "'''' 2>/dev/null #",
-    'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 "$0" "$@"',
+    'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"',
 )
 _EXEC_LINE = re.compile(
     r'^exec uv --quiet --project "\$\(dirname "\$0"\)" run --frozen --no-sync\s+'
-    r'python3 (?:"\$0"|-m [\w.]+) "\$@"$',
+    r'python3 -P (?:"\$0"|-m [\w.]+) "\$@"$',
 )
+# ``python3`` with no ``-P`` puts the launcher's folder (or, under ``-m``, the current
+# one) first on ``sys.path``, where a sibling ``types.py`` shadows the stdlib's.
+_UNSAFE_PYTHON = re.compile(r'\bpython3 (?="\$0"|-m )')
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -4453,9 +4456,9 @@ class CliShapeRule:
 
     # Extra ruff-noqa lines after line 2 are allowed (a file may need ``N999``
     # for a kebab-case name); the fixed lines follow them. The ``exec`` line may span a
-    # backslash continuation and may run ``python3 -m <module>`` instead of ``"$0"``
-    # (shape 2b, where the module must import as itself); ``--frozen --no-sync`` are
-    # mandatory and the project is ``$(dirname "$0")`` with no path walk.
+    # backslash continuation and may run ``python3 -P -m <module>`` instead of ``"$0"``
+    # (shape 2b, where the module must import as itself); ``--frozen --no-sync`` and
+    # ``-P`` are mandatory and the project is ``$(dirname "$0")`` with no path walk.
     def _header(self, lines: Sequence[str], unit: Unit) -> Iterator[str]:
         """Check (a): the polyglot header, trailer, and executable bit."""
         if len(lines) < 5 or not _RUFF_NOQA_HEADER.match(lines[1]):
@@ -4489,7 +4492,7 @@ class CliShapeRule:
         if not _EXEC_LINE.match(exec_line):
             yield (
                 f"(a) line {exec_at + 1} must be `{_POLYGLOT_HEADER[2]}` "
-                '(or `... python3 -m <module> "$@"` for a coupled entry)'
+                '(or `... python3 -P -m <module> "$@"` for a coupled entry)'
             )
         if not lines or lines[-1] != "# vim: ft=python":
             yield "(a) last line must be `# vim: ft=python`"
@@ -6968,7 +6971,12 @@ def _fix_polyglot_header(lines: list[str]) -> None:
         if lines[exec_at].startswith(3 * "'"):
             break
         exec_at += 1
+    # The house launcher keeps its shape; its interpreter only gains ``-P``.
     if exec_at < len(lines) and lines[exec_at].startswith("exec uv "):
+        end = _continued_to(lines, exec_at)
+        lines[exec_at:end] = [
+            _UNSAFE_PYTHON.sub("python3 -P ", line) for line in lines[exec_at:end]
+        ]
         return
     # Another ``exec`` before the docstring is the launcher to replace, with the
     # lines its trailing backslashes continue it onto (as ``_header`` joins them).
@@ -6981,10 +6989,15 @@ def _fix_polyglot_header(lines: list[str]) -> None:
     if launch is None:
         lines.insert(start + 2, _POLYGLOT_HEADER[2] + "\n")
         return
-    end = launch + 1
+    lines[launch : _continued_to(lines, launch)] = [_POLYGLOT_HEADER[2] + "\n"]
+
+
+def _continued_to(lines: Sequence[str], row: int) -> int:
+    """Return the row after the shell line at ``row`` and its backslash continuations."""
+    end = row + 1
     while end < len(lines) and lines[end - 1].rstrip().endswith("\\"):
         end += 1
-    lines[launch:end] = [_POLYGLOT_HEADER[2] + "\n"]
+    return end
 
 
 def _is_main_guard(stmt: ast.If) -> bool:

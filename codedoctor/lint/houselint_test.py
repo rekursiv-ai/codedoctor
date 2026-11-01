@@ -3315,7 +3315,7 @@ _POLYGLOT_PRELUDE = (
 )
 _POLYGLOT_EXEC = (
     'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync '
-    'python3 "$0" "$@"\n'
+    'python3 -P "$0" "$@"\n'
 )
 
 
@@ -3337,11 +3337,15 @@ def test_cli_fix_terminates_the_last_line_before_the_modeline(tmp_path: Path) ->
 
 
 def test_cli_fix_keeps_a_custom_exec_uv_line(tmp_path: Path) -> None:
-    """Any ``exec uv`` line is the author's; only a missing one is replaced."""
+    """An ``exec uv`` line keeps its shape, given ``-P``; only a missing one is replaced."""
     exec_line = 'exec uv run python3 "$0" "$@"\n'
     body = _POLYGLOT_PRELUDE + exec_line + "'''\nx = 1\n"
     unit = _rule_unit(tmp_path, body, name="tool.py")
-    assert houselint_rules.CliShapeRule().fix(unit) == body + "# vim: ft=python\n"
+    assert houselint_rules.CliShapeRule().fix(unit) == (
+        _POLYGLOT_PRELUDE
+        + 'exec uv run python3 -P "$0" "$@"\n'
+        + "'''\nx = 1\n# vim: ft=python\n"
+    )
 
 
 def test_cli_fix_of_a_vanished_file_still_returns_the_rewrite(tmp_path: Path) -> None:

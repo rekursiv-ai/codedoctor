@@ -3012,7 +3012,7 @@ _POLYGLOT = (
     "# ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.\n"
     "# fmt: off\n"
     "'''' 2>/dev/null #\n"
-    'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 "$0" "$@"\n'
+    'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"\n'
     "Doc.\n"
     "'''\n"
     "# fmt: on\n"
@@ -3090,8 +3090,8 @@ def test_polyglot_exec_search_stops_at_docstring_close(tmp_path: Path) -> None:
     unit = Unit(path=tmp_path / "absent.py", source=source, kind="python")
     want = (
         '(a) line 7 must be `exec uv --quiet --project "$(dirname "$0")" run '
-        '--frozen --no-sync python3 "$0" "$@"` '
-        '(or `... python3 -m <module> "$@"` for a coupled entry)'
+        '--frozen --no-sync python3 -P "$0" "$@"` '
+        '(or `... python3 -P -m <module> "$@"` for a coupled entry)'
     )
     assert [f.message for f in CliShapeRule().check(unit)] == [want]
 
@@ -3143,7 +3143,7 @@ def test_cli_shape_fixes_polyglot_header_and_mode(tmp_path: Path) -> None:
         "# ruff: noqa: EXE003, D300, D205, N999 -- Polyglot shell/Python script.\n"
         "# fmt: off\n"
         "'''' 2>/dev/null #\n"
-        'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 "$0" "$@"\n',
+        'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"\n',
     )
     assert fixed.endswith("# vim: ft=python\n")
     assert path.stat().st_mode & 0o111
@@ -3255,7 +3255,7 @@ def test_cli_shape_reports_and_fixes_a_polyglot_noqa_without_a_reason(
         "# ruff: noqa: EXE003, D300, D205\n"
         "# fmt: off\n"
         "'''' 2>/dev/null #\n"
-        'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 "$0" "$@"\n'
+        'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"\n'
         "Doc.\n"
         "'''\n"
         "# vim: ft=python\n"
@@ -3294,7 +3294,7 @@ def test_cli_shape_fix_keeps_extra_noqa_and_comment_lines(tmp_path: Path) -> Non
         "# invoked by name.\n"
         "# fmt: off\n"
         "'''' 2>/dev/null #\n"
-        'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 "$0" "$@"\n'
+        'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"\n'
         "Doc.\n"
         "'''\n"
         "# vim: ft=python\n"
@@ -5466,7 +5466,7 @@ def test_cli_header_and_description_edge_branches(tmp_path: Path) -> None:
     body = (
         "#!/bin/sh\n# ruff: noqa: EXE003\n# shell note\n"
         "# fmt: off\n'''' 2>/dev/null #\nexec uv \\\n"
-        ' --project "$(dirname "$0")" run --frozen --no-sync python3 "$0" \\\n'
+        ' --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" \\\n'
         ' "$@"\n# vim: ft=python\n'
     )
     findings = _findings(tmp_path, CliShapeRule(), body, name="__main__.py")
@@ -5753,7 +5753,7 @@ def test_cli_shape_polyglot_fix_keeps_the_docstring_summary(tmp_path: Path) -> N
     """A header missing its noqa line had its docstring summary overwritten."""
     body = (
         "#!/bin/sh\n# fmt: off\n'''' 2>/dev/null #\n"
-        'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 "$0" "$@"\n'
+        'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"\n'
         "Summary line of the tool.\n'''\n# fmt: on\n# vim: ft=python\n"
     )
     fixed = _fixed(tmp_path, CliShapeRule(), body)
@@ -5811,11 +5811,11 @@ def test_single_use_helper_survives_an_unparsable_sibling(tmp_path: Path) -> Non
 
 # -- mutation coverage: cli-shape --------------------------------------------
 
-_EXEC: Final = 'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 "$0" "$@"'
+_EXEC: Final = 'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"'
 _HEAD: Final = "#!/bin/sh\n# ruff: noqa: EXE003, D300, D205 -- W.\n"
 _PINNED: Final = "# fmt: off\n'''' 2>/dev/null #\n"
 _EXEC_MSG: Final = (
-    f'must be `{_EXEC}` (or `... python3 -m <module> "$@"` for a coupled entry)'
+    f'must be `{_EXEC}` (or `... python3 -P -m <module> "$@"` for a coupled entry)'
 )
 
 
@@ -5896,6 +5896,34 @@ def test_cli_header_names_the_line_a_wrapped_exec_ends_on(tmp_path: Path) -> Non
 def test_cli_header_skips_a_shell_comment_line(tmp_path: Path) -> None:
     body = _HEAD + "# shell note\n" + _PINNED + _EXEC + "\n'''\n# vim: ft=python\n"
     assert _cli(tmp_path, body) == ([], None)
+
+
+@pytest.mark.parametrize(
+    "exec_line",
+    [
+        _EXEC,
+        _EXEC.replace('"$0" "$@"', '-m pkg.mod "$@"'),
+        _EXEC.replace(" python3 ", " \\\n  python3 "),
+    ],
+)
+def test_cli_header_without_safe_path_is_named_and_given_it(
+    tmp_path: Path,
+    exec_line: str,
+) -> None:
+    """A launcher died on import: its folder came first on ``sys.path``.
+
+    ``python3 "$0"`` puts the script's folder, symlink resolved, ahead of the stdlib, so
+    a ``types.py`` beside it stood in for ``types``. ``-P`` keeps it off, and a launcher
+    without it is given it, in whichever shape its line takes.
+    """
+    unsafe = exec_line.replace(" -P ", " ")
+    last = 5 + unsafe.count("\n")
+    findings, fixed = _cli(
+        tmp_path,
+        _HEAD + _PINNED + unsafe + "\n'''\n# vim: ft=python\n",
+    )
+    assert findings == [(1, f"(a) line {last} {_EXEC_MSG}")]
+    assert fixed == _HEAD + _PINNED + exec_line + "\n'''\n# vim: ft=python\n"
 
 
 def test_cli_header_missing_exec_bit_is_reported_and_set(tmp_path: Path) -> None:
@@ -6288,7 +6316,7 @@ def test_cli_header_check_joins_a_continued_exec_without_its_backslash(
 ) -> None:
     exec_lines = (
         'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync \\\n'
-        '  python3 "$0" "$@"\n'
+        '  python3 -P "$0" "$@"\n'
     )
     body = _HEAD + _PINNED + exec_lines + "'''\n# vim: ft=python\n"
     assert _cli(tmp_path, body)[0] == []
@@ -6790,7 +6818,7 @@ def test_cli_header_check_reads_a_header_of_only_comments(tmp_path: Path) -> Non
 def test_cli_header_check_continuation_may_trail_spaces(tmp_path: Path) -> None:
     exec_lines = (
         'exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync \\  \n'
-        '  python3 "$0" "$@"\n'
+        '  python3 -P "$0" "$@"\n'
     )
     findings, _ = _cli(
         tmp_path,
