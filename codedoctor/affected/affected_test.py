@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
 from unittest.mock import Mock
@@ -2687,7 +2688,7 @@ def test_the_derived_cache_is_group_readable_and_keyed_on_this_code(
     assert affected.ensure_derived(database) == first
     assert sibling.exists()
     assert not other.exists()
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("INSERT INTO edges VALUES ('n:a', 'n:b', 'calls')")
     second = affected.ensure_derived(database)
     assert second is not None

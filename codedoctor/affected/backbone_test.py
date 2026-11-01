@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -217,7 +218,7 @@ def test_an_overlay_indexes_only_the_changed_files(tmp_path: Path) -> None:
         fingerprint=backbone.fingerprint(root, sha=_SHA, paths=changed),
         paths=tuple(changed),
     )
-    with sqlite3.connect(overlay) as connection:
+    with closing(sqlite3.connect(overlay)) as connection:
         assert connection.execute(
             "SELECT file_path FROM nodes ORDER BY file_path",
         ).fetchall() == [("pkg/a.py",), ("pkg/c.py",)]
@@ -234,7 +235,7 @@ def test_an_unchanged_worktree_reuses_its_overlay(tmp_path: Path) -> None:
     calls: list[Path] = []
     git = _git(diff="a.py\0")
 
-    counts = []
+    counts: list[int] = []
     for content in ("x", "x", "y", "y"):
         (root / "a.py").write_text(content)
         assert (
@@ -438,7 +439,7 @@ def test_a_renamed_column_is_reported_not_queried(
     """An unpinned CodeGraph upgrade must degrade the gate, not mis-select."""
     caches = tmp_path / "caches"
     database = _published(caches)
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute(f"ALTER TABLE {table} RENAME COLUMN {column} TO renamed")
 
     problem, overlay = backbone.overlay_problem(caches, root=tmp_path, output=_git())
@@ -450,7 +451,7 @@ def test_a_renamed_column_is_reported_not_queried(
 
 def test_a_renamed_overlay_column_is_reported(tmp_path: Path) -> None:
     caches, root, overlay = _fresh(tmp_path)
-    with sqlite3.connect(overlay) as connection:
+    with closing(sqlite3.connect(overlay)) as connection, connection:
         connection.execute("ALTER TABLE edges RENAME COLUMN source TO renamed")
 
     problem, _ = backbone.overlay_problem(caches, root=root, output=_git(diff="a.py\0"))
