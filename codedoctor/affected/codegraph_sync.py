@@ -2,7 +2,7 @@
 # ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
 # fmt: off
 '''' 2>/dev/null #
-exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 "$0" "$@"
+exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
 Keep the CodeGraph index current for the gates that walk it.
 
 Runs only when PRECOMMIT_CODEGRAPH_PYTEST or PRECOMMIT_CODEGRAPH_TYPECHECK holds

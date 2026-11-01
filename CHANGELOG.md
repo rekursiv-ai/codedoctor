@@ -10,6 +10,10 @@ All notable codedoctor changes are documented here. This project follows
 - `mutation` findings are advisory: they print and the run exits 0. `--blocking`,
   or `PRECOMMIT_MUTATION_BLOCKING` set to a positive integer, makes any finding
   exit 1 as before. A run that cannot start still exits 1.
+- houselint's `cli-shape` wants a polyglot launcher to run `python3 -P "$0"` (or
+  `python3 -P -m MODULE`), and its fix adds the `-P`. Without it Python puts the
+  launcher's folder first on `sys.path`, where a module beside it, such as a
+  `types.py`, shadows the standard library's.
 
 ## 0.1.2 - 2026-10-22
 
