@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -149,7 +150,7 @@ def test_the_published_backbone_is_one_self_contained_file(tmp_path: Path) -> No
     _refresh(tmp_path, _Tools())
     database = backbone.backbone_database(tmp_path / "caches")
 
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
     assert not Path(f"{database}-wal").exists()
     assert not Path(f"{database}.tmp").exists()
