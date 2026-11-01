@@ -1819,6 +1819,55 @@ def test_without_a_base_every_function_is_as_likely_as_any() -> None:
     assert flags.prefer_changed == "HEAD"
 
 
+@pytest.mark.parametrize(
+    ("from_ref", "base"),
+    [(None, "HEAD"), ("", "HEAD"), ("abc123", "abc123")],
+    ids=["commit", "commit-empty", "range"],
+)
+def test_a_hook_prefers_what_pre_commit_checks(
+    monkeypatch: pytest.MonkeyPatch,
+    from_ref: str | None,
+    base: str,
+) -> None:
+    """A commit checks the change since ``HEAD``; ``--from-ref`` names its own start.
+
+    Pre-commit appends file names after the hook's flags; each stays a file.
+    """
+    if from_ref is None:
+        monkeypatch.delenv("PRE_COMMIT_FROM_REF", raising=False)
+    else:
+        monkeypatch.setenv("PRE_COMMIT_FROM_REF", from_ref)
+
+    flags, _ = mutated._parse_args(
+        argparse.ArgumentParser(),
+        ["--prefer-changed-in-pre-commit", "pkg/a.py", "pkg/b.py"],
+    )
+
+    assert (flags.prefer_changed, flags.paths) == (
+        base,
+        [Path("pkg/a.py"), Path("pkg/b.py")],
+    )
+
+
+def test_the_usage_names_what_prefer_changed_takes() -> None:
+    parser = argparse.ArgumentParser()
+    _ = mutated._parse_args(parser, [])
+    assert "[--prefer-changed BASE | --prefer-changed-in-pre-commit]" in " ".join(
+        parser.format_usage().split(),
+    )
+
+
+def test_a_base_and_pre_commit_s_base_are_not_both_given(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        mutated._parse_args(
+            argparse.ArgumentParser(),
+            ["--prefer-changed", "HEAD", "--prefer-changed-in-pre-commit"],
+        )
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
 def test_a_run_by_hand_has_no_limit_unless_given_one() -> None:
     """The hook gives one so a hung run cannot hold it; a person can wait or stop it."""
     flags, _ = mutated._parse_args(argparse.ArgumentParser(), ["pkg"])

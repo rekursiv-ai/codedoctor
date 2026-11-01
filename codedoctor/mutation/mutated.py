@@ -8,7 +8,9 @@ and a named file is mutated as given. Mutates every function under
 fraction of them, rounded up, and --max-functions-sampled caps that count.
 Mutmut skips decorated functions other than class and static methods.
 --prefer-changed BASE samples the functions changed since commit BASE before
-any other; without it, every function is as likely as any.
+any other; --prefer-changed-in-pre-commit takes BASE from what pre-commit
+checks: PRE_COMMIT_FROM_REF, or else HEAD. Without either, every function is as
+likely as any.
 The project root is the nearest
 pyproject.toml; flag defaults come from [tool.mutated] in the nearest
 pyproject.toml that has one, and flags override them.
@@ -846,10 +848,21 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         default=os.environ.get("PRECOMMIT_MUTATION_SEED", ""),
         help="Sampling seed (default: PRECOMMIT_MUTATION_SEED, or empty).",
     )
-    parser.add_argument(
+    preference = parser.add_mutually_exclusive_group()
+    preference.add_argument(
         "--prefer-changed",
         metavar="BASE",
         help="Sample the functions changed since commit BASE first (default: none).",
+    )
+    # Pre-commit sets PRE_COMMIT_FROM_REF only for --from-ref; a commit checks
+    # what changed since HEAD.
+    preference.add_argument(
+        "--prefer-changed-in-pre-commit",
+        action="store_const",
+        dest="prefer_changed",
+        const=os.environ.get("PRE_COMMIT_FROM_REF") or "HEAD",
+        help="Prefer what pre-commit checks: the change since PRE_COMMIT_FROM_REF, "
+        "or else since HEAD.",
     )
     parser.add_argument(
         "--timeout-sec",
@@ -883,10 +896,13 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Write the selected functions to stderr.",
     )
+    # pragma: no mutate start -- any non-count fallback is equally off.
+    blocking = positive(os.environ.get("PRECOMMIT_MUTATION_BLOCKING", ""))
+    # pragma: no mutate end
     parser.add_argument(
         "--blocking",
         action="store_true",
-        default=bool(positive(os.environ.get("PRECOMMIT_MUTATION_BLOCKING", ""))),
+        default=bool(blocking),
         help="Exit 1 on any finding (default: PRECOMMIT_MUTATION_BLOCKING, or off).",
     )
 
