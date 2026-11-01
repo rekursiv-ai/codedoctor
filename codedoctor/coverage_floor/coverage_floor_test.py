@@ -313,6 +313,7 @@ def test_each_group_pins_openblas_before_numpy_loads(
                 "pkg/__main__.py",
                 "pkg/gone.py",
                 "pkg/third_party/vendored.py",
+                "pkg/testdata/fixture.py",
             ],
             0,
             "",
@@ -334,6 +335,7 @@ def test_a_floored_source_without_a_sidecar_fails_and_runs_nothing(
             "pkg/__main__.py": "X = 1\n",
             "pkg/m.py": _SOURCE,
             "pkg/third_party/vendored.py": _SOURCE,
+            "pkg/testdata/fixture.py": _SOURCE,
         },
     )
     monkeypatch.chdir(tmp_path)
