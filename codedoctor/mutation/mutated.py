@@ -274,8 +274,9 @@ def changed_functions(root: Path, *, base: str, files: list[str]) -> frozenset[s
     names = [path for path in files if path.endswith(".py")]
     if not names:
         return frozenset[str]()
-    # Each option pins what a user's git config would change: the prefixes the
-    # parse strips, a diff program's output, and paths named from the git root.
+    # Each option pins what a user's git config would change: a diff program's
+    # or text conversion's output, the prefix the parse strips, and paths named
+    # from the git root rather than the project.
     diff = subprocess.run(  # noqa: S603 -- git from PATH; derived arguments.
         [  # noqa: S607 -- git from PATH.
             "git",
@@ -284,7 +285,6 @@ def changed_functions(root: Path, *, base: str, files: list[str]) -> frozenset[s
             "--no-color",
             "--no-ext-diff",
             "--no-textconv",
-            "--src-prefix=a/",
             "--dst-prefix=b/",
             "--relative",
             base,
@@ -1040,17 +1040,17 @@ def _unparsable(root: Path, *, tests: tuple[str, ...]) -> list[str]:
     return errors
 
 
+# Past the limit, stop.
+#
+# The first run's results are already recorded; those the retry did not reach stay
+# inconclusive.
 def _retry_inconclusive(
     snapshot: Path,
     *,
     shard: Shard,
     timeout_sec: float | None,
 ) -> None:
-    """Retry selected segfaulted and unrun mutants serially once; past the limit, stop.
-
-    The first run's results are already recorded; those the retry did not reach
-    stay inconclusive.
-    """
+    """Retry selected segfaulted and unrun mutants serially once."""
     data = SourceFileMutationData(path=snapshot / "mutants" / shard.source)
     data.load()
     names = tuple(
