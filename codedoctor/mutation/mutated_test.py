@@ -1160,6 +1160,49 @@ def test_a_function_whose_mutants_are_all_killed_passes(tmp_path: Path) -> None:
 
 @pytest.mark.cli_git
 @pytest.mark.cli_python_subprocess
+def test_a_mutant_that_skips_every_selected_test_is_killed(tmp_path: Path) -> None:
+    """Pytest exits 0 when it skips everything; such a mutant ran no test at all.
+
+    The repository's own collection hook decides what to skip, so a mutant of the
+    function it calls can skip the very tests that would catch it.
+    """
+    root = _repo(
+        tmp_path / "repo",
+        body='def skipped(name):\n    return name == "test_never"\n',
+    )
+    _runnable(root)
+    (root / "pkg/__init__.py").touch()
+    (root / "conftest.py").write_text(
+        "import pytest\n"
+        "from pkg.mod import skipped\n"
+        "def pytest_collection_modifyitems(items):\n"
+        "    for item in items:\n"
+        "        if skipped(item.name):\n"
+        "            item.add_marker(pytest.mark.skip(reason='skipped'))\n",
+    )
+    (root / "pkg/mod_test.py").write_text(
+        "from pkg.mod import skipped\n"
+        "def test_skipped():\n"
+        "    assert skipped('test_never')\n"
+        "    assert not skipped('test_skipped')\n",
+    )
+
+    report = run_shard(
+        root,
+        shard=Shard(source="pkg/mod.py", filters=("pkg.mod.x_skipped__mutmut_*",)),
+        snapshot=tmp_path / "snapshot",
+        template=_template(root, tmp_path),
+        workers=1,
+        timeout_sec=None,
+    )
+
+    assert report.failure == ""
+    assert report.outcomes["survived"] == ()
+    assert report.checked > 0
+
+
+@pytest.mark.cli_git
+@pytest.mark.cli_python_subprocess
 def test_a_mutant_confined_to_a_cast_type_is_not_a_survivor(tmp_path: Path) -> None:
     root = _repo(
         tmp_path / "repo",
@@ -2172,6 +2215,8 @@ def test_snapshots_load_the_dynamo_plugin_after_the_projects_own_args(
             "codedoctor.mutation.mutmut_dynamo",
             "-p",
             "codedoctor.mutation.mutmut_param_ids",
+            "-p",
+            "codedoctor.mutation.mutmut_outcome",
             "-p",
             "no:py_pglite",
             "-p",

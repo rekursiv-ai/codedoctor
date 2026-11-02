@@ -632,6 +632,8 @@ def copy_snapshot(
         "codedoctor.mutation.mutmut_dynamo",
         "-p",
         "codedoctor.mutation.mutmut_param_ids",
+        "-p",
+        "codedoctor.mutation.mutmut_outcome",
         # py_pglite marks every test whose path says "benchmark" `performance`,
         # which the default ``-m`` deselects, leaving such modules untestable.
         "-p",
