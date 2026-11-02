@@ -1247,6 +1247,19 @@ _UNOBSERVABLE_FLAGS: Final = frozenset({"usedforsecurity"})
 # so ``None`` behaves as ``False``.
 _TRUTH_FLAGS: Final = frozenset({"ensure_ascii", "add_help"})
 
+# Each resolves ``encoding=`` through ``codecs.lookup``, which ignores case.
+_CODEC_CALLS: Final = frozenset(
+    {
+        "open",
+        "encode",
+        "decode",
+        "read_text",
+        "write_text",
+        "reconfigure",
+        "TextIOWrapper",
+    },
+)
+
 
 # Header and codec names are lowercased: both are looked up whatever their case.
 def _erase_unobservable(code: str) -> str:
@@ -1255,7 +1268,7 @@ def _erase_unobservable(code: str) -> str:
     for node in ast.walk(tree):
         if isinstance(node, ast.Subscript) and (fallback := _raising_fallback(node)):
             fallback.values[-1] = ast.Constant(value=None)
-        if isinstance(node, ast.Subscript) and _is_headers(node.value):
+        if isinstance(node, ast.Subscript) and _is_http_headers(node.value):
             node.slice = _lowered(node.slice)
         if not isinstance(node, ast.Call):
             continue
@@ -1264,15 +1277,16 @@ def _erase_unobservable(code: str) -> str:
         if (
             isinstance(node.func, ast.Attribute)
             and node.func.attr == "get"
-            and _is_headers(node.func.value)
+            and _is_http_headers(node.func.value)
             and node.args
         ):
             node.args[0] = _lowered(node.args[0])
+        codec = _callee(node) in _CODEC_CALLS
         node.keywords = [k for k in node.keywords if k.arg not in _UNOBSERVABLE_FLAGS]
         for keyword in node.keywords:
             if keyword.arg == "help" and isinstance(keyword.value, ast.Constant):
                 keyword.value = ast.Constant(value=None)
-            elif keyword.arg == "encoding":
+            elif keyword.arg == "encoding" and codec:
                 keyword.value = _lowered(keyword.value)
             elif (
                 keyword.arg in _TRUTH_FLAGS
@@ -1283,11 +1297,11 @@ def _erase_unobservable(code: str) -> str:
     return ast.dump(tree)
 
 
-def _is_headers(node: ast.expr) -> bool:
-    """Return whether ``node`` names a ``headers`` mapping: ``headers`` or ``x.headers``."""
-    return (isinstance(node, ast.Name) and node.id == "headers") or (
-        isinstance(node, ast.Attribute) and node.attr == "headers"
-    )
+# ``x.headers`` is the case-insensitive mapping of ``http.server``, ``email``,
+# ``urllib``, ``requests`` and ``httpx``; a bare ``headers`` may be a plain dict.
+def _is_http_headers(node: ast.expr) -> bool:
+    """Return whether ``node`` is an attribute named ``headers``."""
+    return isinstance(node, ast.Attribute) and node.attr == "headers"
 
 
 def _lowered(node: ast.expr) -> ast.expr:
