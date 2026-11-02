@@ -245,6 +245,20 @@ def fingerprint(root: Path, *, sha: str, paths: Sequence[str]) -> str:
     return digest.hexdigest()
 
 
+def index_tree(tree: Path, *, run: Callable[[Sequence[str]], int]) -> int:
+    """Index ``tree`` from scratch into its ``.codegraph/codegraph.db``.
+
+    Args:
+      tree: The directory to index.
+      run: Runs one argv; returns its exit code.
+
+    Returns:
+      status: The CLI's exit code.
+
+    """
+    return run(["codegraph", "init", "--yes", str(tree)])
+
+
 def build_overlay(
     root: Path,
     *,

@@ -1978,6 +1978,77 @@ def _recorded_harvest(
     return calls
 
 
+def test_a_stale_overlay_is_rebuilt_before_the_walk(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Another process editing the worktree kept the walk off the graph."""
+    calls = _recorded_harvest(monkeypatch)
+    overlay = tmp_path / "overlay.db"
+    answers = iter([("The overlay is stale.", None), ("", overlay)])
+    asked: list[tuple[Path, Path, object]] = []
+    rebuilt: list[tuple[Path, Path, object]] = []
+    indexed: list[list[str]] = []
+
+    def problem(
+        caches: Path,
+        *,
+        root: Path,
+        output: object,
+    ) -> tuple[str, Path | None]:
+        asked.append((caches, root, output))
+        return next(answers)
+
+    def build(
+        root: Path,
+        *,
+        caches: Path,
+        output: object,
+        index: Callable[[Path], int],
+    ) -> str:
+        rebuilt.append((root, caches, output))
+        assert index(tmp_path) == 0
+        return ""
+
+    def run(argv: Sequence[str]) -> int:
+        indexed.append(list(argv))
+        return 0
+
+    monkeypatch.setattr(backbone, "overlay_problem", problem)
+    monkeypatch.setattr(backbone, "build_overlay", build)
+    monkeypatch.setattr(affected, "run_argv", run)
+    argv = ["affected.py", "--caches", str(tmp_path), "--depth", "2", "--", "a.py"]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    assert affected.main() == 0
+    looked = (tmp_path, Path.cwd(), affected.output_argv)
+    assert asked == [looked, looked]
+    assert rebuilt == [(Path.cwd(), tmp_path, affected.output_argv)]
+    assert indexed == [["codegraph", "init", "--yes", str(tmp_path)]]
+    assert (calls[0]["depth"], calls[0]["overlay"]) == (2, overlay)
+
+
+def test_an_overlay_that_will_not_rebuild_selects_without_the_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _recorded_harvest(monkeypatch)
+
+    def problem(caches: Path, **_: object) -> tuple[str, Path | None]:
+        del caches
+        return ("No CodeGraph backbone.", None)
+
+    def build(root: Path, **_: object) -> str:
+        del root
+        return "no backbone"
+
+    monkeypatch.setattr(backbone, "overlay_problem", problem)
+    monkeypatch.setattr(backbone, "build_overlay", build)
+    monkeypatch.setattr(sys, "argv", ["affected.py", "--depth", "2", "--", "a.py"])
+
+    assert affected.main() == 0
+    assert (calls[0]["depth"], calls[0]["overlay"]) == (0, None)
+
+
 def test_the_skip_token_forces_depth_zero_and_keeps_the_other_flags(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

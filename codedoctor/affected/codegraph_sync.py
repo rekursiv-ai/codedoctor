@@ -158,7 +158,7 @@ def sync(
         root,
         caches=caches,
         output=output,
-        index=partial(_index, run=run),
+        index=partial(backbone.index_tree, run=run),
     )
 
 
@@ -251,11 +251,6 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="With --refresh, fetch origin first.",
     )
-
-
-def _index(tree: Path, *, run: Callable[[Sequence[str]], int]) -> int:
-    """Index ``tree`` from scratch into its ``.codegraph/codegraph.db``."""
-    return run(["codegraph", "init", "--yes", str(tree)])
 
 
 def _refresh_locked(
