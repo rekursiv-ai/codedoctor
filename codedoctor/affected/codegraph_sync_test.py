@@ -276,7 +276,12 @@ def test_a_missing_backbone_starts_one_in_the_background(tmp_path: Path) -> None
 
     problem = _sync(tmp_path, tools)
 
-    assert "background" in problem
+    log = backbone.overlay_database(tmp_path / "caches", root=tmp_path / "root")
+    assert problem == (
+        "No CodeGraph backbone yet; building one in the background "
+        f"(log: {log.with_name('refresh.log')}). "
+        "Gates select without the graph until it lands."
+    )
     assert tools.spawned == [
         (
             [
@@ -309,6 +314,73 @@ def test_a_published_backbone_gets_this_worktrees_overlay(tmp_path: Path) -> Non
     assert backbone.stamped(overlay) is not None
 
 
+def test_a_backbone_behind_origin_main_is_refreshed_in_the_background(
+    tmp_path: Path,
+) -> None:
+    """Nothing else republished it: 29 commits behind, the overlay held 1,019 files."""
+    _refresh(tmp_path, _Tools(sha=_OLD))
+    tools = _Tools(sha=_NEW)
+
+    assert _sync(tmp_path, tools) == ""
+    assert tools.spawned == [
+        (
+            [
+                sys.executable,
+                "-m",
+                "codedoctor.affected.codegraph_sync",
+                "--caches",
+                str(tmp_path / "caches"),
+                "--refresh",
+                "--fetch",
+            ],
+            tmp_path / "root",
+            backbone.overlay_database(
+                tmp_path / "caches",
+                root=tmp_path / "root",
+            ).with_name("refresh.log"),
+        ),
+    ]
+    overlay = backbone.overlay_database(tmp_path / "caches", root=tmp_path / "root")
+    assert backbone.stamped(overlay) is not None
+    assert tools.ran("rev-parse") == [
+        [
+            "git",
+            "-C",
+            str(tmp_path / "root"),
+            "rev-parse",
+            "--verify",
+            "origin/main^{commit}",
+        ],
+    ]
+
+
+def test_a_worktree_gets_a_cli_index_seeded_from_the_backbone(tmp_path: Path) -> None:
+    """Without ``.codegraph`` in the worktree, ``codegraph sync`` there refused to run."""
+    _refresh(tmp_path, _Tools())
+
+    _sync(tmp_path, _Tools())
+
+    link = tmp_path / "root" / ".codegraph"
+    overlay = backbone.overlay_database(tmp_path / "caches", root=tmp_path / "root")
+    assert link.is_symlink()
+    assert link.resolve() == overlay.parent / "cli"
+    seeded = backbone.stamped(link / "codegraph.db")
+    published = backbone.stamped(backbone.backbone_database(tmp_path / "caches"))
+    assert seeded is not None
+    assert seeded == published
+
+
+def test_an_existing_cli_index_is_left_alone(tmp_path: Path) -> None:
+    _refresh(tmp_path, _Tools())
+    own = tmp_path / "root" / ".codegraph"
+    own.mkdir(parents=True)
+
+    _sync(tmp_path, _Tools())
+
+    assert not own.is_symlink()
+    assert list(own.iterdir()) == []
+
+
 def test_an_overlay_is_indexed_by_the_codegraph_cli(tmp_path: Path) -> None:
     _refresh(tmp_path, _Tools())
     (tmp_path / "root").mkdir()
@@ -327,7 +399,10 @@ def test_a_missing_cli_that_npm_cannot_install_is_reported(tmp_path: Path) -> No
     problem = _sync(tmp_path, tools)
 
     assert tools.calls == [["npm", "install", "-g", "@colbymchenry/codegraph"]]
-    assert "codegraph CLI" in problem
+    assert problem == (
+        "The codegraph CLI is missing, and `npm install -g "
+        "@colbymchenry/codegraph` did not install it."
+    )
 
 
 def test_a_missing_cli_is_installed_then_used(tmp_path: Path) -> None:

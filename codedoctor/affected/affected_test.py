@@ -150,10 +150,17 @@ def _deny_edges_after(permitted: int) -> Callable[..., int]:
 # definition.
 #
 # Line ranges are ten apart and never adjacent, so a hunk can name exactly one symbol.
+def _fixture_db(database: Path) -> sqlite3.Connection:
+    """Open a test-built index without an fsync per commit: 30ms of each test."""
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA synchronous = OFF")
+    return connection
+
+
 def _index(tmp_path: Path) -> Path:
     """Build a CodeGraph-shaped index: ``lib.py`` <- ``mid.py`` <- ``far_test.py``."""
     database = tmp_path / "codegraph.db"
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.executescript(
         "CREATE TABLE nodes (id TEXT PRIMARY KEY, kind TEXT, name TEXT,"
         " file_path TEXT, qualified_name TEXT, start_line INTEGER, end_line INTEGER);"
@@ -344,7 +351,7 @@ def test_an_unresolved_call_needs_the_caller_to_import_the_definition(
     ten such call sites across craftax, priml, and sagent into its changeset.
     """
     database = _index(tmp_path)
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.execute(
         "INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?, ?)",
         ("n:stray", "function", "test_stray", "stray_test.py", "test_stray", 1, 9),
@@ -380,7 +387,7 @@ def test_an_import_matches_a_whole_module_component_not_a_bare_suffix(
     test runs -- a name with one definition never consults it.
     """
     database = _index(tmp_path)
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.executemany(
         "INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
@@ -420,7 +427,7 @@ def test_an_unresolved_call_matches_a_module_component_not_a_bare_suffix(
     incident has a CLASS, and every sibling of the same shape needs the audit.
     """
     database = _index(tmp_path)
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.executemany(
         "INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
@@ -468,7 +475,7 @@ def test_an_exact_module_name_still_satisfies_the_import_test(tmp_path: Path) ->
     it reaches `twin.py`'s, which its import genuinely backs.
     """
     database = _index(tmp_path)
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.execute(
         "INSERT INTO edges VALUES ('n:othertest', 'n:twin', 'instantiates')",
     )
@@ -493,7 +500,7 @@ def test_a_relative_import_still_backs_its_own_package(tmp_path: Path) -> None:
     spelling had to be checked, not just the one that motivated it.
     """
     database = _index(tmp_path)
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.executemany(
         "INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
@@ -536,7 +543,7 @@ def test_a_multi_dot_relative_import_still_backs_its_package(tmp_path: Path) -> 
     RESOLUTION instruction, never part of the name being matched.
     """
     database = _index(tmp_path)
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.executemany(
         "INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
@@ -601,7 +608,7 @@ def test_an_empty_boundary_matches_no_module(tmp_path: Path) -> None:
     changed to `"%"` would pass the value test's negation and admit every edge.
     """
     database = _index(tmp_path)
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.executemany(
         "INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
@@ -647,7 +654,7 @@ def test_a_relative_import_of_a_top_level_module_still_backs_it(
     relative ones started being stripped. Both arms must see the same name.
     """
     database = _index(tmp_path)
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.executemany(
         "INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
@@ -687,7 +694,7 @@ def test_a_torn_derived_build_is_retried_not_cached_as_done(tmp_path: Path) -> N
     into an empty selection: green, having run no tests.
     """
     database = tmp_path / "partial.db"
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     # No `unresolved_refs`: the second CREATE has nothing to select from.
     connection.executescript(
         "CREATE TABLE nodes (id TEXT PRIMARY KEY, kind TEXT, name TEXT,"
@@ -736,7 +743,7 @@ def test_the_derived_tables_are_built_once_per_index_version(
     assert len(builds) == 1
     assert first == second
 
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.execute("INSERT INTO edges VALUES ('n:fartest', 'n:lib', 'calls')")
     connection.commit()
     connection.close()
@@ -760,7 +767,7 @@ def test_an_underscore_in_a_module_name_is_not_a_like_wildcard(
     exists to close, one metacharacter over.
     """
     database = _index(tmp_path)
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.executemany(
         "INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
@@ -849,7 +856,7 @@ def test_a_unique_private_name_still_needs_an_import(tmp_path: Path) -> None:
     its module can reach it.
     """
     database = _index(tmp_path)
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.executemany(
         "INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
@@ -1001,7 +1008,7 @@ def test_the_walk_refuses_to_route_through_a_file_node(tmp_path: Path) -> None:
 def test_a_node_reached_at_two_depths_is_emitted_once(tmp_path: Path) -> None:
     """The walk yields one row per depth at which a node was reached."""
     database = _index(tmp_path)
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.execute("INSERT INTO edges VALUES ('n:fartest', 'n:lib', 'calls')")
     connection.commit()
     connection.close()
@@ -1650,7 +1657,7 @@ def test_an_unreadable_index_falls_back_instead_of_raising(tmp_path: Path) -> No
 def test_a_stub_seeds_its_dependents(tmp_path: Path) -> None:
     """CG-PYI-009: `types_or` accepts `.pyi`, so the closure must too."""
     database = tmp_path / "codegraph.db"
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.executescript(
         "CREATE TABLE nodes (id TEXT PRIMARY KEY, kind TEXT, name TEXT,"
         " file_path TEXT, qualified_name TEXT, start_line INTEGER, end_line INTEGER);"
@@ -1899,7 +1906,7 @@ def test_selector_method_without_class_owner_uses_file_selector(
     database = _graph(tmp_path / "index.db", nodes=[])
     derived = affected.ensure_derived(database)
     assert derived is not None
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.execute("ATTACH DATABASE ? AS derived", (str(derived),))
     affected._lay_over(connection, None)
     try:
@@ -2137,7 +2144,7 @@ def test_one_worker_walks_every_seed_on_one_attached_handle(tmp_path: Path) -> N
 def test_a_stub_dependent_is_a_file_to_check(tmp_path: Path) -> None:
     """A dependent ``.pyi`` is type-checked like a ``.py``; other files are not."""
     database = tmp_path / "codegraph.db"
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.executescript(
         "CREATE TABLE nodes (id TEXT PRIMARY KEY, kind TEXT, name TEXT,"
         " file_path TEXT, qualified_name TEXT, start_line INTEGER, end_line INTEGER);"
@@ -2199,7 +2206,7 @@ def _graph(
     refs: Sequence[tuple[str, str, str]] = (),
 ) -> Path:
     """Write a CodeGraph-shaped index; ``refs`` are ``(caller, name_tail, file)`` calls."""
-    connection = sqlite3.connect(database)
+    connection = _fixture_db(database)
     connection.executescript(
         "CREATE TABLE nodes (id TEXT PRIMARY KEY, kind TEXT, name TEXT,"
         " file_path TEXT, qualified_name TEXT, start_line INTEGER, end_line INTEGER);"
@@ -2688,7 +2695,7 @@ def test_the_derived_cache_is_group_readable_and_keyed_on_this_code(
     assert affected.ensure_derived(database) == first
     assert sibling.exists()
     assert not other.exists()
-    with closing(sqlite3.connect(database)) as connection, connection:
+    with closing(_fixture_db(database)) as connection, connection:
         connection.execute("INSERT INTO edges VALUES ('n:a', 'n:b', 'calls')")
     second = affected.ensure_derived(database)
     assert second is not None

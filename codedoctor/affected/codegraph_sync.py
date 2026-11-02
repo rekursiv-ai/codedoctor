@@ -130,24 +130,30 @@ def sync(
                 "The codegraph CLI is missing, and `npm install -g "
                 "@colbymchenry/codegraph` did not install it."
             )
-    if not backbone.backbone_database(caches).exists():
-        log = backbone.overlay_database(caches, root=root).with_name("refresh.log")
-        spawn(
-            [
-                sys.executable,
-                "-m",
-                "codedoctor.affected.codegraph_sync",
-                "--caches",
-                str(caches),
-                "--refresh",
-            ],
-            cwd=root,
-            log=log,
-        )
+    database = backbone.backbone_database(caches)
+    log = backbone.overlay_database(caches, root=root).with_name("refresh.log")
+    command = [
+        sys.executable,
+        "-m",
+        "codedoctor.affected.codegraph_sync",
+        "--caches",
+        str(caches),
+        "--refresh",
+    ]
+    if not database.exists():
+        spawn(command, cwd=root, log=log)
         return (
             f"No CodeGraph backbone yet; building one in the background (log: {log}). "
             "Gates select without the graph until it lands."
         )
+    # Nothing else republishes the backbone, and every commit since it was built
+    # lands in each overlay: 29 behind, an overlay indexed 1,019 files, not 219.
+    # Fetched in the background, so the commit never waits on the network.
+    published = backbone.stamped(database)
+    head = _origin_main(root, output=output)
+    if published is not None and head and published.sha != head:
+        spawn([*command, "--fetch"], cwd=root, log=log)
+    _link_cli_index(root, caches=caches)
     return backbone.build_overlay(
         root,
         caches=caches,
@@ -265,12 +271,7 @@ def _refresh_locked(
         status := run(["git", "-C", str(repo), "fetch", "--quiet", "origin"])
     ):
         return f"`git fetch origin` failed (exit {status})."
-    sha = (
-        output(
-            ["git", "-C", str(repo), "rev-parse", "--verify", "origin/main^{commit}"],
-        )
-        or ""
-    ).strip()
+    sha = _origin_main(repo, output=output)
     if not sha:
         return f"origin/main does not resolve in {repo}."
     database = home / "codegraph.db"
@@ -304,6 +305,33 @@ def _refresh_locked(
     if ensure_derived(database) is None:
         return f"Building the derived tables of {database} failed."
     return ""
+
+
+# Neither index the gates read is this worktree's whole tree -- the backbone is
+# origin/main, the overlay only its changes -- so the CLI gets its own, seeded from the
+# backbone: a ``codegraph sync`` then indexes only what differs, 15 s rather than a full
+# ``init``. A symlink, because ``CODEGRAPH_DIR`` resolves relative to the project and
+# the index is too large for the checkout. An existing ``.codegraph`` is the owner's.
+def _link_cli_index(root: Path, *, caches: Path) -> None:
+    """Give worktree ``root`` a ``.codegraph`` the CLI and MCP server can sync."""
+    index = root / ".codegraph"
+    if index.exists() or index.is_symlink():
+        return
+    home = backbone.overlay_database(caches, root=root).parent / "cli"
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        seeded = home / "codegraph.db"
+        if not seeded.exists():
+            shutil.copyfile(backbone.backbone_database(caches), seeded)
+        index.symlink_to(home)
+    except OSError:
+        return
+
+
+def _origin_main(repo: Path, *, output: Callable[[Sequence[str]], str | None]) -> str:
+    """Return the commit ``origin/main`` names in ``repo``; empty when it names none."""
+    argv = ["git", "-C", str(repo), "rev-parse", "--verify", "origin/main^{commit}"]
+    return (output(argv) or "").strip()
 
 
 def _publish(working: Path, database: Path, *, sha: str) -> None:

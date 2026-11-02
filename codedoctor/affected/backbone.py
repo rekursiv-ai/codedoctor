@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Final, cast
 from urllib.request import pathname2url
 
 import hashlib
+import os
 import shutil
 import sqlite3
 import tempfile
@@ -100,9 +101,11 @@ def stamp(
 
     Rollback journaling, not CodeGraph's WAL: a published index is one file a
     reader opens read-only, with no ``-wal`` or ``-shm`` beside it to own.
+    Every caller stamps a private scratch file it then renames into place, so
+    one fsync at the end stands in for SQLite's fsync per statement.
 
     Args:
-      database: The index to stamp.
+      database: The index to stamp; a scratch file no reader has opened.
       sha: The backbone commit.
       fingerprint: An overlay's ``fingerprint``.
       paths: An overlay's changed files.
@@ -111,6 +114,7 @@ def stamp(
     connection = sqlite3.connect(database)
     try:
         connection.execute("""PRAGMA journal_mode=DELETE""")
+        connection.execute("""PRAGMA synchronous = OFF""")
         connection.executescript(
             """
             DROP TABLE IF EXISTS codedoctor_stamp;
@@ -130,6 +134,8 @@ def stamp(
         connection.commit()
     finally:
         connection.close()
+    with database.open("rb") as written:
+        os.fsync(written.fileno())
 
 
 def stamped(database: Path) -> Stamp | None:

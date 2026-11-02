@@ -27,6 +27,8 @@ def _codegraph(database: Path, *, files: Sequence[str] = ()) -> Path:
     """Write a CodeGraph-shaped index holding one function per file in ``files``."""
     database.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database)
+    # A test fixture needs no fsync per commit: 18ms per statement here.
+    connection.execute("PRAGMA synchronous = OFF")
     connection.executescript(
         "CREATE TABLE nodes (id TEXT PRIMARY KEY, kind TEXT, name TEXT,"
         " qualified_name TEXT, file_path TEXT, start_line INTEGER, end_line INTEGER);"
