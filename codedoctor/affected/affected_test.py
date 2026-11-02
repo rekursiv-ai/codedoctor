@@ -20,6 +20,7 @@ import pytest
 
 from codedoctor.affected import affected, backbone
 from codedoctor.affected.affected import _collection_patterns, _skipped, harvest
+from codedoctor.gate.gate import output_argv
 
 
 if TYPE_CHECKING:
@@ -2047,9 +2048,9 @@ def test_a_stale_overlay_is_rebuilt_before_the_walk(
     monkeypatch.setattr(sys, "argv", argv)
 
     assert affected.main() == 0
-    looked = (tmp_path, Path.cwd(), affected.output_argv)
+    looked = (tmp_path, Path.cwd(), output_argv)
     assert asked == [looked, looked]
-    assert rebuilt == [(Path.cwd(), tmp_path, affected.output_argv)]
+    assert rebuilt == [(Path.cwd(), tmp_path, output_argv)]
     assert indexed == [["codegraph", "init", "--yes", str(tmp_path)]]
     assert (calls[0]["depth"], calls[0]["overlay"]) == (2, overlay)
 
