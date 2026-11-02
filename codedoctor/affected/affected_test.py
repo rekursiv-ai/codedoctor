@@ -1453,40 +1453,37 @@ def test_an_unsaturated_changeset_still_walks(tmp_path: Path) -> None:
     )
 
 
-def test_a_saturated_changeset_still_selects_nodeids(tmp_path: Path) -> None:
-    """Saturation bounds the FILE set; it says nothing about which tests to run.
+def test_a_saturated_changeset_selects_every_test_file_without_walking(
+    tmp_path: Path,
+) -> None:
+    """Every test file changed seeds every test it holds: the suite, unwalked.
 
-    Returning empty here would hand the hook shell no selection, and its
-    fallback names whole test files -- the scope nodeid selection exists to
-    beat. The walk is worth its 48.3s against a suite that takes minutes.
+    Walked, ``--all-files`` took 48.3s, then past 7 minutes once each seed's
+    query read the backbone with an overlay laid over it.
     """
-    database = _index(tmp_path)
     _tree(tmp_path)
-    assert "lib_test.py::test_helper" in harvest(
-        database,
-        changed=["lib.py", "mid.py"],
+    assert harvest(
+        tmp_path / "absent.db",
+        changed=["lib.py", "lib_test.py", "mid.py", "far_test.py", "notes.pyi"],
         depth=1,
         emit="nodeids",
         saturated=True,
-    )
+    ) == ["far_test.py", "lib_test.py"]
 
 
-def test_an_empty_tree_is_never_covered(tmp_path: Path) -> None:
-    """No Python files must not assert coverage: every input covers the empty set."""
-    (tmp_path / "notes.txt").touch()
-    assert not affected._covers_universe([])
+def test_an_unknown_index_is_not_read_for_a_saturated_changeset(tmp_path: Path) -> None:
+    """Saturation is answered before any handle opens, as the depth-0 floor is."""
+    _tree(tmp_path)
+    garbage = tmp_path / "garbage.db"
+    garbage.write_text("not sqlite")
 
-
-def test_coverage_counts_every_python_file_in_the_tree(tmp_path: Path) -> None:
-    """The cwd's `.py` and `.pyi` files, minus hidden and `.gitignore`d trees."""
-    (tmp_path / ".git").mkdir()
-    (tmp_path / ".gitignore").write_text("build/\n")
-    for name in ("a.py", "pkg/b.pyi", "pkg/c.txt", "build/d.py", ".venv/e.py"):
-        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / name).touch()
-    assert affected._covers_universe(["a.py", "pkg/b.pyi"])
-    assert affected._covers_universe(["./a.py", "pkg/b.pyi", "extra.py"])
-    assert not affected._covers_universe(["a.py"])
+    assert harvest(
+        garbage,
+        changed=["lib_test.py"],
+        depth=1,
+        emit="nodeids",
+        saturated=True,
+    ) == ["lib_test.py"]
 
 
 @pytest.mark.parametrize(
@@ -1495,10 +1492,11 @@ def test_coverage_counts_every_python_file_in_the_tree(tmp_path: Path) -> None:
         (["--emit", "files"], True, True),
         (["--emit", "files"], False, False),
         (["--emit", "files", "--no-universe"], True, False),
-        (["--emit", "nodeids"], True, False),
+        (["--emit", "nodeids"], True, True),
+        (["--emit", "nodeids", "--no-universe"], True, False),
     ],
 )
-def test_only_the_files_projection_checks_coverage(
+def test_both_projections_check_coverage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     argv: list[str],
@@ -1507,8 +1505,7 @@ def test_only_the_files_projection_checks_coverage(
 ) -> None:
     """Asserts the ARGUMENT: no fixture hands in every tracked file.
 
-    `nodeids` never reads it, and `--no-universe` is the escape hatch, so
-    neither may pay for the walk.
+    `--no-universe` is the escape hatch, so it must not pay for the walk.
     """
     received: list[object] = []
     checked: list[list[str]] = []
@@ -1531,7 +1528,25 @@ def test_only_the_files_projection_checks_coverage(
     )
     assert affected.main() == 0
     assert received == [want]
-    assert checked == ([["a.py"]] if argv == ["--emit", "files"] else [])
+    assert checked == ([] if "--no-universe" in argv else [["a.py"]])
+
+
+def test_an_empty_tree_is_never_covered(tmp_path: Path) -> None:
+    """No Python files must not assert coverage: every input covers the empty set."""
+    (tmp_path / "notes.txt").touch()
+    assert not affected._covers_universe([])
+
+
+def test_coverage_counts_every_python_file_in_the_tree(tmp_path: Path) -> None:
+    """The cwd's `.py` and `.pyi` files, minus hidden and `.gitignore`d trees."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".gitignore").write_text("build/\n")
+    for name in ("a.py", "pkg/b.pyi", "pkg/c.txt", "build/d.py", ".venv/e.py"):
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).touch()
+    assert affected._covers_universe(["a.py", "pkg/b.pyi"])
+    assert affected._covers_universe(["./a.py", "pkg/b.pyi", "extra.py"])
+    assert not affected._covers_universe(["a.py"])
 
 
 def test_skip_reads_one_name_out_of_precommits_list(
@@ -2466,6 +2481,42 @@ def test_a_deleted_definition_makes_a_name_unique_again(tmp_path: Path) -> None:
         emit="nodeids",
         overlay=overlay,
     ) == ["e_test.py::test_e"]
+
+
+def test_the_walk_builds_no_index_per_query(tmp_path: Path) -> None:
+    """A merged count view was rebuilt as an automatic index on every query.
+
+    Each worker's queries allocated it anew, so 24 workers took 8.4s on 80
+    seeds where one took 3.7s and the code before the overlay took 0.3s.
+    """
+    database = _graph(
+        tmp_path / "backbone.db",
+        nodes=[("old:helper", "function", "helper", "lib.py", 1)],
+    )
+    overlay = _overlay(tmp_path, changed=["dup.py"])
+    connections = affected._Connections(
+        database=database,
+        derived=affected.ensure_derived(database),
+        overlay=overlay,
+    )
+    connection = connections.handle()
+    assert connection is not None
+    try:
+        connections.attach(connection)
+        affected._touched_table(connection, [])
+        plan = [
+            str(row[-1])
+            for row in connection.execute(
+                "EXPLAIN QUERY PLAN " + affected._walk(),
+                {"seed": "lib.py", "depth": 1, "scoped": 0},
+            )
+        ]
+    finally:
+        connections.close()
+
+    # The fixture's `edges` carries no index of its own; CodeGraph's does.
+    built = [step for step in plan if "AUTOMATIC" in step and "edges" not in step]
+    assert not built, plan
 
 
 def test_an_overlay_method_is_selected_through_its_overlay_class(
