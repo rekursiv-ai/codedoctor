@@ -204,6 +204,10 @@ def test_diagnostics_map_the_overlay_back_onto_the_checkout(tmp_path: Path) -> N
     overlay = tmp_path / "overlay"
     root.mkdir()
     (root / "m.py").write_text(_SOURCE)
+    overlay.mkdir()
+    (overlay / "m.py").write_text(
+        unnecessary_assert_isinstance.probe(_SOURCE, checker="basedpyright"),
+    )
     outside = tmp_path / "typeshed.pyi"
     outside.write_text("x: int\n")
     width = len(_PROBE)
@@ -1018,8 +1022,12 @@ def test_a_pyrefly_run_that_prints_no_report_passes_its_failure_through(
 def test_pyrefly_diagnostics_map_severities_and_shift_past_the_probe(
     tmp_path: Path,
 ) -> None:
-    (tmp_path / "m.py").write_text(
-        "def f(x: int) -> None:\n    assert isinstance(x, int)\n",
+    source = "def f(x: int) -> None:\n    assert isinstance(x, int)\n"
+    (tmp_path / "m.py").write_text(source)
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    (overlay / "m.py").write_text(
+        unnecessary_assert_isinstance.probe(source, checker="pyrefly"),
     )
     width = len("isinstance(x, int) or reveal_type(x); ")
 
@@ -1045,7 +1053,7 @@ def test_pyrefly_diagnostics_map_severities_and_shift_past_the_probe(
     }
     found = unnecessary_assert_isinstance.pyrefly_diagnostics(
         json.dumps(report),
-        overlay=tmp_path,
+        overlay=overlay,
         root=tmp_path,
     )
     assert [(d.line, d.column, d.severity, d.redundant) for d in found] == [
@@ -1055,6 +1063,38 @@ def test_pyrefly_diagnostics_map_severities_and_shift_past_the_probe(
         (2, 5, "error", False),
         (2, 5, "information", True),
     ]
+
+
+def test_a_file_edited_during_the_check_never_reports_its_probe(
+    tmp_path: Path,
+) -> None:
+    """Probes are found in the text the checker read, not in the live checkout."""
+    source = "def f(x: int) -> None:\n    assert isinstance(x, int)\n"
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    (overlay / "m.py").write_text(
+        unnecessary_assert_isinstance.probe(source, checker="pyrefly"),
+    )
+    # Another writer moves the assert down a line while the checker runs.
+    (tmp_path / "m.py").write_text("import os\n" + source)
+    report = {
+        "errors": [
+            {
+                "path": "m.py",
+                "line": 2,
+                "column": 5 + len("isinstance(x, int) or "),
+                "name": "unimported-directive",
+                "description": "`reveal_type` must be imported",
+                "severity": "error",
+            },
+        ],
+    }
+    found = unnecessary_assert_isinstance.pyrefly_diagnostics(
+        json.dumps(report),
+        overlay=overlay,
+        root=tmp_path,
+    )
+    assert found == []
 
 
 def test_pyrefly_runs_with_info_reports_and_no_summary(
