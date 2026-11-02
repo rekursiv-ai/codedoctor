@@ -1743,6 +1743,7 @@ def test_a_blank_collection_setting_falls_back_to_the_default(tmp_path: Path) ->
 @pytest.mark.cli_python_subprocess
 def test_an_option_shaped_path_is_a_path_not_a_flag(tmp_path: Path) -> None:
     """CG-ARGV-012: argparse consumed a leading-dash filename as an option."""
+    Path("-broken.py").touch()
     completed = _run_cli(
         "--emit",
         "files",
