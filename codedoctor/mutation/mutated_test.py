@@ -1308,6 +1308,64 @@ def test_an_unreachable_docstring_fallback_is_not_a_survivor(tmp_path: Path) -> 
             True,
         ),
         ("t = f(x, flag=False)", "t = f(x, flag=None)", False),
+        # A last ``case _`` that does what falling off the end does: the checker
+        # demands it for exhaustiveness, and deleting it changes nothing.
+        (
+            (
+                "def f(r):\n    match r:\n        case 1:\n            return 2\n"
+                "        case _:\n            return None\n"
+            ),
+            "def f(r):\n    match r:\n        case 1:\n            return 2\n",
+            True,
+        ),
+        (
+            (
+                "def f(rs):\n    for r in rs:\n        match r:\n            case 1:\n"
+                "                g()\n            case _:\n                continue\n"
+            ),
+            (
+                "def f(rs):\n    for r in rs:\n        match r:\n            case 1:\n"
+                "                g()\n"
+            ),
+            True,
+        ),
+        (
+            (
+                "def f(r):\n    match r:\n        case 1:\n            g()\n"
+                "        case _:\n            pass\n"
+            ),
+            "def f(r):\n    match r:\n        case 1:\n            g()\n",
+            True,
+        ),
+        # Followed by more code, ending the call or the iteration skips it.
+        (
+            (
+                "def f(r):\n    match r:\n        case 1:\n            return 2\n"
+                "        case _:\n            return None\n    g()\n"
+            ),
+            "def f(r):\n    match r:\n        case 1:\n            return 2\n    g()\n",
+            False,
+        ),
+        (
+            (
+                "def f(rs):\n    for r in rs:\n        match r:\n            case 1:\n"
+                "                g()\n            case _:\n                continue\n"
+                "        h()\n"
+            ),
+            (
+                "def f(rs):\n    for r in rs:\n        match r:\n            case 1:\n"
+                "                g()\n        h()\n"
+            ),
+            False,
+        ),
+        (
+            (
+                "def f(r):\n    match r:\n        case 1:\n            return 2\n"
+                "        case _:\n            return 3\n"
+            ),
+            "def f(r):\n    match r:\n        case 1:\n            return 2\n",
+            False,
+        ),
         # A falsy docstring raises IndexError with either fallback.
         (
             'd = (__doc__ or "").split("\\n", 2)[2]',

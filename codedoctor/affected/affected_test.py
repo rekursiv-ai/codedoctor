@@ -2504,13 +2504,14 @@ def test_the_walk_builds_no_index_per_query(tmp_path: Path) -> None:
     try:
         connections.attach(connection)
         affected._touched_table(connection, [])
-        plan = [
-            str(row[-1])
-            for row in connection.execute(
+        rows = cast(
+            "list[tuple[int, int, int, str]]",
+            connection.execute(
                 "EXPLAIN QUERY PLAN " + affected._walk(),
                 {"seed": "lib.py", "depth": 1, "scoped": 0},
-            )
-        ]
+            ).fetchall(),
+        )
+        plan = [detail for *_, detail in rows]
     finally:
         connections.close()
 

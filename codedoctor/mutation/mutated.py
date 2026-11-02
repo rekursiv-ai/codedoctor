@@ -1265,6 +1265,7 @@ _CODEC_CALLS: Final = frozenset(
 def _erase_unobservable(code: str) -> str:
     """Dump ``code`` with casts, ``help=`` values, flags, and raising fallbacks blanked."""
     tree = ast.parse(textwrap.dedent(code))
+    _drop_fallthrough_defaults(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Subscript) and (fallback := _raising_fallback(node)):
             fallback.values[-1] = ast.Constant(value=None)
@@ -1295,6 +1296,57 @@ def _erase_unobservable(code: str) -> str:
             ):
                 keyword.value = ast.Constant(value=None)
     return ast.dump(tree)
+
+
+# A type checker demands a last ``case _`` for exhaustiveness. One that does only
+# what falling off the end of its function or loop body would do is the same
+# program with or without it.
+def _drop_fallthrough_defaults(tree: ast.Module) -> None:
+    """Delete each such ``case _`` from ``tree``."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            ends = (_returns_none, _passes)
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            ends = (_continues, _passes)
+        else:
+            continue
+        last = node.body[-1]
+        if (
+            isinstance(last, ast.Match)
+            and len(last.cases) > 1
+            and _is_wildcard(default := last.cases[-1])
+            and len(default.body) == 1
+            and any(end(default.body[0]) for end in ends)
+        ):
+            last.cases.pop()
+
+
+def _is_wildcard(case: ast.match_case) -> bool:
+    """Return whether ``case`` is a bare, unguarded ``case _``."""
+    return (
+        isinstance(case.pattern, ast.MatchAs)
+        and case.pattern.pattern is None
+        and case.pattern.name is None
+        and case.guard is None
+    )
+
+
+def _returns_none(statement: ast.stmt) -> bool:
+    """Return whether ``statement`` is ``return`` or ``return None``."""
+    return isinstance(statement, ast.Return) and (
+        statement.value is None
+        or (isinstance(statement.value, ast.Constant) and statement.value.value is None)
+    )
+
+
+def _continues(statement: ast.stmt) -> bool:
+    """Return whether ``statement`` is ``continue``."""
+    return isinstance(statement, ast.Continue)
+
+
+def _passes(statement: ast.stmt) -> bool:
+    """Return whether ``statement`` is ``pass``."""
+    return isinstance(statement, ast.Pass)
 
 
 # ``x.headers`` is the case-insensitive mapping of ``http.server``, ``email``,
