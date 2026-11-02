@@ -1243,22 +1243,58 @@ def _only_unobservable(original: str, mutant: str) -> bool:
 # check it); the bytes it returns are the same either way, so no test can see it.
 _UNOBSERVABLE_FLAGS: Final = frozenset({"usedforsecurity"})
 
+# The stdlib reads these only for their truth (``json.dumps``, ``ArgumentParser``),
+# so ``None`` behaves as ``False``.
+_TRUTH_FLAGS: Final = frozenset({"ensure_ascii", "add_help"})
 
+
+# Header and codec names are lowercased: both are looked up whatever their case.
 def _erase_unobservable(code: str) -> str:
     """Dump ``code`` with casts, ``help=`` values, flags, and raising fallbacks blanked."""
     tree = ast.parse(textwrap.dedent(code))
     for node in ast.walk(tree):
         if isinstance(node, ast.Subscript) and (fallback := _raising_fallback(node)):
             fallback.values[-1] = ast.Constant(value=None)
+        if isinstance(node, ast.Subscript) and _is_headers(node.value):
+            node.slice = _lowered(node.slice)
         if not isinstance(node, ast.Call):
             continue
         if _callee(node) == "cast" and node.args:
             node.args[0] = ast.Constant(value=None)
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and _is_headers(node.func.value)
+            and node.args
+        ):
+            node.args[0] = _lowered(node.args[0])
         node.keywords = [k for k in node.keywords if k.arg not in _UNOBSERVABLE_FLAGS]
         for keyword in node.keywords:
             if keyword.arg == "help" and isinstance(keyword.value, ast.Constant):
                 keyword.value = ast.Constant(value=None)
+            elif keyword.arg == "encoding":
+                keyword.value = _lowered(keyword.value)
+            elif (
+                keyword.arg in _TRUTH_FLAGS
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value in (False, None)
+            ):
+                keyword.value = ast.Constant(value=None)
     return ast.dump(tree)
+
+
+def _is_headers(node: ast.expr) -> bool:
+    """Return whether ``node`` names a ``headers`` mapping: ``headers`` or ``x.headers``."""
+    return (isinstance(node, ast.Name) and node.id == "headers") or (
+        isinstance(node, ast.Attribute) and node.attr == "headers"
+    )
+
+
+def _lowered(node: ast.expr) -> ast.expr:
+    """Return ``node`` lowercased when it is a string constant, else ``node``."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return ast.Constant(value=node.value.lower())
+    return node
 
 
 def _raising_fallback(node: ast.Subscript) -> ast.BoolOp | None:

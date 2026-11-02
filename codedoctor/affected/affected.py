@@ -95,12 +95,7 @@ def main() -> int:
         depth=depth,
         emit=flags.emit,
         workers=flags.workers,
-        # Only the ``files`` projection reads it; see ``harvest``.
-        saturated=(
-            flags.emit == "files"
-            and not flags.no_universe
-            and _covers_universe(flags.files)
-        ),
+        saturated=not flags.no_universe and _covers_universe(flags.files),
         hunks={} if flags.diff is None else _parse_diff(Path(flags.diff)),
     )
     for line in lines:
@@ -167,14 +162,20 @@ def harvest(
     # every dependent is already in `changed`. Skipped before any handle opens, the same shape as the depth-0 guard below --
     # "do not consult the index", not "discard what it said".
     #
-    # `"nodeids"` is deliberately NOT short-circuited here. Saturation proves
-    # the FILE set cannot grow; it proves nothing about which of those files'
-    # individual tests to select, and returning empty would hand pytest the
-    # whole suite. That walk is 48.3s at `--all-files`, against a suite that
-    # takes minutes.
-    if emit == "files" and saturated:
-        return sorted(set(changed))
+    # `"nodeids"` short-circuits too: every test file is among the changed, and
+    # each changed test file seeds every test in it, so the walk can only name
+    # the whole suite. Named as its files, which collect faster than nodeids;
+    # walked, it took 48.3s, and past 7 minutes once each seed read an overlay.
     patterns = _collection_patterns(Path())
+    if saturated:
+        if emit == "files":
+            return sorted(set(changed))
+        return sorted(
+            path
+            for path in changed
+            if path.endswith(".py")
+            and any(fnmatch(Path(path).name, pattern) for pattern in patterns[2])
+        )
     # A non-positive depth opens nothing rather than passing the walk through:
     # the CTE emits its own seeds at depth 0, and for a changed TEST file those
     # seeds ARE tests, so returning them would dress a stale index up as a
@@ -923,11 +924,12 @@ back(id, depth, kind, name, file_path) AS (
     -- than derived here: SQL `replace(path, '.py', '')` strips that substring
     -- ANYWHERE, turning `api.pyi` into `apii`.
     --
-    -- `all_anycount` and `all_imports` are the same construct for the same
+    -- `anycount` and `all_imports` are the same construct for the same
     -- reason: correlated work the CTE would otherwise redo per candidate row.
-    -- See `_build_derived`. Each is a view over the backbone's table and the
-    -- overlay's, read only from a correlated subquery, where SQLite pushes the
-    -- lookup into both halves and keeps their indexes.
+    -- See `_build_derived`. A count is looked up in the overlay's table, then
+    -- the backbone's, each by its own index: as a view over both, SQLite
+    -- materialized it and built an automatic index on every query, which
+    -- made 24 workers slower than one.
     --
     -- The suffix match is anchored on a COMPONENT BOUNDARY, via `_boundary`:
     -- a dotted module path is a sequence of components, not a string, and a
@@ -937,7 +939,8 @@ back(id, depth, kind, name, file_path) AS (
     -- above, one operand over.
     AND (
       source.file_path = back.file_path
-      OR ((SELECT n FROM all_anycount WHERE name = back.name) < 2
+      OR (COALESCE((SELECT n FROM temp.oanycount WHERE name = back.name),
+                   (SELECT n FROM derived.anycount WHERE name = back.name)) < 2
           AND (substr(back.name, 1, 1) != '_'
                -- `from pkg import mod` records only `pkg`.
                OR EXISTS (
@@ -963,7 +966,8 @@ back(id, depth, kind, name, file_path) AS (
   WHERE back.depth < :depth AND source.kind != 'file'
     AND (
       source.file_path = back.file_path
-      OR ((SELECT n FROM all_anycount WHERE name = back.name) < 2
+      OR (COALESCE((SELECT n FROM temp.oanycount WHERE name = back.name),
+                   (SELECT n FROM derived.anycount WHERE name = back.name)) < 2
           AND (substr(back.name, 1, 1) != '_'
                OR EXISTS (
                  SELECT 1 FROM all_imports imported
@@ -1003,7 +1007,9 @@ back(id, depth, kind, name, file_path) AS (
   WHERE back.depth < :depth
     AND unresolved_refs.file_path NOT IN (SELECT path FROM temp.changed)
     AND back.kind IN ('function', 'method', 'class')
-    AND 1 = (SELECT n FROM all_defcount WHERE name = unresolved_refs.name_tail)
+    AND 1 = COALESCE(
+      (SELECT n FROM temp.odefcount WHERE name = unresolved_refs.name_tail),
+      (SELECT n FROM derived.defcount WHERE name = unresolved_refs.name_tail))
     AND EXISTS (
       SELECT 1 FROM all_imports imported
       JOIN all_modules modules ON modules.file_path = back.file_path
@@ -1020,7 +1026,9 @@ back(id, depth, kind, name, file_path) AS (
   JOIN temp.onodes caller ON caller.id = unresolved_refs.from_node_id
   WHERE back.depth < :depth
     AND back.kind IN ('function', 'method', 'class')
-    AND 1 = (SELECT n FROM all_defcount WHERE name = unresolved_refs.name_tail)
+    AND 1 = COALESCE(
+      (SELECT n FROM temp.odefcount WHERE name = unresolved_refs.name_tail),
+      (SELECT n FROM derived.defcount WHERE name = unresolved_refs.name_tail))
     AND EXISTS (
       SELECT 1 FROM all_imports imported
       JOIN all_modules modules ON modules.file_path = back.file_path
@@ -1088,14 +1096,6 @@ def _lay_over(connection: sqlite3.Connection, overlay: Path | None) -> None:
           SELECT file_path, dotted, package FROM derived.modules
           WHERE file_path NOT IN (SELECT file_path FROM temp.omodules)
           UNION ALL SELECT file_path, dotted, package FROM temp.omodules;
-        CREATE TEMP VIEW all_defcount AS
-          SELECT name, n FROM derived.defcount
-          WHERE name NOT IN (SELECT name FROM temp.odefcount)
-          UNION ALL SELECT name, n FROM temp.odefcount;
-        CREATE TEMP VIEW all_anycount AS
-          SELECT name, n FROM derived.anycount
-          WHERE name NOT IN (SELECT name FROM temp.oanycount)
-          UNION ALL SELECT name, n FROM temp.oanycount;
         """,
     )
     if overlay is None:

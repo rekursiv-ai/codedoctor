@@ -1257,6 +1257,51 @@ def test_an_unreachable_docstring_fallback_is_not_a_survivor(tmp_path: Path) -> 
             "h = hashlib.sha1(None, usedforsecurity=False)",
             False,
         ),
+        # HTTP header names and codec names are looked up whatever their case.
+        (
+            'n = self.headers.get("Content-Length")',
+            'n = self.headers.get("content-length")',
+            True,
+        ),
+        (
+            'n = headers.get("Content-Length")',
+            'n = headers.get("CONTENT-LENGTH")',
+            True,
+        ),
+        ('n = r.headers["Content-Length"]', 'n = r.headers["CONTENT-LENGTH"]', True),
+        (
+            'n = self.headers.get("Content-Length")',
+            'n = self.headers.get("XXContent-LengthXX")',
+            False,
+        ),
+        ('n = d.get("Content-Length")', 'n = d.get("content-length")', False),
+        (
+            'h = p.open("a", encoding="utf-8")',
+            'h = p.open("a", encoding="UTF-8")',
+            True,
+        ),
+        (
+            'h = p.open("a", encoding="utf-8")',
+            'h = p.open("a", encoding="XXutf-8XX")',
+            False,
+        ),
+        # These flags are read only for their truth, so ``None`` is ``False``.
+        (
+            "t = json.dumps(x, ensure_ascii=False)",
+            "t = json.dumps(x, ensure_ascii=None)",
+            True,
+        ),
+        (
+            "t = json.dumps(x, ensure_ascii=False)",
+            "t = json.dumps(x, ensure_ascii=True)",
+            False,
+        ),
+        (
+            "p = ArgumentParser(add_help=False)",
+            "p = ArgumentParser(add_help=None)",
+            True,
+        ),
+        ("t = f(x, flag=False)", "t = f(x, flag=None)", False),
         # A falsy docstring raises IndexError with either fallback.
         (
             'd = (__doc__ or "").split("\\n", 2)[2]',
