@@ -36,7 +36,7 @@ import tomllib
 from treekle import ReadError, from_plain
 
 from codedoctor.affected import backbone
-from codedoctor.gate.gate import output_argv
+from codedoctor.gate.gate import output_argv, run_argv
 from codedoctor.lib.files import walk
 from codedoctor.lib.worker_count import worker_count
 
@@ -83,6 +83,20 @@ def main() -> int:
                 root=Path.cwd(),
                 output=output_argv,
             )
+            # The overlay goes stale whenever any changed file moves -- in a
+            # shared worktree, another process's edit between the sync hook and
+            # this one. Rebuilding costs seconds; walking without it, coverage.
+            if problem and not backbone.build_overlay(
+                Path.cwd(),
+                caches=Path(flags.caches),
+                output=output_argv,
+                index=partial(backbone.index_tree, run=run_argv),
+            ):
+                problem, overlay = backbone.overlay_problem(
+                    Path(flags.caches),
+                    root=Path.cwd(),
+                    output=output_argv,
+                )
             if problem:
                 # Depth 0 is the floor `SKIP` already selects: each changed file's
                 # paired tests, or the changed files themselves.

@@ -21,7 +21,7 @@ import shlex
 import sys
 import tempfile
 
-from codedoctor.gate import gate, spool
+from codedoctor.gate import gate
 from codedoctor.testing import coverage_summary
 from codedoctor.testing.tiers import TIERS, Tier
 
@@ -62,7 +62,7 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
         1 when the spool was never written.
 
     """
-    files = spool.drain(context.directory, gate="pytest", key=context.key)
+    files = gate.drained("pytest", context=context)
     if files is None:
         return gate.unspooled("pytest")
     count = gate.workers("pytest", environ=context.environ)
