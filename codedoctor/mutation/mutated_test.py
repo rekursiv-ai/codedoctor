@@ -1263,11 +1263,17 @@ def test_an_unreachable_docstring_fallback_is_not_a_survivor(tmp_path: Path) -> 
             'n = self.headers.get("content-length")',
             True,
         ),
+        # A bare ``headers`` may be a plain dict, whose keys are case-sensitive.
         (
             'n = headers.get("Content-Length")',
             'n = headers.get("CONTENT-LENGTH")',
-            True,
+            False,
         ),
+        ('n = headers["Content-Length"]', 'n = headers["CONTENT-LENGTH"]', False),
+        ('ok = r.headers.get("A") == "B"', 'ok = r.headers.get("A") == "b"', False),
+        # Only the stdlib's text and codec calls look an encoding up by name.
+        ('h = s.encode(encoding="utf-8")', 'h = s.encode(encoding="UTF-8")', True),
+        ('h = f(x, encoding="utf-8")', 'h = f(x, encoding="UTF-8")', False),
         ('n = r.headers["Content-Length"]', 'n = r.headers["CONTENT-LENGTH"]', True),
         (
             'n = self.headers.get("Content-Length")',
