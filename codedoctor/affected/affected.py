@@ -28,6 +28,7 @@ import hashlib
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -36,7 +37,7 @@ import tomllib
 from treekle import ReadError, from_plain
 
 from codedoctor.affected import backbone
-from codedoctor.gate.gate import output_argv, run_argv
+from codedoctor.gate.gate import output_argv
 from codedoctor.lib.files import walk
 from codedoctor.lib.worker_count import worker_count
 
@@ -45,7 +46,7 @@ _THIS: Final = Path(__file__).resolve()
 _CWD: Final = _THIS.parent
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
 
 class _Flags(Protocol):
@@ -75,9 +76,14 @@ def main() -> int:
     depth = 0 if _skipped(flags.skip_token) else flags.depth
     database = Path(flags.database) if flags.database else None
     overlay: Path | None = None
+    saturated = not flags.no_universe and _covers_universe(
+        flags.files,
+        suffixes={Path(path).suffix for path in flags.files} & {".py", ".pyi"},
+    )
     if database is None:
         database = backbone.backbone_database(Path(flags.caches))
-        if depth > 0:
+        # Saturated, the answer needs no graph, so none is read or rebuilt.
+        if depth > 0 and not saturated:
             problem, overlay = backbone.overlay_problem(
                 Path(flags.caches),
                 root=Path.cwd(),
@@ -90,7 +96,7 @@ def main() -> int:
                 Path.cwd(),
                 caches=Path(flags.caches),
                 output=output_argv,
-                index=partial(backbone.index_tree, run=run_argv),
+                index=partial(backbone.index_tree, run=_quietly),
             ):
                 problem, overlay = backbone.overlay_problem(
                     Path(flags.caches),
@@ -109,11 +115,14 @@ def main() -> int:
         depth=depth,
         emit=flags.emit,
         workers=flags.workers,
-        saturated=not flags.no_universe and _covers_universe(flags.files),
+        saturated=saturated,
         hunks={} if flags.diff is None else _parse_diff(Path(flags.diff)),
     )
+    # The graph names files as they were indexed; one deleted since -- another
+    # process's probe -- reached ty as a path it could not open.
     for line in lines:
-        print(line)  # noqa: T201 -- CLI output is this function's product.
+        if Path(line.partition("::")[0]).exists():
+            print(line)  # noqa: T201 -- CLI output is this function's product.
     return 0
 
 
@@ -712,9 +721,15 @@ def _parse_args(
 # A tree with no Python is NOT covered: the empty set is trivially covered by any
 # input, and asserting saturation there would skip every walk -- the same shape as the
 # blank glob in `_globs`.
-def _covers_universe(changed: Sequence[str]) -> bool:
-    """Report whether ``changed`` names every Python file under the cwd."""
-    universe = walk.expand([Path()], suffixes={".py", ".pyi"})
+# A hook handed only ``.py`` files is saturated by every ``.py``: requiring its ``.pyi``
+# too never matched pytest's ``--all-files``, so that walked every seed.
+def _covers_universe(
+    changed: Sequence[str],
+    *,
+    suffixes: Collection[str] = (".py", ".pyi"),
+) -> bool:
+    """Report whether ``changed`` names every file under the cwd with ``suffixes``."""
+    universe = walk.expand([Path()], suffixes=set(suffixes))
     return bool(universe) and {p.as_posix() for p in universe} <= {
         Path(path).as_posix() for path in changed
     }
@@ -1202,3 +1217,14 @@ def _lay_over(connection: sqlite3.Connection, overlay: Path | None) -> None:
     # The inserts opened an implicit transaction, which holds the overlay attached.
     connection.commit()
     connection.execute("""DETACH DATABASE overlay""")
+
+
+# This command's stdout is the selection a gate reads: the index CLI's banner printed
+# there reached ty as paths and left pytest nothing to collect.
+def _quietly(argv: Sequence[str]) -> int:
+    """Run ``argv`` with its output on stderr; return its exit code."""
+    try:
+        return subprocess.run(argv, check=False, stdout=sys.stderr).returncode  # noqa: S603 -- The index CLI's fixed argv.
+    except FileNotFoundError:
+        sys.stderr.write(f"{argv[0]}: command not found\n")
+        return 127
