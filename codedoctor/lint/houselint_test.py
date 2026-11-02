@@ -18,7 +18,6 @@ import sys
 
 import pytest
 
-from codedoctor.lib.worker_count import default_workers
 from codedoctor.lint import (
     house_ignore,
     houselint,
@@ -2250,11 +2249,13 @@ def test_workers_default_to_the_hook_sizing(
         return (), ()
 
     monkeypatch.setattr(houselint, "run", spying_run)
+    # Pinned: the real sizing reads the live load, so two calls can disagree.
+    monkeypatch.setattr(houselint, "default_workers", lambda: 7)
     path = _write(tmp_path, "value = 1\n")
     monkeypatch.setattr(sys, "argv", ["houselint.py", "--select", "digits", str(path)])
 
     assert houselint.main() == 0
-    assert seen == [default_workers()]
+    assert seen == [7]
 
 
 def test_no_paths_lints_the_working_directory(

@@ -878,7 +878,16 @@ def test_emitting_filters_samples_without_running(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["mutated", "--emit", "filters", "--function-sample-rate", "0.1", *paths],
+        [
+            "mutated",
+            "--emit",
+            "filters",
+            "--function-sample-rate",
+            "0.1",
+            "--workers",
+            "1",
+            *paths,
+        ],
     )
 
     assert mutated.main() == 0
