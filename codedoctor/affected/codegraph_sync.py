@@ -13,9 +13,13 @@ a problem is printed, and `affected` independently refuses a stale overlay.
 
 --refresh republishes the backbone at origin/main; a timer runs it with --fetch.
 
+--cli links this worktree a `.codegraph` seeded from the backbone, so the codegraph
+CLI and MCP server can sync and query it. Run it once per worktree before them.
+
 Examples:
   python -m codedoctor.affected.codegraph_sync --caches /opt/scratch/caches/codegraph
   python -m codedoctor.affected.codegraph_sync --caches /opt/scratch/caches/codegraph --refresh --fetch
+  python -m codedoctor.affected.codegraph_sync --caches /opt/scratch/caches/codegraph --cli
 
 '''
 # fmt: on
@@ -45,10 +49,11 @@ if TYPE_CHECKING:
 
 
 def main() -> int:
-    """Refresh the backbone, or sync this worktree's overlay when opted in.
+    """Refresh the backbone, link a CLI index, or sync this worktree's overlay.
 
     Returns:
-      exit_code: 0, except a failed ``--refresh``, which its timer must see.
+      exit_code: 0, except a failed ``--refresh`` or ``--cli``, which their
+        callers must see.
 
     """
     parser = argparse.ArgumentParser(
@@ -68,6 +73,10 @@ def main() -> int:
             output=output_argv,
         )
         if problem:
+            sys.stderr.write(f"codegraph-sync: {problem}\n")
+        return int(bool(problem))
+    if flags.cli:
+        if problem := link_cli_index(Path.cwd(), caches=flags.caches):
             sys.stderr.write(f"codegraph-sync: {problem}\n")
         return int(bool(problem))
     if opted_in(os.environ) and (
@@ -153,7 +162,6 @@ def sync(
     head = _origin_main(root, output=output)
     if published is not None and head and published.sha != head:
         spawn([*command, "--fetch"], cwd=root, log=log)
-    _link_cli_index(root, caches=caches)
     return backbone.build_overlay(
         root,
         caches=caches,
@@ -204,6 +212,45 @@ def refresh(
         return _refresh_locked(repo, home=home, fetch=fetch, run=run, output=output)
 
 
+# Neither index the gates read is this worktree's whole tree -- the backbone is
+# origin/main, the overlay only its changes -- so the CLI gets its own, seeded from the
+# backbone: a ``codegraph sync`` then indexes only what differs, 15 s rather than a full
+# ``init``. A symlink, because ``CODEGRAPH_DIR`` resolves relative to the project and
+# the index is too large for the checkout. An existing ``.codegraph`` is the owner's.
+# Only on request: the gates once linked one into every worktree they ran in, each a
+# full copy of the backbone (825 MB), whether or not anyone used the CLI there.
+def link_cli_index(root: Path, *, caches: Path) -> str:
+    """Give worktree ``root`` a ``.codegraph`` the CLI and MCP server can sync.
+
+    Args:
+      root: The worktree.
+      caches: The CodeGraph cache directory.
+
+    Returns:
+      problem: Why ``root`` has no CLI index; empty when it has one.
+
+    """
+    index = root / ".codegraph"
+    if index.exists() or index.is_symlink():
+        return ""
+    database = backbone.backbone_database(caches)
+    if not database.is_file():
+        return (
+            "No CodeGraph backbone to seed from; run --refresh, or commit once "
+            "with PRECOMMIT_CODEGRAPH_PYTEST set."
+        )
+    home = backbone.overlay_database(caches, root=root).parent / "cli"
+    seeded = home / "codegraph.db"
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        if not seeded.exists():
+            shutil.copyfile(database, seeded)
+        index.symlink_to(home)
+    except OSError as error:
+        return f"Linking {index} to {home} failed: {error}"
+    return ""
+
+
 def spawn(argv: Sequence[str], *, cwd: Path, log: Path) -> subprocess.Popen[bytes]:
     """Start ``argv`` in its own session, so it outlives the hook that started it.
 
@@ -232,6 +279,7 @@ class _Flags(Protocol):
     caches: Path
     refresh: bool
     fetch: bool
+    cli: bool
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -241,10 +289,16 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         required=True,
         help="CodeGraph cache directory: the backbone, and one overlay per worktree.",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--refresh",
         action="store_true",
         help="Republish the backbone at origin/main of the clone in the cwd.",
+    )
+    mode.add_argument(
+        "--cli",
+        action="store_true",
+        help="Link the cwd's worktree a .codegraph for the codegraph CLI and MCP.",
     )
     parser.add_argument(
         "--fetch",
@@ -300,27 +354,6 @@ def _refresh_locked(
     if ensure_derived(database) is None:
         return f"Building the derived tables of {database} failed."
     return ""
-
-
-# Neither index the gates read is this worktree's whole tree -- the backbone is
-# origin/main, the overlay only its changes -- so the CLI gets its own, seeded from the
-# backbone: a ``codegraph sync`` then indexes only what differs, 15 s rather than a full
-# ``init``. A symlink, because ``CODEGRAPH_DIR`` resolves relative to the project and
-# the index is too large for the checkout. An existing ``.codegraph`` is the owner's.
-def _link_cli_index(root: Path, *, caches: Path) -> None:
-    """Give worktree ``root`` a ``.codegraph`` the CLI and MCP server can sync."""
-    index = root / ".codegraph"
-    if index.exists() or index.is_symlink():
-        return
-    home = backbone.overlay_database(caches, root=root).parent / "cli"
-    try:
-        home.mkdir(parents=True, exist_ok=True)
-        seeded = home / "codegraph.db"
-        if not seeded.exists():
-            shutil.copyfile(backbone.backbone_database(caches), seeded)
-        index.symlink_to(home)
-    except OSError:
-        return
 
 
 def _origin_main(repo: Path, *, output: Callable[[Sequence[str]], str | None]) -> str:

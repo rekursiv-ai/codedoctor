@@ -354,14 +354,27 @@ def test_a_backbone_behind_origin_main_is_refreshed_in_the_background(
     ]
 
 
-def test_a_worktree_gets_a_cli_index_seeded_from_the_backbone(tmp_path: Path) -> None:
-    """Without ``.codegraph`` in the worktree, ``codegraph sync`` there refused to run."""
+def test_the_gate_gives_no_worktree_a_cli_index(tmp_path: Path) -> None:
+    """Each gate-made CLI index copied the whole backbone: 825 MB per worktree."""
     _refresh(tmp_path, _Tools())
 
     _sync(tmp_path, _Tools())
 
-    link = tmp_path / "root" / ".codegraph"
+    assert not (tmp_path / "root" / ".codegraph").exists()
     overlay = backbone.overlay_database(tmp_path / "caches", root=tmp_path / "root")
+    assert not (overlay.parent / "cli").exists()
+
+
+def test_a_worktree_gets_a_cli_index_seeded_from_the_backbone(tmp_path: Path) -> None:
+    """Without ``.codegraph`` in the worktree, ``codegraph sync`` there refused to run."""
+    _refresh(tmp_path, _Tools())
+    root = tmp_path / "root"
+    root.mkdir()
+
+    assert codegraph_sync.link_cli_index(root, caches=tmp_path / "caches") == ""
+
+    link = root / ".codegraph"
+    overlay = backbone.overlay_database(tmp_path / "caches", root=root)
     assert link.is_symlink()
     assert link.resolve() == overlay.parent / "cli"
     seeded = backbone.stamped(link / "codegraph.db")
@@ -375,10 +388,23 @@ def test_an_existing_cli_index_is_left_alone(tmp_path: Path) -> None:
     own = tmp_path / "root" / ".codegraph"
     own.mkdir(parents=True)
 
-    _sync(tmp_path, _Tools())
+    assert codegraph_sync.link_cli_index(own.parent, caches=tmp_path / "caches") == ""
 
     assert not own.is_symlink()
     assert list(own.iterdir()) == []
+
+
+def test_a_cli_index_without_a_backbone_is_refused(tmp_path: Path) -> None:
+    """An empty ``cli`` directory once stood in for an index the copy never made."""
+    root = tmp_path / "root"
+    root.mkdir()
+
+    problem = codegraph_sync.link_cli_index(root, caches=tmp_path / "caches")
+
+    assert "No CodeGraph backbone" in problem
+    assert not (root / ".codegraph").exists()
+    overlay = backbone.overlay_database(tmp_path / "caches", root=root)
+    assert not (overlay.parent / "cli").exists()
 
 
 def test_an_overlay_is_indexed_by_the_codegraph_cli(tmp_path: Path) -> None:
@@ -465,6 +491,11 @@ def _main(
         called.append(f"refresh {repo} fetch={fetch} umasks={masks}")
         return "refresh problem"
 
+    def link_cli_index(root: Path, **kwargs: object) -> str:
+        assert kwargs == {"caches": caches}
+        called.append(f"cli {root}")
+        return "cli problem"
+
     # Recorded, never applied: a real `os.umask` here would outlive the test.
     masks: list[int] = []
 
@@ -479,6 +510,7 @@ def _main(
     monkeypatch.delenv("PRECOMMIT_CODEGRAPH_TYPECHECK", raising=False)
     monkeypatch.setattr(codegraph_sync, "sync", sync)
     monkeypatch.setattr(codegraph_sync, "refresh", refresh)
+    monkeypatch.setattr(codegraph_sync, "link_cli_index", link_cli_index)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -515,6 +547,21 @@ def test_a_failed_refresh_fails_its_timer(
     assert "refresh problem" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("opt_in", ["1", "0"])
+def test_cli_mode_links_the_index_whatever_the_gates_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    opt_in: str,
+) -> None:
+    """The CLI's index is asked for by its user, not by the gates' opt-in."""
+    called = _main(monkeypatch, tmp_path, "--cli", opt_in=opt_in)
+
+    assert codegraph_sync.main() == 1
+    assert called == [f"cli {tmp_path}"]
+    assert "codegraph-sync: cli problem" in capsys.readouterr().err
+
+
 def test_the_help_describes_both_modes(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -526,6 +573,7 @@ def test_the_help_describes_both_modes(
 
     assert "Keep the shared CodeGraph backbone" in text
     assert "--refresh republishes the backbone" in text
+    assert "--cli links this worktree" in text
     assert "exec uv" not in text
 
 
