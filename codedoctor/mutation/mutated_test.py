@@ -1337,6 +1337,41 @@ def test_an_unreachable_docstring_fallback_is_not_a_survivor(tmp_path: Path) -> 
             "def f(r):\n    match r:\n        case 1:\n            g()\n",
             True,
         ),
+        (
+            (
+                "def f(r):\n    match r:\n        case 1:\n            return 2\n"
+                "        case 2:\n            return 3\n        case _:\n            return None\n"
+            ),
+            (
+                "def f(r):\n    match r:\n        case 1:\n            return 2\n"
+                "        case 2:\n            return 3\n"
+            ),
+            True,
+        ),
+        (
+            (
+                "def f(r):\n    match r:\n        case 1:\n            return 2\n"
+                "        case 3:\n            return None\n"
+            ),
+            "def f(r):\n    match r:\n        case 1:\n            return 2\n",
+            True,
+        ),
+        (
+            (
+                "def f(r):\n    match r:\n        case 1:\n            return 2\n"
+                "        case _ if g():\n            return None\n"
+            ),
+            "def f(r):\n    match r:\n        case 1:\n            return 2\n",
+            False,
+        ),
+        (
+            (
+                "def f(r):\n    match r:\n        case 1:\n            return None\n"
+                "        case _:\n            return 2\n"
+            ),
+            "def f(r):\n    match r:\n        case _:\n            return 2\n",
+            False,
+        ),
         # Followed by more code, ending the call or the iteration skips it.
         (
             (

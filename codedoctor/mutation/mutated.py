@@ -1298,11 +1298,11 @@ def _erase_unobservable(code: str) -> str:
     return ast.dump(tree)
 
 
-# A type checker demands a last ``case _`` for exhaustiveness. One that does only
-# what falling off the end of its function or loop body would do is the same
-# program with or without it.
+# A type checker demands a last ``case _`` for exhaustiveness. A last case that does
+# only what falling off the end of its function or loop body would do is the same
+# program with or without it, whatever its pattern; a guard is code, so it stays.
 def _drop_fallthrough_defaults(tree: ast.Module) -> None:
-    """Delete each such ``case _`` from ``tree``."""
+    """Delete each such last case from ``tree``."""
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             ends = (_returns_none, _passes)
@@ -1313,22 +1313,11 @@ def _drop_fallthrough_defaults(tree: ast.Module) -> None:
         last = node.body[-1]
         if (
             isinstance(last, ast.Match)
-            and len(last.cases) > 1
-            and _is_wildcard(default := last.cases[-1])
+            and (default := last.cases[-1]).guard is None
             and len(default.body) == 1
             and any(end(default.body[0]) for end in ends)
         ):
             last.cases.pop()
-
-
-def _is_wildcard(case: ast.match_case) -> bool:
-    """Return whether ``case`` is a bare, unguarded ``case _``."""
-    return (
-        isinstance(case.pattern, ast.MatchAs)
-        and case.pattern.pattern is None
-        and case.pattern.name is None
-        and case.guard is None
-    )
 
 
 def _returns_none(statement: ast.stmt) -> bool:
