@@ -1515,7 +1515,8 @@ def test_both_projections_check_coverage(
         received.append(kwargs["saturated"])
         return []
 
-    def covers(changed: list[str]) -> bool:
+    def covers(changed: list[str], *, suffixes: set[str]) -> bool:
+        assert suffixes == {".py", ".pyi"}
         checked.append(changed)
         return covered
 
@@ -1524,11 +1525,20 @@ def test_both_projections_check_coverage(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["affected.py", *argv, "--database", str(tmp_path / "absent.db"), "--", "a.py"],
+        [
+            "affected.py",
+            *argv,
+            "--database",
+            str(tmp_path / "absent.db"),
+            "--",
+            "a.py",
+            "b.pyi",
+            "c.txt",
+        ],
     )
     assert affected.main() == 0
     assert received == [want]
-    assert checked == ([] if "--no-universe" in argv else [["a.py"]])
+    assert checked == ([] if "--no-universe" in argv else [["a.py", "b.pyi", "c.txt"]])
 
 
 def test_an_empty_tree_is_never_covered(tmp_path: Path) -> None:
@@ -1547,6 +1557,21 @@ def test_coverage_counts_every_python_file_in_the_tree(tmp_path: Path) -> None:
     assert affected._covers_universe(["a.py", "pkg/b.pyi"])
     assert affected._covers_universe(["./a.py", "pkg/b.pyi", "extra.py"])
     assert not affected._covers_universe(["a.py"])
+
+
+def test_every_py_file_covers_a_tree_for_a_hook_handed_only_python(
+    tmp_path: Path,
+) -> None:
+    """Pytest's hook is handed `.py` files: requiring the `.pyi` too never matched.
+
+    So `--all-files` walked every seed, 35s before pytest started.
+    """
+    for name in ("a.py", "pkg/b.pyi", "pkg/c.py"):
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).touch()
+
+    assert affected._covers_universe(["a.py", "pkg/c.py"], suffixes={".py"})
+    assert not affected._covers_universe(["a.py"], suffixes={".py"})
 
 
 def test_skip_reads_one_name_out_of_precommits_list(
@@ -1742,6 +1767,7 @@ def test_main_prints_only_the_selection(
     _recorded_harvest(monkeypatch)
     monkeypatch.setattr(affected, "harvest", harvest_stub)
     monkeypatch.setattr(sys, "argv", ["affected", "--", "x.py"])
+    Path("x.py").touch()
     assert affected.main() == 0
     assert capfd.readouterr() == ("x.py\n", "")
 
@@ -2016,7 +2042,7 @@ def test_a_stale_overlay_is_rebuilt_before_the_walk(
 
     monkeypatch.setattr(backbone, "overlay_problem", problem)
     monkeypatch.setattr(backbone, "build_overlay", build)
-    monkeypatch.setattr(affected, "run_argv", run)
+    monkeypatch.setattr(affected, "_quietly", run)
     argv = ["affected.py", "--caches", str(tmp_path), "--depth", "2", "--", "a.py"]
     monkeypatch.setattr(sys, "argv", argv)
 
@@ -2026,6 +2052,83 @@ def test_a_stale_overlay_is_rebuilt_before_the_walk(
     assert rebuilt == [(Path.cwd(), tmp_path, affected.output_argv)]
     assert indexed == [["codegraph", "init", "--yes", str(tmp_path)]]
     assert (calls[0]["depth"], calls[0]["overlay"]) == (2, overlay)
+
+
+@pytest.mark.parametrize(
+    ("emit", "found"),
+    [
+        ("files", ["kept.py", "gone_test.py"]),
+        ("nodeids", ["kept_test.py::t", "gone_test.py::t"]),
+    ],
+)
+def test_a_deleted_file_is_never_printed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    emit: str,
+    found: list[str],
+) -> None:
+    """The graph remembers a file another process deleted; ty then failed on it."""
+
+    def harvested(database: Path, **_: object) -> list[str]:
+        del database
+        return found
+
+    def uncovered(changed: list[str], **_: object) -> bool:
+        del changed
+        return False
+
+    monkeypatch.setattr(affected, "harvest", harvested)
+    monkeypatch.setattr(affected, "_covers_universe", uncovered)
+    (tmp_path / "kept.py").touch()
+    (tmp_path / "kept_test.py").touch()
+    monkeypatch.chdir(tmp_path)
+    argv = ["affected.py", "--emit", emit, "--database", "x.db", "--", "kept.py"]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    assert affected.main() == 0
+    assert capsys.readouterr().out.split() == found[:1]
+
+
+def test_the_rebuilds_index_output_never_reaches_the_selection(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """`codegraph init`'s banner landed in stdout: the gates read it as paths."""
+    status = affected._quietly(
+        [sys.executable, "-c", "print('Initializing CodeGraph')"],
+    )
+
+    out, err = capfd.readouterr()
+    assert status == 0
+    assert out == ""
+    assert "Initializing CodeGraph" in err
+
+
+def test_a_saturated_changeset_never_rebuilds_the_overlay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every file handed in needs no graph, so a stale overlay costs nothing."""
+    calls = _recorded_harvest(monkeypatch)
+
+    def problem(caches: Path, **_: object) -> tuple[str, Path | None]:
+        del caches
+        return ("The overlay is stale.", None)
+
+    def build(root: Path, **_: object) -> str:
+        del root
+        raise AssertionError("a saturated changeset rebuilt the overlay")
+
+    def covers(changed: list[str], **_: object) -> bool:
+        del changed
+        return True
+
+    monkeypatch.setattr(backbone, "overlay_problem", problem)
+    monkeypatch.setattr(backbone, "build_overlay", build)
+    monkeypatch.setattr(affected, "_covers_universe", covers)
+    monkeypatch.setattr(sys, "argv", ["affected.py", "--depth", "2", "--", "a.py"])
+
+    assert affected.main() == 0
+    assert calls[0]["saturated"] is True
 
 
 def test_an_overlay_that_will_not_rebuild_selects_without_the_graph(
