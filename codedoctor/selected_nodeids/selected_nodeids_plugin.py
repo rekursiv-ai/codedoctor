@@ -109,9 +109,7 @@ def pytest_addoption(parser: _Parser) -> None:
     parser.addoption(
         "--test-files",
         type=Path,
-        # pragma: no mutate start -- the help text reaches only `--help`.
-        help="Collect only the test files this file lists, one per line.",
-        # pragma: no mutate end
+        help="Collect only the test files this file lists, one per line.",  # pragma: no mutate -- `--help` only.
     )
 
 
