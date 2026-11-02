@@ -121,22 +121,23 @@ def main() -> int:
             text=True,
             check=False,
         )
-    sys.stderr.write(result.stderr)
-    # 0 clean, 1 diagnostics; anything else is a crash with no JSON report, as is
-    # pyrefly's exit 1 on a missing path, which prints no report at all.
-    if result.returncode > 1 or (
-        checker == "pyrefly" and result.returncode and not result.stdout
-    ):
-        sys.stdout.write(result.stdout)
-        return result.returncode
-    parse = pyrefly_diagnostics if checker == "pyrefly" else diagnostics
-    # Above one thread, basedpyright prints no report at all, not an empty one, when
-    # it analyzes no file: every target excluded or under a hidden directory.
-    found = (
-        parse(result.stdout, overlay=overlay, root=root)
-        if result.stdout or result.returncode
-        else []
-    )
+        sys.stderr.write(result.stderr)
+        # 0 clean, 1 diagnostics; anything else is a crash with no JSON report, as
+        # is pyrefly's exit 1 on a missing path, which prints no report at all.
+        if result.returncode > 1 or (
+            checker == "pyrefly" and result.returncode and not result.stdout
+        ):
+            sys.stdout.write(result.stdout)
+            return result.returncode
+        parse = pyrefly_diagnostics if checker == "pyrefly" else diagnostics
+        # Above one thread, basedpyright prints no report at all, not an empty one,
+        # when it analyzes no file: every target excluded or under a hidden
+        # directory. Parsed while the overlay exists: its copies locate the probes.
+        found = (
+            parse(result.stdout, overlay=overlay, root=root)
+            if result.stdout or result.returncode
+            else []
+        )
     rule = "unnecessary-assert-isinstance"
     try:
         needed = still_needed(
@@ -396,7 +397,7 @@ def diagnostics(report: str, *, overlay: Path, root: Path) -> list[Diagnostic]:
         line = from_plain(start.get("line"), int, default=0) + 1
         column = from_plain(start.get("character"), int, default=0)
         rule = from_plain(item.get("rule"), str, default="")
-        probed_at = _probe_span(path, line=line, checker="basedpyright")
+        probed_at = _probe_span(checked, line=line, checker="basedpyright")
         redundant = column in probed_at
         if redundant and rule != "reportUnnecessaryIsInstance":
             continue
@@ -450,7 +451,7 @@ def pyrefly_diagnostics(report: str, *, overlay: Path, root: Path) -> list[Diagn
         column = from_plain(item.get("column"), int) - 1
         rule = from_plain(item.get("name"), str)
         message = from_plain(item.get("description"), str)
-        probed_at = _probe_span(path, line=line, checker="pyrefly")
+        probed_at = _probe_span(checked, line=line, checker="pyrefly")
         redundant = column in probed_at
         if redundant and (rule, message) != ("reveal-type", "revealed type: Never"):
             continue
@@ -606,13 +607,17 @@ def _probe(match: re.Match[str], *, checker: str) -> str:
     return f"isinstance({match['args']}); "
 
 
-def _probe_span(path: Path, *, line: int, checker: str) -> range:
-    """Return the 0-based columns the probe occupies on ``path``'s 1-based ``line``."""
-    match = _ASSERT.fullmatch(path.read_text().split("\n")[line - 1])
-    if match is None:
+# Read from the overlay copy the checker saw: the checkout may change while it runs,
+# moving its asserts off the lines the report names.
+def _probe_span(checked: Path, *, line: int, checker: str) -> range:
+    """Return the 0-based columns a probe occupies on ``checked``'s 1-based ``line``."""
+    text = checked.read_text().split("\n")[line - 1]
+    start = len(text) - len(text.lstrip())
+    end = text.find("; assert ", start) + len("; ")
+    match = _ASSERT.fullmatch(text[:start] + text[end:]) if end > start else None
+    if match is None or text[start:end] != _probe(match, checker=checker):
         return range(0)
-    start = len(match["indent"])
-    return range(start, start + len(_probe(match, checker=checker)))
+    return range(start, end)
 
 
 # Each directory on the way becomes real, holding links to its children, so writing the
