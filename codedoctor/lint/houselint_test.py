@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, ClassVar, cast, override
 import argparse
 import ast
 import json
+import os
 import re
 import subprocess
 import sys
@@ -1000,7 +1001,8 @@ def test_a_full_tree_argv_does_not_break_the_pool(tmp_path: Path) -> None:
         check=False,
         capture_output=True,
         text=True,
-        cwd=Path(houselint.__file__).resolve().parents[3],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
     )
 
     assert result.returncode == 0, result.stderr

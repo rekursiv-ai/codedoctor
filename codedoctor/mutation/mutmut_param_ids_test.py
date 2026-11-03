@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING
 
+import os
 import subprocess
 import sys
 
 import pytest
 
 
-_CWD: Final = Path(__file__).resolve().parent
+if TYPE_CHECKING:
+    from pathlib import Path
+
 
 _MODULE = """\
 import pytest
@@ -73,7 +75,7 @@ def test_ids_from_one_session_select_tests_in_the_next(
         capture_output=True,
         check=False,
         cwd=tmp_path,
-        env={"PYTHONPATH": str(_CWD.parents[2]), "PATH": ""},
+        env={"PYTHONPATH": os.pathsep.join(sys.path), "PATH": ""},
         text=True,
     )
 
