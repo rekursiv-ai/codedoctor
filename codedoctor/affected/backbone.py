@@ -307,7 +307,7 @@ def build_overlay(
         if present and (status := index(tree)):
             return f"Indexing the overlay failed (codegraph exit {status})."
         if not present:
-            built = Path(scratch) / "codegraph.db"
+            built.parent.mkdir(parents=True)
             sqlite3.connect(built).close()
         stamp(built, sha=base.sha, fingerprint=key, paths=paths)
         built.chmod(0o664)

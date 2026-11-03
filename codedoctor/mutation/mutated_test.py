@@ -2218,6 +2218,8 @@ def test_snapshots_load_the_dynamo_plugin_after_the_projects_own_args(
             "-p",
             "codedoctor.mutation.mutmut_outcome",
             "-p",
+            "codedoctor.mutation.mutmut_kill_guard",
+            "-p",
             "no:py_pglite",
             "-p",
             "no:fast_array_utils",

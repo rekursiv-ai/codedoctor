@@ -33,7 +33,9 @@ def _install(
         return f"/usr/bin/{cmd}" if cmd in installed else None
 
     def fake_run(args: list[str], *, check: bool) -> _FakeCompleted:
-        del check
+        # A raising run would turn the tool's verdict into a traceback.
+        if check is not False:
+            raise subprocess.CalledProcessError(returncode, args)
         calls.append(args)
         return _FakeCompleted(returncode)
 
@@ -76,7 +78,7 @@ def test_missing_binary_reports_127(
     _install(monkeypatch)
 
     assert nbstripout_hook.main() == 127
-    assert "nbstripout" in capsys.readouterr().err
+    assert capsys.readouterr().err == "nbstripout or nbstripout-fast is required.\n"
 
 
 def test_filenames_reach_the_underlying_tool(

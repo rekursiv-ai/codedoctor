@@ -12,7 +12,7 @@ failed a required check for hours while the artifact looked the right size.
 Writing from the hook instead makes the file this plugin's output rather than
 the console's. Nothing another plugin prints can reach it.
 
-Enable with ``-p codedoctor.selected_nodeids.selected_nodeids_plugin`` -- the dotted
+Enable with ``-p codedoctor.testing.listing`` -- the dotted
 path, which is what resolves from the repository root -- or by naming it in
 ``PYTEST_PLUGINS``. Then set any of:
 
@@ -30,8 +30,12 @@ inherit the environment, and a listing in it narrowed their run to nothing.
 A listing may also split one file between shards (``shard_plan.py``): a
 ``<file>::<test>`` line runs only the tests so named from that file, and a
 ``!<file>::<test>`` line drops that test from a file the listing names whole.
-The shard holding the file whole runs every test no other shard names, a new
-one included.
+A test named without its ``[case]`` names every case. The shard holding the
+file whole runs every test no other shard names, a new one included.
+
+The pre-commit ``pytest`` gate selects the same way, from the dependency
+graph's nodeids. Nodeids as arguments are unsafe: once one points into a
+module that skips at module level, pytest 9.2 drops every other argument.
 
 Without one of these the plugin does nothing, so the same invocation works
 uninstrumented.
@@ -47,6 +51,7 @@ from typing import TYPE_CHECKING, Protocol
 import json
 import os
 
+from codedoctor.gate import gate
 from codedoctor.testing.tiers import TIERS
 
 
@@ -109,7 +114,7 @@ def pytest_addoption(parser: _Parser) -> None:
     parser.addoption(
         "--test-files",
         type=Path,
-        help="Collect only the test files this file lists, one per line.",  # pragma: no mutate -- `--help` only.
+        help="Collect only the test files this file lists, one per line.",
     )
 
 
@@ -132,20 +137,19 @@ def pytest_collection_finish(session: _Session) -> None:
       session: pytest session with finalized item collection.
 
     """
-    # pragma: no mutate start -- an unset variable is falsy under every default.
-    selected = os.environ.get("PYTEST_COLLECT_SELECTED", "")
-    selected_dir = os.environ.get("PYTEST_COLLECT_SELECTED_DIR", "")
-    tiers = os.environ.get("PYTEST_COLLECT_TIERS", "")
-    # pragma: no mutate end
-    if selected:
+    environ = os.environ
+    if gate.flagged(environ, "PYTEST_COLLECT_SELECTED"):
         _write_nodeids(
-            Path(selected),
+            Path(environ["PYTEST_COLLECT_SELECTED"]),
             nodeids=(item.nodeid for item in session.items),
         )
-    if selected_dir:
-        _write_tier_nodeids(Path(selected_dir), items=session.items)
-    if tiers:
-        _write_tier_files(Path(tiers), items=session.items)
+    if gate.flagged(environ, "PYTEST_COLLECT_SELECTED_DIR"):
+        _write_tier_nodeids(
+            Path(environ["PYTEST_COLLECT_SELECTED_DIR"]),
+            items=session.items,
+        )
+    if gate.flagged(environ, "PYTEST_COLLECT_TIERS"):
+        _write_tier_files(Path(environ["PYTEST_COLLECT_TIERS"]), items=session.items)
 
 
 def pytest_ignore_collect(collection_path: Path, config: _Config) -> bool | None:
@@ -194,8 +198,10 @@ def pytest_collection_modifyitems[ItemT: _Item](
     deselected: list[ItemT] = []
     for item in items:
         file = item.nodeid.partition("::")[0]
-        runs_here = item.nodeid not in dropped and (
-            file not in named or item.nodeid in named[file]
+        # The dependency graph names ``f::t``; pytest collects ``f::t[case]``.
+        names = {item.nodeid, item.nodeid.partition("[")[0]}
+        runs_here = not names & dropped and (
+            file not in named or bool(names & named[file])
         )
         (kept if runs_here else deselected).append(item)
     if deselected:

@@ -96,7 +96,7 @@ def main() -> int:
 def opted_in(environ: Mapping[str, str]) -> bool:
     """Report whether either graph-walking gate is on."""
     return any(
-        positive(environ.get(name, ""))
+        positive(environ.get(name))
         for name in ("PRECOMMIT_CODEGRAPH_PYTEST", "PRECOMMIT_CODEGRAPH_TYPECHECK")
     )
 
