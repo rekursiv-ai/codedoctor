@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Final, Literal
+from typing import TYPE_CHECKING, Literal
 
+import os
 import subprocess
 import sys
 
@@ -15,7 +15,9 @@ import pytest
 from codedoctor.mutation import mutmut_outcome
 
 
-_CWD: Final = Path(__file__).resolve().parent
+if TYPE_CHECKING:
+    from pathlib import Path
+
 
 _MODULE = """\
 import pytest
@@ -91,7 +93,7 @@ def test_only_a_mutant_run_that_ran_no_test_fails(
         check=False,
         cwd=tmp_path,
         env={
-            "PYTHONPATH": str(_CWD.parents[2]),
+            "PYTHONPATH": os.pathsep.join(sys.path),
             "PATH": "",
             "MUTANT_UNDER_TEST": mutant,
         },

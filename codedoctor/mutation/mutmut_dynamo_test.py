@@ -7,8 +7,7 @@ it, and one without it has nothing for Dynamo to trace.
 from __future__ import annotations
 
 from importlib import util
-from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING
 
 import os
 import subprocess
@@ -21,7 +20,9 @@ import pytest
 from codedoctor.mutation import mutmut_dynamo
 
 
-_CWD: Final = Path(__file__).resolve().parent
+if TYPE_CHECKING:
+    from pathlib import Path
+
 
 pytestmark = pytest.mark.skipif(
     util.find_spec("torch") is None,
@@ -35,6 +36,7 @@ def test_a_fullgraph_compile_traces_a_trampoline_while_stats_are_collected(
 ) -> None:
     source = tmp_path / "mod.py"
     source.write_text("def shift(x):\n    return x + 1\n")
+    (tmp_path / "pyproject.toml").write_text('[tool.mutmut]\nsource_paths = ["."]\n')
     probe = tmp_path / "probe.py"
     probe.write_text(
         "import importlib.util, os, sys, torch\n"
@@ -59,7 +61,8 @@ def test_a_fullgraph_compile_traces_a_trampoline_while_stats_are_collected(
             [sys.executable, str(probe), mode, str(source)],
             capture_output=True,
             check=True,
-            cwd=_CWD.parents[2],
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
             text=True,
         ).stdout.strip()
 
