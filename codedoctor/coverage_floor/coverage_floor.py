@@ -238,7 +238,12 @@ def report(
     for source in morfs:
         _, statements, _, missing, gaps = measurement.analysis2(source)
         unit = source if scope == "file" else str(Path(source).parent)
-        floor = floors[max((p for p in floors if source.startswith(p)), key=len)]
+        floor = floors[
+            max(
+                (p for p in floors if source.startswith(p)),
+                key=len,  # pragma: no mutate -- nested prefixes sort longest last.
+            )
+        ]
         _, total, missed, where = units.get(unit, (floor, 0, 0, []))
         if gaps:
             where = [*where, gaps if scope == "file" else f"{source}: {gaps}"]
