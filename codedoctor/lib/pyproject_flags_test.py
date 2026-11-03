@@ -1,5 +1,6 @@
 """Tests for ``pyproject_flags``: TOML defaults under argparse flags."""
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -204,6 +205,50 @@ def test_an_unset_flag_takes_its_table_type_from_a_converter_function(
     with pytest.raises(SystemExit):
         parse()
     assert "workers: expected int, got str" in capsys.readouterr().err
+
+
+def _counted(text: str) -> "int":
+    return int(text)
+
+
+def _listed(text: str) -> list[int]:
+    return [int(text)]
+
+
+@pytest.mark.parametrize(
+    ("converter", "accepted", "rejected"),
+    [
+        # A string annotation, as ``from __future__ import annotations`` leaves.
+        (_counted, "3", '"3"'),
+        # A generic alias is no class ``isinstance`` can check.
+        (_listed, None, "[3]"),
+    ],
+    ids=["string-annotation", "generic-annotation"],
+)
+def test_a_converter_annotation_must_name_a_class(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    converter: Callable[[str], object],
+    accepted: str | None,
+    rejected: str,
+) -> None:
+    def parse(value: str) -> argparse.Namespace:
+        parser = _parser()
+        parser.add_argument("--workers", type=converter)
+        _pyproject(tmp_path, f"[tool.tool]\nworkers = {value}\n")
+        flags, _ = pyproject_flags.parse_args(
+            parser,
+            tool="tool",
+            argv=[],
+            start=tmp_path,
+        )
+        return flags
+
+    if accepted is not None:
+        assert vars(parse(accepted))["workers"] == 3
+    with pytest.raises(SystemExit):
+        parse(rejected)
+    assert "workers:" in capsys.readouterr().err
 
 
 def test_the_table_is_found_from_the_cwd_without_a_start(

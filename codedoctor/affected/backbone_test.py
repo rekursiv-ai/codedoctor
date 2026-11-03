@@ -6,6 +6,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import hashlib
 import os
 import sqlite3
 import subprocess
@@ -21,6 +22,8 @@ if TYPE_CHECKING:
 
 
 _SHA = "a" * 40
+# Distinct past its 12th character, so a message shows exactly the prefix it names.
+_LONG = "0123456789abcdef" * 2 + "01234567"
 
 
 def _codegraph(database: Path, *, files: Sequence[str] = ()) -> Path:
@@ -91,6 +94,21 @@ def _indexer(calls: list[Path]) -> Callable[[Path], int]:
     return index
 
 
+@pytest.mark.parametrize("status", [0, 3])
+def test_a_tree_is_indexed_from_scratch_by_the_codegraph_cli(
+    tmp_path: Path,
+    status: int,
+) -> None:
+    seen: list[list[str]] = []
+
+    def run(argv: Sequence[str]) -> int:
+        seen.append(list(argv))
+        return status
+
+    assert backbone.index_tree(tmp_path, run=run) == status
+    assert seen == [["codegraph", "init", "--yes", str(tmp_path)]]
+
+
 def test_every_worktree_reads_the_one_backbone(tmp_path: Path) -> None:
     assert backbone.backbone_database(tmp_path) == (
         tmp_path / "backbone" / "codegraph.db"
@@ -104,7 +122,8 @@ def test_each_worktree_gets_its_own_overlay(tmp_path: Path) -> None:
 
     assert first != second
     assert first.parent.parent == tmp_path / "overlays"
-    assert first.parent.name.startswith("loop-")
+    digest = hashlib.sha256(str((tmp_path / "a" / "loop").resolve()).encode())
+    assert first.parent.name == f"loop-{digest.hexdigest()[:12]}"
     assert first == backbone.overlay_database(tmp_path, root=tmp_path / "a" / "loop")
 
 
@@ -175,6 +194,21 @@ def test_the_fingerprint_moves_with_content_deletion_and_commit(
     second = backbone.fingerprint(tmp_path, sha=_SHA, paths=["a.py"])
     (tmp_path / "a.py").unlink()
     assert second != backbone.fingerprint(tmp_path, sha=_SHA, paths=["a.py"])
+
+
+def test_the_fingerprint_is_the_commit_then_each_path_and_its_content(
+    tmp_path: Path,
+) -> None:
+    """A stamped overlay keeps its fingerprint across releases, so its form is fixed."""
+    (tmp_path / "a.py").write_bytes(b"one")
+    content = hashlib.sha256(b"one").hexdigest()
+    digest = hashlib.sha256(_SHA.encode())
+    digest.update(f"\0a.py\0{content}".encode())
+    digest.update(b"\0gone.py\0-")
+
+    assert backbone.fingerprint(tmp_path, sha=_SHA, paths=["a.py", "gone.py"]) == (
+        digest.hexdigest()
+    )
 
 
 def test_the_fingerprint_separates_a_path_from_its_content(tmp_path: Path) -> None:
@@ -287,12 +321,15 @@ def test_an_overlay_needs_a_backbone(tmp_path: Path) -> None:
         index=_indexer([]),
     )
 
-    assert "No CodeGraph backbone" in problem
+    assert problem == (
+        f"No CodeGraph backbone at {backbone.backbone_database(tmp_path / 'caches')}; "
+        "the codegraph-sync hook builds one, and its --refresh mode keeps it current."
+    )
 
 
 def test_an_unfetched_backbone_commit_is_reported(tmp_path: Path) -> None:
     caches = tmp_path / "caches"
-    _published(caches)
+    _published(caches, sha=_LONG)
 
     problem = backbone.build_overlay(
         tmp_path,
@@ -301,8 +338,9 @@ def test_an_unfetched_backbone_commit_is_reported(tmp_path: Path) -> None:
         index=_indexer([]),
     )
 
-    assert "git fetch origin" in problem
-    assert _SHA[:12] in problem
+    assert problem == (
+        "Backbone commit 0123456789ab is not in this clone; run `git fetch origin`."
+    )
 
 
 def test_a_failed_index_publishes_nothing(tmp_path: Path) -> None:
@@ -370,8 +408,13 @@ def test_an_edited_file_makes_the_overlay_stale(tmp_path: Path) -> None:
         output=_git(diff="a.py\0"),
     )
 
-    assert "stale" in problem
+    assert problem == _STALE
     assert overlay is None
+
+
+_STALE = (
+    "The overlay is stale: the worktree changed since the codegraph-sync hook built it."
+)
 
 
 def test_a_newly_changed_file_makes_the_overlay_stale(tmp_path: Path) -> None:
@@ -383,21 +426,26 @@ def test_a_newly_changed_file_makes_the_overlay_stale(tmp_path: Path) -> None:
         output=_git(diff="a.py\0b.py\0"),
     )
 
-    assert "stale" in problem
+    assert problem == _STALE
 
 
 def test_a_republished_backbone_makes_the_overlay_stale(tmp_path: Path) -> None:
-    caches, root, _ = _fresh(tmp_path)
+    caches, root = tmp_path / "caches", tmp_path / "root"
+    _published(caches, sha=_LONG)
+    root.mkdir()
+    (root / "a.py").write_text("x")
+    git = _git(diff="a.py\0")
+    built = backbone.build_overlay(root, caches=caches, output=git, index=_indexer([]))
+    assert built == ""
     backbone.backbone_database(caches).unlink()
-    _published(caches, sha="b" * 40)
+    _published(caches, sha="fedcba9876543210" * 2 + "fedcba98")
 
-    problem, overlay = backbone.overlay_problem(
-        caches,
-        root=root,
-        output=_git(diff="a.py\0"),
+    problem, overlay = backbone.overlay_problem(caches, root=root, output=git)
+
+    assert problem == (
+        "The overlay describes backbone commit 0123456789ab, but the backbone is now "
+        "fedcba987654; the codegraph-sync hook rebuilds it."
     )
-
-    assert "bbbbbbbbbbbb" in problem
     assert overlay is None
 
 
@@ -409,7 +457,14 @@ def test_a_missing_backbone_or_overlay_is_a_problem(tmp_path: Path) -> None:
         in backbone.overlay_problem(caches, root=root, output=_git())[0]
     )
     _published(caches)
-    assert "No overlay" in backbone.overlay_problem(caches, root=root, output=_git())[0]
+    assert backbone.overlay_problem(caches, root=root, output=_git()) == (
+        (
+            f"No overlay for {root.resolve()} at "
+            f"{backbone.overlay_database(caches, root=root)}; "
+            "the codegraph-sync hook builds it."
+        ),
+        None,
+    )
 
 
 def test_an_unfetched_commit_is_a_problem_for_readers_too(tmp_path: Path) -> None:
@@ -447,7 +502,10 @@ def test_a_renamed_column_is_reported_not_queried(
     problem, overlay = backbone.overlay_problem(caches, root=tmp_path, output=_git())
 
     assert f"{table}.{column}" in problem
-    assert str(database) in problem
+    assert problem == (
+        f"{database} lacks {table}.{column}: CodeGraph's schema changed, and "
+        "the walk in `affected.py` must follow it."
+    )
     assert overlay is None
 
 
@@ -476,10 +534,28 @@ def test_an_unreadable_backbone_is_a_problem(tmp_path: Path) -> None:
     database.parent.mkdir(parents=True)
     database.write_bytes(b"garbage " * 100)
 
-    assert (
-        "unreadable"
-        in backbone.overlay_problem(tmp_path, root=tmp_path, output=_git())[0]
+    assert backbone.overlay_problem(tmp_path, root=tmp_path, output=_git()) == (
+        (
+            f"The CodeGraph backbone at {database} is unreadable or unstamped; "
+            "codegraph-sync --refresh republishes it."
+        ),
+        None,
     )
+
+
+def test_a_renamed_pair_of_columns_is_listed_comma_separated(tmp_path: Path) -> None:
+    database = _published(tmp_path / "caches")
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("ALTER TABLE edges RENAME COLUMN source TO s")
+        connection.execute("ALTER TABLE edges RENAME COLUMN target TO t")
+
+    problem, _ = backbone.overlay_problem(
+        tmp_path / "caches",
+        root=tmp_path,
+        output=_git(),
+    )
+
+    assert problem.startswith(f"{database} lacks edges.source, edges.target: ")
 
 
 @pytest.mark.cli_git

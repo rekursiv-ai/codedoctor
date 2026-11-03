@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import ast
+import warnings
 
 from codedoctor.lint.houselint_types import Unit
 
@@ -61,6 +62,23 @@ def test_unparsable_and_notebook_units_have_empty_views() -> None:
         assert unit.walk == ()
         assert dict(unit.parents) == {}
         assert unit.nodes(ast.AST) == ()
+
+
+def test_a_parse_warning_names_the_units_file() -> None:
+    unit = Unit(path=Path("pkg/mod.py"), source='x = "\\d"\n', kind="python")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert unit.tree is not None
+
+    assert [warning.filename for warning in caught] == ["pkg/mod.py"]
+
+
+def test_tokens_stop_quietly_where_tokenizing_fails() -> None:
+    tokens = _unit("x = 1\ny = (\n").tokens
+
+    assert [token.string for token in tokens][:3] == ["x", "=", "1"]
+    assert all(token.start[0] <= 2 for token in tokens)
 
 
 if __name__ == "__main__":

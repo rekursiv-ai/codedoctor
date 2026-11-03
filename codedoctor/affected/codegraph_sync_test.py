@@ -145,6 +145,30 @@ def test_a_first_refresh_snapshots_indexes_and_publishes(tmp_path: Path) -> None
     assert home.stat().st_mode & 0o7777 == 0o2775
 
 
+def test_the_published_backbone_holds_what_codegraph_indexed(tmp_path: Path) -> None:
+    tools = _Tools()
+
+    def indexing(argv: Sequence[str]) -> int:
+        status = tools.run(argv)
+        if argv[0] == "codegraph":
+            index = Path(argv[-1]) / ".codegraph" / "codegraph.db"
+            with closing(sqlite3.connect(index)) as connection, connection:
+                connection.execute("INSERT INTO nodes (id) VALUES ('indexed')")
+        return status
+
+    codegraph_sync.refresh(
+        tmp_path / "repo",
+        caches=tmp_path / "caches",
+        fetch=False,
+        run=indexing,
+        output=tools.output,
+    )
+
+    database = backbone.backbone_database(tmp_path / "caches")
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("SELECT id FROM nodes").fetchall() == [("indexed",)]
+
+
 def test_the_published_backbone_is_one_self_contained_file(tmp_path: Path) -> None:
     """Readers open it read-only; a WAL beside it would need their write access."""
     _refresh(tmp_path, _Tools())
@@ -270,6 +294,31 @@ def test_a_failed_snapshot_is_reported(tmp_path: Path) -> None:
     assert "read-tree" in problem
 
 
+# Distinct past its 12th character, so a message shows exactly the prefix it names.
+_LONG = "0123456789abcdef" * 2 + "01234567"
+
+
+def test_a_failed_snapshot_names_the_commit_and_status(tmp_path: Path) -> None:
+    def failing(argv: Sequence[str]) -> int:
+        return 128 if "read-tree" in argv else 0
+
+    problem = codegraph_sync.refresh(
+        tmp_path,
+        caches=tmp_path / "caches",
+        fetch=False,
+        run=failing,
+        output=_Tools(sha=_LONG).output,
+    )
+
+    assert problem == "`git read-tree` of 0123456789ab failed (exit 128)."
+
+
+def test_a_failed_index_names_the_commit_and_status(tmp_path: Path) -> None:
+    problem = _refresh(tmp_path, _Tools(sha=_LONG, codegraph=3))
+
+    assert problem == "Indexing 0123456789ab failed (codegraph exit 3)."
+
+
 def test_a_missing_backbone_starts_one_in_the_background(tmp_path: Path) -> None:
     """The first commit pays nothing; its gates select without the graph."""
     tools = _Tools()
@@ -383,6 +432,20 @@ def test_a_worktree_gets_a_cli_index_seeded_from_the_backbone(tmp_path: Path) ->
     assert seeded == published
 
 
+def test_a_removed_link_is_relinked_to_the_index_it_had(tmp_path: Path) -> None:
+    _refresh(tmp_path, _Tools())
+    root = tmp_path / "root"
+    root.mkdir()
+    caches = tmp_path / "caches"
+    assert codegraph_sync.link_cli_index(root, caches=caches) == ""
+    (root / ".codegraph").unlink()
+
+    assert codegraph_sync.link_cli_index(root, caches=caches) == ""
+
+    overlay = backbone.overlay_database(caches, root=root)
+    assert (root / ".codegraph").resolve() == overlay.parent / "cli"
+
+
 def test_an_existing_cli_index_is_left_alone(tmp_path: Path) -> None:
     _refresh(tmp_path, _Tools())
     own = tmp_path / "root" / ".codegraph"
@@ -401,7 +464,10 @@ def test_a_cli_index_without_a_backbone_is_refused(tmp_path: Path) -> None:
 
     problem = codegraph_sync.link_cli_index(root, caches=tmp_path / "caches")
 
-    assert "No CodeGraph backbone" in problem
+    assert problem == (
+        "No CodeGraph backbone to seed from; run --refresh, or commit once "
+        "with PRECOMMIT_CODEGRAPH_PYTEST set."
+    )
     assert not (root / ".codegraph").exists()
     overlay = backbone.overlay_database(tmp_path / "caches", root=root)
     assert not (overlay.parent / "cli").exists()
@@ -575,6 +641,20 @@ def test_the_help_describes_both_modes(
     assert "--refresh republishes the backbone" in text
     assert "--cli links this worktree" in text
     assert "exec uv" not in text
+
+
+def test_the_help_has_no_description_when_docstrings_are_stripped(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # As ``python -OO`` runs it.
+    monkeypatch.setattr(codegraph_sync, "__doc__", None)
+    monkeypatch.setattr(sys, "argv", ["codegraph_sync", "--help"])
+
+    with pytest.raises(SystemExit):
+        codegraph_sync.main()
+
+    assert capsys.readouterr().out.split("\n\n")[1].startswith("options:")
 
 
 def test_the_caches_must_be_named(monkeypatch: pytest.MonkeyPatch) -> None:

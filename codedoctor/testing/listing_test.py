@@ -15,11 +15,9 @@ import subprocess
 import sys
 import textwrap
 
-from treekle import json_loads
-
 import pytest
 
-from codedoctor.selected_nodeids import selected_nodeids_plugin
+from codedoctor.testing import listing
 
 
 if TYPE_CHECKING:
@@ -73,7 +71,7 @@ def _collect(
             "-p",
             "no:cacheprovider",
             "-p",
-            "selected_nodeids_plugin",
+            "listing",
         ],
         capture_output=True,
         check=False,
@@ -196,7 +194,7 @@ def test_one_collection_writes_each_pr_pytest_tier(tmp_path: Path) -> None:
             "-p",
             "no:cacheprovider",
             "-p",
-            "selected_nodeids_plugin",
+            "listing",
             "-m",
             "not cluster and not cuda and not performance",
         ],
@@ -224,15 +222,10 @@ def test_one_collection_writes_each_pr_pytest_tier(tmp_path: Path) -> None:
     assert (destination / "pytest-integration-global.txt").read_text(
         encoding="utf-8",
     ) == "probe_test.py::test_integration\n"
-    assert json_loads(
-        (destination / "selected-counts.json").read_text(),
-        dict[str, object],
-    ) == {
-        "pytest-global": 1,
-        "pytest-slow-global": 1,
-        "pytest-ci-smoke-global": 1,
-        "pytest-integration-global": 1,
-    }
+    assert (destination / "selected-counts.json").read_text() == (
+        '{"pytest-global": 1, "pytest-slow-global": 1, '
+        '"pytest-ci-smoke-global": 1, "pytest-integration-global": 1}\n'
+    )
 
 
 @pytest.mark.cli_python_subprocess
@@ -258,7 +251,7 @@ def test_no_destination_writes_nothing(tmp_path: Path) -> None:
             "-p",
             "no:cacheprovider",
             "-p",
-            "selected_nodeids_plugin",
+            "listing",
         ],
         capture_output=True,
         check=False,
@@ -325,7 +318,7 @@ def test_each_tier_receives_exactly_its_tests(
     monkeypatch.delenv("PYTEST_COLLECT_SELECTED", raising=False)
     monkeypatch.setenv("PYTEST_COLLECT_SELECTED_DIR", str(out))
 
-    selected_nodeids_plugin.pytest_collection_finish(
+    listing.pytest_collection_finish(
         _Session(items),
     )
 
@@ -339,15 +332,10 @@ def test_each_tier_receives_exactly_its_tests(
         "t.py::integ",
         "t.py::slow_integ",
     ]
-    assert json_loads(
-        (out / "selected-counts.json").read_bytes().decode("utf-8"),
-        dict[str, int],
-    ) == {
-        "pytest-global": 1,
-        "pytest-slow-global": 2,
-        "pytest-ci-smoke-global": 2,
-        "pytest-integration-global": 2,
-    }
+    assert (out / "selected-counts.json").read_bytes().decode("utf-8") == (
+        '{"pytest-global": 1, "pytest-slow-global": 2, '
+        '"pytest-ci-smoke-global": 2, "pytest-integration-global": 2}\n'
+    )
 
 
 def test_one_file_receives_every_selected_node_id(
@@ -360,7 +348,7 @@ def test_one_file_receives_every_selected_node_id(
     # Non-ASCII so a locale-default encoding would write different bytes.
     nodeids = ["a.py::x[ü]", "b.py::y"]
 
-    selected_nodeids_plugin.pytest_collection_finish(
+    listing.pytest_collection_finish(
         _Session([_Item(nodeids[0], "slow"), _Item(nodeids[1])]),
     )
 
@@ -376,7 +364,7 @@ def test_no_variable_writes_nothing_in_process(
     monkeypatch.delenv("PYTEST_COLLECT_TIERS", raising=False)
     monkeypatch.chdir(tmp_path)
 
-    selected_nodeids_plugin.pytest_collection_finish(
+    listing.pytest_collection_finish(
         _Session([_Item("a::b")]),
     )
 
@@ -400,7 +388,7 @@ def test_the_tier_file_names_each_file_once_per_tier_it_holds_tests_for(
         _Item("c/three_test.py::gpu", "cuda"),
     ]
 
-    selected_nodeids_plugin.pytest_collection_finish(_Session(items))
+    listing.pytest_collection_finish(_Session(items))
 
     # A golden is no tier of its own: it runs in whichever tier holds it.
     assert destination.read_bytes().decode("utf-8").splitlines() == [
@@ -411,9 +399,9 @@ def test_the_tier_file_names_each_file_once_per_tier_it_holds_tests_for(
 
 
 def test_a_listing_keeps_only_its_files_and_their_directories(tmp_path: Path) -> None:
-    listing = tmp_path / "files.txt"
-    listing.write_text("pkg/kept_test.py\n", encoding="utf-8")
-    config = _Config(tmp_path / "root", test_files=listing)
+    files = tmp_path / "files.txt"
+    files.write_text("pkg/kept_test.py\n", encoding="utf-8")
+    config = _Config(tmp_path / "root", test_files=files)
     root = config.rootpath
     (root / "pkg").mkdir(parents=True)
     (root / "other").mkdir()
@@ -428,14 +416,17 @@ def test_a_listing_keeps_only_its_files_and_their_directories(tmp_path: Path) ->
 
 def test_the_listing_is_a_path_option() -> None:
     parser = _Parser()
-    selected_nodeids_plugin.pytest_addoption(parser)
+    listing.pytest_addoption(parser)
     assert parser.types == {"--test-files": Path}
+    assert parser.helps == {
+        "--test-files": "Collect only the test files this file lists, one per line.",
+    }
 
 
 def test_no_listing_ignores_nothing(tmp_path: Path) -> None:
     config = _Config(tmp_path, test_files=None)
     assert (
-        selected_nodeids_plugin.pytest_ignore_collect(
+        listing.pytest_ignore_collect(
             collection_path=tmp_path / "a_test.py",
             config=config,
         )
@@ -466,9 +457,9 @@ def test_a_real_collection_is_narrowed_to_the_listing(tmp_path: Path) -> None:
 def test_a_split_file_is_collected_wherever_a_listing_names_its_tests(
     tmp_path: Path,
 ) -> None:
-    listing = tmp_path / "files.txt"
-    listing.write_text("pkg/split_test.py::test_b\n", encoding="utf-8")
-    config = _Config(tmp_path / "root", test_files=listing)
+    files = tmp_path / "files.txt"
+    files.write_text("pkg/split_test.py::test_b\n", encoding="utf-8")
+    config = _Config(tmp_path / "root", test_files=files)
     root = config.rootpath
     (root / "pkg").mkdir(parents=True)
 
@@ -485,10 +476,10 @@ def test_a_split_listing_deselects_the_tests_it_gives_away(tmp_path: Path) -> No
     other.write_text("s_test.py::b\ns_test.py::gone\n", encoding="utf-8")
 
     kept: list[list[str]] = []
-    for listing in (owner, other):
-        config = _ItemConfig(tmp_path, test_files=listing)
+    for files in (owner, other):
+        config = _ItemConfig(tmp_path, test_files=files)
         narrowed = list(items)
-        selected_nodeids_plugin.pytest_collection_modifyitems(config, narrowed)
+        listing.pytest_collection_modifyitems(config, narrowed)
         kept.append([item.nodeid for item in narrowed])
         assert [item.nodeid for item in config.hook.deselected] == [
             item.nodeid for item in items if item not in narrowed
@@ -498,13 +489,58 @@ def test_a_split_listing_deselects_the_tests_it_gives_away(tmp_path: Path) -> No
     assert kept == [["s_test.py::a", "s_test.py::new"], ["s_test.py::b"]]
 
 
+def test_a_class_test_is_matched_by_its_file(tmp_path: Path) -> None:
+    """``s_test.py::Case::a`` lives in ``s_test.py``, not in ``s_test.py::Case``."""
+    files = tmp_path / "files.txt"
+    files.write_text("s_test.py::Case::a\n", encoding="utf-8")
+    config = _ItemConfig(tmp_path, test_files=files)
+    items = [_Item("s_test.py::Case::a"), _Item("s_test.py::Case::b")]
+
+    listing.pytest_collection_modifyitems(config, items)
+
+    assert [item.nodeid for item in items] == ["s_test.py::Case::a"]
+
+
+def test_a_test_named_without_parameters_keeps_every_parametrization(
+    tmp_path: Path,
+) -> None:
+    """The dependency graph names a test as defined, never as each case collects."""
+    files = tmp_path / "files.txt"
+    files.write_text(
+        "s_test.py::p\ns_test.py::q[1]\nt_test.py\n!t_test.py::r\n",
+        encoding="utf-8",
+    )
+    config = _ItemConfig(tmp_path, test_files=files)
+    items = [
+        _Item(nodeid)
+        for nodeid in (
+            "s_test.py::p[1]",
+            "s_test.py::p[2]",
+            "s_test.py::pp",
+            "s_test.py::q[1]",
+            "s_test.py::q[2]",
+            "t_test.py::r[1]",
+            "t_test.py::rest",
+        )
+    ]
+
+    listing.pytest_collection_modifyitems(config, items)
+
+    assert [item.nodeid for item in items] == [
+        "s_test.py::p[1]",
+        "s_test.py::p[2]",
+        "s_test.py::q[1]",
+        "t_test.py::rest",
+    ]
+
+
 def test_a_files_only_listing_deselects_nothing(tmp_path: Path) -> None:
-    listing = tmp_path / "files.txt"
-    listing.write_text("a_test.py\n", encoding="utf-8")
-    config = _ItemConfig(tmp_path, test_files=listing)
+    files = tmp_path / "files.txt"
+    files.write_text("a_test.py\n", encoding="utf-8")
+    config = _ItemConfig(tmp_path, test_files=files)
     items = [_Item("a_test.py::one"), _Item("a_test.py::two")]
 
-    selected_nodeids_plugin.pytest_collection_modifyitems(config, items)
+    listing.pytest_collection_modifyitems(config, items)
 
     assert len(items) == 2
     assert config.hook.deselected == []
@@ -517,12 +553,12 @@ def test_the_shards_of_a_split_file_run_each_of_its_tests_once(tmp_path: Path) -
         encoding="utf-8",
     )
     ran: list[set[str]] = []
-    for listing in (
+    for lines in (
         "split_test.py\n!split_test.py::test_b\n!split_test.py::test_c\n",
         "split_test.py::test_b\n",
         "split_test.py::test_c\nsplit_test.py::test_gone\n",
     ):
-        (tmp_path / "files.txt").write_text(listing, encoding="utf-8")
+        (tmp_path / "files.txt").write_text(lines, encoding="utf-8")
         result = _narrowed_pytest(tmp_path)
         assert result.returncode == 0, result.stdout[-400:] + result.stderr[-400:]
         ran.append(set(re.findall(r"split_test\.py::(test_\w+) PASSED", result.stdout)))
@@ -583,7 +619,7 @@ def _narrowed_pytest(cwd: Path) -> subprocess.CompletedProcess[str]:
             "-p",
             "no:cacheprovider",
             "-p",
-            "selected_nodeids_plugin",
+            "listing",
             "--test-files=files.txt",
         ],
         capture_output=True,
@@ -595,20 +631,22 @@ def _narrowed_pytest(cwd: Path) -> subprocess.CompletedProcess[str]:
 
 
 def _ignored(path: Path, *, config: _Config) -> bool | None:
-    return selected_nodeids_plugin.pytest_ignore_collect(
+    return listing.pytest_ignore_collect(
         collection_path=path,
         config=config,
     )
 
 
 class _Parser:
-    """Records the type each option registered with ``addoption`` parses to."""
+    """Records the type and help of each option registered with ``addoption``."""
 
     def __init__(self) -> None:
         self.types: dict[str, object] = {}
+        self.helps: dict[str, object] = {}
 
     def addoption(self, *names: str, **attrs: object) -> None:
         self.types.update(dict.fromkeys(names, attrs.get("type")))
+        self.helps.update(dict.fromkeys(names, attrs.get("help")))
 
 
 class _Config:

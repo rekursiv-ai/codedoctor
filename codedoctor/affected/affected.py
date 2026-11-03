@@ -753,7 +753,7 @@ def _harvest_seed(
         try:
             connections.attach(connection)
         except sqlite3.Error:
-            connection = None  # pragma: no mutate -- "" is falsy too.
+            connection = None
     rows = _reachable(connection, seed=seed, depth=depth, lines=hunks.get(seed, ()))
     if emit == "files":
         return {row[3] for row in rows if row[3].endswith((".py", ".pyi"))}
@@ -773,7 +773,7 @@ def _selectors(
     patterns: tuple[list[str], list[str], list[str]],
 ) -> set[str]:
     """Return the pytest selectors among ``rows``, dropping uncollectable ones."""
-    if not connection:
+    if connection is None:
         return set()
     functions, classes, files = patterns
     try:
@@ -881,7 +881,7 @@ def _reachable(
     lines: Sequence[tuple[int, int]] = (),
 ) -> list[tuple[str, str, str, str]]:
     """Return ``(id, kind, name, file_path)`` rows reachable from one seed file."""
-    if not connection:
+    if connection is None:
         return []
     try:
         _touched_table(connection, lines)

@@ -634,6 +634,8 @@ def copy_snapshot(
         "codedoctor.mutation.mutmut_param_ids",
         "-p",
         "codedoctor.mutation.mutmut_outcome",
+        "-p",
+        "codedoctor.mutation.mutmut_kill_guard",
         # py_pglite marks every test whose path says "benchmark" `performance`,
         # which the default ``-m`` deselects, leaving such modules untestable.
         "-p",
@@ -898,9 +900,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Write the selected functions to stderr.",
     )
-    # pragma: no mutate start -- any non-count fallback is equally off.
-    blocking = positive(os.environ.get("PRECOMMIT_MUTATION_BLOCKING", ""))
-    # pragma: no mutate end
+    blocking = positive(os.environ.get("PRECOMMIT_MUTATION_BLOCKING"))
     parser.add_argument(
         "--blocking",
         action="store_true",

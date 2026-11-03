@@ -156,12 +156,12 @@ def groups(tests: Sequence[str], *, count: int) -> list[list[str]]:
       groups: Nonempty lists of test files, each in path order.
 
     """
-    loads = [0] * capped_workers(count, units=len(tests))
-    members: list[list[str]] = [[] for _ in loads]
-    for test in sorted(tests, key=lambda t: (-Path(t).stat().st_size, t)):
-        lightest = loads.index(min(loads))
-        loads[lightest] += Path(test).stat().st_size
-        members[lightest].append(test)
+    sizes = {test: Path(test).stat().st_size for test in tests}
+    members: list[list[str]] = [
+        [] for _ in range(capped_workers(count, units=len(tests)))
+    ]
+    for test in sorted(tests, key=lambda t: (-sizes[t], t)):
+        min(members, key=lambda group: sum(sizes[t] for t in group)).append(test)
     # Path order: pytest 9 splits a package whose files are interleaved with
     # another directory's, and the second copy loses the package's conftest
     # fixtures (`fixture 'prepared_manifest' not found`).
@@ -198,7 +198,7 @@ def run_groups(
         if run.returncode:
             sys.stdout.write(run.stdout)
     combined = coverage.Coverage(data_file=str(data))
-    combined.combine([str(data.parent)])
+    combined.combine()
     combined.save()
     return any(run.returncode for run in runs)
 

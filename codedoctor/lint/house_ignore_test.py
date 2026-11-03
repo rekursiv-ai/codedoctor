@@ -42,6 +42,22 @@ def test_header_lines_of_compound_and_simple_statements() -> None:
     assert list(house_ignore.header_lines(assign)) == [10, 11, 12]
 
 
+@pytest.mark.parametrize(
+    ("source", "header"),
+    [
+        # A decorator heading the body belongs to the body, not the header.
+        ("if x:\n    @d\n    def f():\n        pass\n", [1]),
+        ("if x:\n    def f():\n        pass\n", [1]),
+        ("if x:\n    y = 1\n", [1]),
+    ],
+)
+def test_a_header_ends_before_its_bodys_first_line(
+    source: str,
+    header: list[int],
+) -> None:
+    assert list(house_ignore.header_lines(ast.parse(source).body[0])) == header
+
+
 def test_a_finding_outside_every_statement_is_its_own_line() -> None:
     """A comment line belongs to no statement; only a marker on it covers it."""
     unit = _unit("x = 1\n# BAD\ny = 2\n")
@@ -92,6 +108,34 @@ def test_a_malformed_marker_names_the_unit_and_says_what_is_missing() -> None:
             message="house-ignore[...] needs a trailing `-- Reason.`",
         ),
     ]
+
+
+@pytest.mark.parametrize(
+    ("marker", "messages"),
+    [
+        ("# house-ignore[r] -- Why.", []),
+        ("# house-ignore[r]", ["house-ignore[...] needs a trailing `-- Reason.`"]),
+    ],
+)
+def test_a_marker_with_rules_is_judged_only_on_its_reason(
+    marker: str,
+    messages: list[str],
+) -> None:
+    unit = _unit(f"x = 1  {marker}\n")
+
+    assert [finding.message for finding in house_ignore.marker_findings(unit)] == (
+        messages
+    )
+
+
+def test_markers_skip_plain_comments_and_tell_trailing_from_own_line() -> None:
+    unit = _unit(
+        "# plain\n\ny = 2  # house-ignore[r] -- Why.\n# house-ignore[s] -- Why.\n",
+    )
+
+    assert [
+        (line, match.group(1), own) for line, match, own in house_ignore.markers(unit)
+    ] == [(3, "r", False), (4, "s", True)]
 
 
 def test_a_marker_lists_its_rules_by_comma() -> None:
