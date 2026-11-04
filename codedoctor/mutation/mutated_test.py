@@ -29,6 +29,7 @@ from mutmut.mutation.trampoline_templates import CLASS_NAME_SEPARATOR
 from mutmut.state import state
 from treekle import from_plain
 
+import numpy as np
 import pytest
 
 from codedoctor.mutation import mutated
@@ -1491,6 +1492,146 @@ def test_only_unobservable_mutants_are_dropped(
     expected: bool,
 ) -> None:
     assert _only_unobservable(before, after) is expected
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "expected"),
+    [
+        ("np.zeros(3, dtype=np.float64)", "np.zeros(3, dtype=None)", True),
+        ("np.zeros(3, dtype=np.float64)", "np.zeros(3)", True),
+        ("np.ones(3, dtype=numpy.float64)", "np.ones(3)", True),
+        ("np.empty(3, dtype=np.float64)", "np.empty(3)", True),
+        ("np.zeros(3, np.float64)", "np.zeros(3, None)", True),
+        ("np.zeros(3, dtype=np.float32)", "np.zeros(3)", False),
+        ("np.zeros(3, dtype=np.float64)", "np.zeros(4)", False),
+        ("other.zeros(3, dtype=np.float64)", "other.zeros(3)", False),
+        (
+            "np.full(3, np.nan, dtype=np.float32)",
+            "np.full(3, None, dtype=np.float32)",
+            True,
+        ),
+        ("np.full(3, numpy.nan, np.float64)", "np.full(3, None, np.float64)", True),
+        (
+            "np.full(3, np.nan, dtype=np.int64)",
+            "np.full(3, None, dtype=np.int64)",
+            False,
+        ),
+        ("np.full(3, np.nan)", "np.full(3, None)", False),
+        (
+            "np.full(3, np.nan, dtype=np.float32)",
+            "np.full(3, 0, dtype=np.float32)",
+            False,
+        ),
+        (
+            "other.full(3, np.nan, dtype=np.float32)",
+            "other.full(3, None, dtype=np.float32)",
+            False,
+        ),
+        ("np.full_like(x, np.nan)", "np.full_like(x, None)", False),
+        ("np.arange(3, dtype=np.int64)", "np.arange(3)", False),
+        ("x.astype(np.float64)", "x.astype(None)", True),
+        ("x.astype(np.float32)", "x.astype(None)", False),
+        ("x.astype(np.float64, copy=False)", "x.astype(None, copy=False)", True),
+        ("x.astype(np.float32, copy=False)", "x.astype(np.float32, copy=None)", False),
+        ("x.astype(np.float32, copy=False)", "x.astype(np.float32, copy=True)", False),
+        ("x.astype(np.float32, copy=False)", "x.astype(np.float32)", False),
+        ("x.astype(kind, copy=False)", "x.astype(kind, copy=None)", False),
+        ("other.convert(np.float64)", "other.convert(None)", False),
+        ("x.astype(dtype=np.float64)", "x.astype(dtype=None)", True),
+        ("np.zeros(dtype=np.float64)", "np.zeros(dtype=None)", True),
+        (
+            "np.full(3, np.nan, dtype=np.float16)",
+            "np.full(3, None, dtype=np.float16)",
+            True,
+        ),
+        (
+            "np.full(3, fill_value=np.nan, dtype=np.float32)",
+            "np.full(3, fill_value=None, dtype=np.float32)",
+            True,
+        ),
+        ("np.full(3, dtype=np.float32)", "np.full(3, dtype=np.float64)", False),
+        ("np.full(dtype=np.float32)", "np.full(dtype=np.float64)", False),
+        ("np.zeros(3, dtype=np.float64, **options)", "np.zeros(3, **options)", False),
+        ("np.zeros(*args, dtype=np.float64)", "np.zeros(*args)", False),
+    ],
+)
+def test_only_equivalent_numpy_defaults_are_dropped(
+    before: str,
+    after: str,
+    expected: bool,
+) -> None:
+    assert _only_unobservable(before, after) is expected
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
+def test_numpy_default_rewrites_preserve_values_dtype_and_aliasing(
+    dtype: type[np.float16 | np.float32 | np.float64],
+) -> None:
+    values = np.asarray([-np.inf, -0.0, 0.0, 0.1, np.inf, np.nan], dtype=dtype)
+    explicit = values.astype(np.float64)
+    default = values.astype(None)
+    np.testing.assert_array_equal(explicit, default, strict=True)
+    np.testing.assert_array_equal(explicit.view(np.uint64), default.view(np.uint64))
+    assert values.astype(dtype, copy=False) is values
+    assert values.astype(dtype, copy=True) is not values
+    explicit_nan = np.full(3, np.nan, dtype=dtype)
+    default_nan = np.full(3, None, dtype=dtype)
+    np.testing.assert_array_equal(explicit_nan, default_nan, strict=True)
+    np.testing.assert_array_equal(
+        explicit_nan.view(np.uint8),
+        default_nan.view(np.uint8),
+    )
+    np.testing.assert_array_equal(
+        np.zeros(3, dtype=np.float64),
+        np.zeros(3),
+        strict=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "canonical"),
+    [
+        ("x = cast(int, y)", "x = cast(None, y)"),
+        ('x = r.headers["Content-Length"]', 'x = r.headers["content-length"]'),
+        ('p.add(help="Rows")', "p.add(help=None)"),
+        ("f(ensure_ascii=False)", "f(ensure_ascii=None)"),
+        (
+            'x = (__doc__ or "").split("\\n", 2)[2]',
+            'x = (__doc__ or None).split("\\n", 2)[2]',
+        ),
+        (
+            'x = (__doc__ or "" or "").split("\\n", 2)[2]',
+            'x = (__doc__ or "" or None).split("\\n", 2)[2]',
+        ),
+        ("x.astype(dtype=np.float64)", "x.astype(dtype=None)"),
+        ("np.zeros(3, np.float64)", "np.zeros(3, None)"),
+        (
+            "np.full(3, fill_value=np.nan, dtype=np.float32)",
+            "np.full(3, fill_value=None, dtype=np.float32)",
+        ),
+    ],
+)
+def test_normalization_preserves_the_canonical_ast_shape(
+    source: str,
+    canonical: str,
+) -> None:
+    assert mutated._erase_unobservable(source) == ast.dump(ast.parse(canonical))
+
+
+@pytest.mark.parametrize(
+    ("source", "member"),
+    [
+        ("np.zeros", "zeros"),
+        ("numpy.float64", "float64"),
+        ("other.zeros", ""),
+        ("np", ""),
+    ],
+)
+def test_numpy_members_require_an_explicit_numpy_namespace(
+    source: str,
+    member: str,
+) -> None:
+    assert mutated._numpy_member(ast.parse(source, mode="eval").body) == member
 
 
 @pytest.mark.parametrize(

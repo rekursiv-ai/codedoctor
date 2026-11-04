@@ -1275,6 +1275,63 @@ def _erase_unobservable(code: str) -> str:
             node.slice = _lowered(node.slice)
         if not isinstance(node, ast.Call):
             continue
+        name = _numpy_member(node.func)
+        allocation = name in {"zeros", "ones", "empty"}
+        full = name == "full"
+        astype = isinstance(node.func, ast.Attribute) and node.func.attr == "astype"
+        if (
+            (allocation or full or astype)
+            and all(k.arg is not None for k in node.keywords)
+            and not any(isinstance(a, ast.Starred) for a in node.args)
+        ):
+            position = 2 if full else 0 if astype else 1
+            dtype_keyword = next((k for k in node.keywords if k.arg == "dtype"), None)
+            dtype = (
+                dtype_keyword.value
+                if dtype_keyword is not None
+                else node.args[position]
+                if len(node.args) > position
+                else None
+            )
+            default_dtype = (
+                dtype is None
+                or _numpy_member(dtype) == "float64"
+                or (isinstance(dtype, ast.Constant) and dtype.value is None)
+            )
+            if (allocation or astype) and default_dtype:
+                if dtype_keyword is not None:
+                    if astype:
+                        dtype_keyword.value = ast.Constant(value=None)
+                    else:
+                        node.keywords.remove(dtype_keyword)
+                elif len(node.args) > position:
+                    node.args[position] = ast.Constant(value=None)
+            if (
+                full
+                and dtype is not None
+                and _numpy_member(dtype)
+                in {
+                    "float16",
+                    "float32",
+                    "float64",
+                }
+            ):
+                fill_keyword = next(
+                    (k for k in node.keywords if k.arg == "fill_value"),
+                    None,
+                )
+                fill = (
+                    fill_keyword.value
+                    if fill_keyword is not None
+                    else node.args[1]
+                    if len(node.args) > 1
+                    else None
+                )
+                if fill is not None and _numpy_member(fill) == "nan":
+                    if fill_keyword is not None:
+                        fill_keyword.value = ast.Constant(value=None)
+                    else:
+                        node.args[1] = ast.Constant(value=None)
         if _callee(node) == "cast" and node.args:
             node.args[0] = ast.Constant(value=None)
         if (
@@ -1298,6 +1355,17 @@ def _erase_unobservable(code: str) -> str:
             ):
                 keyword.value = ast.Constant(value=None)
     return ast.dump(tree)
+
+
+def _numpy_member(node: ast.expr) -> str:
+    """Return the member of an explicit ``np`` or ``numpy`` attribute."""
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in {"np", "numpy"}
+    ):
+        return node.attr
+    return ""
 
 
 # A type checker demands a last ``case _`` for exhaustiveness. A last case that does
