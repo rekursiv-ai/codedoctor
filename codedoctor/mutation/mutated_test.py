@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import tomllib
 
@@ -1550,7 +1551,16 @@ def test_only_unobservable_mutants_are_dropped(
             False,
         ),
         ("np.full_like(x, np.nan)", "np.full_like(x, None)", False),
-        ("np.arange(3, dtype=np.int64)", "np.arange(3)", False),
+        ("np.arange(0.5, 3, dtype=np.int64)", "np.arange(0.5, 3)", False),
+        ("np.arange(3, dtype='float32')", "np.arange(3)", False),
+        ("np.arange(3, dtype=kind)", "np.arange(3)", False),
+        ("np.float32(np.nan)", "np.float32(None)", True),
+        ("np.float64(np.nan)", "np.float64(None)", True),
+        ("np.float16(np.nan)", "np.float16(None)", True),
+        ("np.float32()", "np.float32(None)", False),
+        ("np.int64(np.nan)", "np.int64(None)", False),
+        ("other.float32(np.nan)", "other.float32(None)", False),
+        ("np.float32(np.nan, **options)", "np.float32(None, **options)", False),
         ("x.astype(np.float64)", "x.astype(None)", True),
         ("x.astype(np.float32)", "x.astype(None)", False),
         ("x.astype(np.float64, copy=False)", "x.astype(None, copy=False)", True),
@@ -1585,6 +1595,172 @@ def test_only_equivalent_numpy_defaults_are_dropped(
     assert _only_unobservable(before, after) is expected
 
 
+@pytest.mark.parametrize(
+    ("bounds", "setup", "expected"),
+    [
+        ("3", "", True),
+        ("-3, 7, 2", "", True),
+        ("len(rows)", "", True),
+        ("size", "    size = len(rows)\n", True),
+        ("window.start, len(rows)", "    window = self.window()\n", True),
+        ("window.stop, len(rows)", "    window = self.window()\n", False),
+        ("unknown, len(rows)", "", False),
+        ("0.5, len(rows)", "", False),
+        ("len(rows)", "    len = custom_length\n", False),
+        ("window.start, len(rows)", "    window = self.unknown()\n", False),
+        (
+            "window.start, len(rows)",
+            "    window = self.window()\n    window = other\n",
+            False,
+        ),
+        ("3, **options", "", False),
+        ("3, like=other", "", False),
+        ("3, step=0.5", "", False),
+        ("0, 3, 1, 2", "", False),
+        ("3 + unknown", "", False),
+        ("unknown + 3", "", False),
+    ],
+)
+def test_integer_arange_defaults_require_proven_integer_bounds(
+    bounds: str,
+    setup: str,
+    expected: bool,
+) -> None:
+    context = """class Window:
+    start: int
+    stop: float
+
+class Builder:
+    def window(self) -> Window: ...
+"""
+    before = (
+        f"def f(self, rows):\n{setup}    return np.arange({bounds}, dtype=np.int64)\n"
+    )
+    context += "\n" + textwrap.indent(before, "    ")
+    after = before.replace(", dtype=np.int64", "")
+    equivalent = expected and np.dtype(np.intp) == np.dtype(np.int64)
+    assert _only_unobservable(before, after, context=context) is equivalent
+    assert _only_unobservable(after, before, context=context) is equivalent
+
+
+@pytest.mark.parametrize(
+    ("source", "expressions"),
+    [
+        ("def f(n: int):\n    return n\n", ("n",)),
+        ("def f(n: float):\n    return n\n", ()),
+        (
+            "def f(n: int):\n    def inner(n: int):\n        return n\n    return n\n",
+            (),
+        ),
+        ("def f():\n    import n\n    return n\n", ()),
+        ("def f():\n    import n\n    n = 3\n    return n\n", ()),
+        ("def f():\n    n = 3\n    import n\n    return n\n", ()),
+        ("def f():\n    import n\n    n = 3\n    n = 4\n    return n\n", ()),
+        ("def f():\n    import n\n    import n\n    n = 3\n    return n\n", ()),
+        ("def f(n: int):\n    n = 0.5\n    return n\n", ()),
+        ("def f(n: int):\n    n = 3\n    return n\n", ()),
+        ("def f(rows):\n    n = len(rows)\n    m = n + 1\n    return m\n", ("n", "m")),
+        ("def f(rows):\n    rows.size = 0\n    n = int(3.5)\n    return n\n", ("n",)),
+        (
+            "def f(rows):\n    n = 0.5\n    n = 2\n    m = len(rows)\n    return m\n",
+            ("m",),
+        ),
+    ],
+)
+def test_integer_facts_preserve_single_assignment_and_load_context(
+    source: str,
+    expressions: tuple[str, ...],
+) -> None:
+    known = mutated._integer_expressions(ast.parse(source), context="")
+    assert known == {
+        "len",
+        "int",
+        *(ast.dump(ast.parse(value, mode="eval").body) for value in expressions),
+    }
+
+
+@pytest.mark.parametrize(
+    ("source", "builtin"),
+    [
+        ("import len\n", "len"),
+        ("import len.other\n", "len"),
+        ("import other as len\n", "len"),
+        ("from other import len\n", "len"),
+        ("from other import custom as int\n", "int"),
+        ("import len\nimport len\n", "len"),
+    ],
+)
+def test_imports_shadow_integer_builtins(source: str, builtin: str) -> None:
+    tree = ast.parse(source)
+    assert builtin not in mutated._integer_expressions(tree, context="")
+
+
+def test_unobservable_comparison_defaults_to_no_module_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    erase = Mock(wraps=mutated._erase_unobservable)
+    monkeypatch.setattr(mutated, "_erase_unobservable", erase)
+
+    assert not _only_unobservable("return 1", "return 2")
+    assert [call.kwargs for call in erase.call_args_list] == [
+        {"context": ""},
+        {"context": ""},
+        {"context": ""},
+        {"context": ""},
+    ]
+
+
+@pytest.mark.parametrize(
+    "statement",
+    ["pass", "return 1", "value = 1", "1", "None", "call()", "value.attr"],
+)
+def test_function_matching_preserves_executable_statements(statement: str) -> None:
+    function = ast.parse(f'def f():\n    """Contract."""\n    {statement}\n').body[0]
+    assert isinstance(function, ast.FunctionDef)
+    assert mutated._function_statements(function) == (
+        ast.dump(ast.parse(statement).body[0]),
+    )
+
+
+@pytest.mark.parametrize("docstring", ["", '    """Contract."""\n'])
+def test_record_integer_facts_match_only_the_owning_class(docstring: str) -> None:
+    source = (
+        f"def f(self, rows):\n{docstring}"
+        "    window = self.window()\n"
+        "    return np.arange(window.start, len(rows), dtype=np.int64)\n"
+    )
+    context = (
+        "class Window:\n    start: int\n    stop: float\n\n"
+        "class Unrelated:\n    def window(self) -> Unknown: ...\n\n"
+        "class Builder:\n    def window(self) -> Window: ...\n"
+        + textwrap.indent(source, "    ")
+    )
+    known = mutated._integer_expressions(ast.parse(source), context=context)
+    assert known == {
+        "len",
+        "int",
+        ast.dump(ast.parse("window.start", mode="eval").body),
+    }
+    after = source.replace("dtype=np.int64", "dtype=None")
+    assert _only_unobservable(source, after, context=context)
+    cast_source = source.replace(
+        "return np.arange",
+        "return cast(object, np.arange",
+    ).replace(
+        "dtype=np.int64)",
+        "dtype=np.int64))",
+    )
+    context = context.replace(
+        textwrap.indent(source, "    "),
+        textwrap.indent(cast_source, "    "),
+    )
+    assert _only_unobservable(
+        cast_source,
+        cast_source.replace("cast(object,", "cast(None,"),
+        context=context,
+    )
+
+
 @pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
 def test_numpy_default_rewrites_preserve_values_dtype_and_aliasing(
     dtype: type[np.float16 | np.float32 | np.float64],
@@ -1598,6 +1774,10 @@ def test_numpy_default_rewrites_preserve_values_dtype_and_aliasing(
     assert values.astype(dtype, copy=True) is not values
     explicit_nan = np.full(3, np.nan, dtype=dtype)
     default_nan = np.full(3, None, dtype=dtype)
+    np.testing.assert_array_equal(
+        np.asarray([dtype(np.nan)]).view(np.uint8),
+        np.asarray([dtype(None)]).view(np.uint8),
+    )
     np.testing.assert_array_equal(explicit_nan, default_nan, strict=True)
     np.testing.assert_array_equal(
         explicit_nan.view(np.uint8),
@@ -1637,7 +1817,9 @@ def test_normalization_preserves_the_canonical_ast_shape(
     source: str,
     canonical: str,
 ) -> None:
-    assert mutated._erase_unobservable(source) == ast.dump(ast.parse(canonical))
+    assert mutated._erase_unobservable(source, context="") == ast.dump(
+        ast.parse(canonical),
+    )
 
 
 @pytest.mark.parametrize(
