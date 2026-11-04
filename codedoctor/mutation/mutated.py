@@ -54,7 +54,7 @@ from fractions import Fraction
 from functools import partial
 from multiprocessing.context import ForkContext
 from pathlib import Path
-from typing import Final, Protocol, cast
+from typing import TYPE_CHECKING, Final, Protocol, cast
 from unicodedata import normalize
 
 import argparse
@@ -104,6 +104,14 @@ from codedoctor.lib import pyproject_flags
 from codedoctor.lib.files import tempclaim, walk
 from codedoctor.lib.kernel_pins import kernel_pins
 from codedoctor.lib.worker_count import capped_workers, default_workers, worker_count
+
+
+if TYPE_CHECKING:
+    import numpy as np
+else:
+    from wrapt import lazy_import
+
+    np = lazy_import("numpy")
 
 
 _DESCRIPTION: Final = (__doc__ or "").strip()
@@ -1192,7 +1200,10 @@ def _collect(snapshot: Path, *, shard: Shard) -> ShardReport:
     diffs = {
         name: _diff(snapshot, name=name, source=shard.source)
         for name in outcomes["survived"]
-        if not _only_unobservable(*_functions(name, path=mutated))
+        if not _only_unobservable(
+            *_functions(name, path=mutated),
+            context=(snapshot / shard.source).read_text(encoding="utf-8"),
+        )
     }
     return ShardReport(
         source=shard.source,
@@ -1236,10 +1247,18 @@ def _functions(name: str, *, path: Path) -> tuple[str, str]:
     return original, mutant
 
 
-def _only_unobservable(original: str, mutant: str) -> bool:
-    """Return whether ``mutant`` differs only in casts, help, flags, or fallbacks."""
-    return original != mutant and _erase_unobservable(original) == _erase_unobservable(
+def _only_unobservable(original: str, mutant: str, *, context: str = "") -> bool:
+    """Return whether ``mutant`` differs only in proven unobservable expressions."""
+    if original == mutant:
+        return False
+    if _erase_unobservable(original, context="") == _erase_unobservable(
         mutant,
+        context="",
+    ):
+        return True
+    return _erase_unobservable(original, context=context) == _erase_unobservable(
+        mutant,
+        context=context,
     )
 
 
@@ -1266,9 +1285,10 @@ _CODEC_CALLS: Final = frozenset(
 
 
 # Header and codec names are lowercased: both are looked up whatever their case.
-def _erase_unobservable(code: str) -> str:
-    """Dump ``code`` with casts, ``help=`` values, flags, and raising fallbacks blanked."""
+def _erase_unobservable(code: str, *, context: str) -> str:
+    """Dump ``code`` with proven unobservable expressions canonicalized."""
     tree = ast.parse(textwrap.dedent(code))
+    integers = _integer_expressions(tree, context=context)
     _drop_fallthrough_defaults(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Subscript) and (fallback := _raising_fallback(node)):
@@ -1278,6 +1298,28 @@ def _erase_unobservable(code: str) -> str:
         if not isinstance(node, ast.Call):
             continue
         name = _numpy_member(node.func)
+        if (
+            name in {"float16", "float32", "float64"}
+            and len(node.args) == 1
+            and not node.keywords
+        ) and _numpy_member(node.args[0]) == "nan":
+            node.args[0] = ast.Constant(value=None)
+        if name == "arange" and all(k.arg == "dtype" for k in node.keywords):
+            for keyword in tuple(node.keywords):
+                default = (
+                    isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value is None
+                )
+                integer = (
+                    _numpy_member(keyword.value) == "int64"
+                    and 1 <= len(node.args) <= 3
+                    and all(
+                        _integer_expression(arg, known=integers) for arg in node.args
+                    )
+                    and np.dtype(np.intp) == np.dtype(np.int64)
+                )
+                if default or integer:
+                    node.keywords.remove(keyword)
         allocation = name in {"zeros", "ones", "empty"}
         full = name == "full"
         astype = isinstance(node.func, ast.Attribute) and node.func.attr == "astype"
@@ -1357,6 +1399,160 @@ def _erase_unobservable(code: str) -> str:
             ):
                 keyword.value = ast.Constant(value=None)
     return ast.dump(tree)
+
+
+def _integer_expressions(tree: ast.Module, *, context: str) -> set[str]:
+    """Find integer bounds without assuming the type of an arbitrary array input."""
+    writes: dict[str, int] = defaultdict(int)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            writes[node.id] += 1
+        elif isinstance(node, ast.arg):
+            writes[node.arg] += 1
+    imported = {
+        node.asname or node.name.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.alias)
+    }
+    module = ast.parse(context)
+    globals_bound = {
+        node.name
+        for node in module.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+    }
+    globals_bound.update(
+        node.id
+        for node in ast.walk(module)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    )
+    known = {
+        name
+        for name in ("len", "int")
+        if name not in writes and name not in globals_bound and name not in imported
+    }
+    records = {
+        node.name: {
+            field.target.id
+            for field in node.body
+            if isinstance(field, ast.AnnAssign)
+            and isinstance(field.target, ast.Name)
+            and isinstance(field.annotation, ast.Name)
+            and field.annotation.id == "int"
+        }
+        for node in module.body
+        if isinstance(node, ast.ClassDef)
+    }
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    ]
+    owners = [
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef)
+        and any(
+            isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef)
+            and _function_statements(method) == _function_statements(function)
+            for method in node.body
+            for function in functions
+        )
+    ]
+    methods = {
+        method.name: method.returns.id
+        for owner in owners
+        for method in owner.body
+        if len(owners) == 1
+        and isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef)
+        and isinstance(method.returns, ast.Name)
+        and method.returns.id in records
+    }
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.arg)
+            and writes[node.arg] == 1
+            and node.arg not in imported
+            and isinstance(node.annotation, ast.Name)
+            and node.annotation.id == "int"
+        ):
+            known.add(ast.dump(ast.parse(node.arg, mode="eval").body))
+    while True:
+        previous = known.copy()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if (
+                not isinstance(target, ast.Name)
+                or writes[target.id] != 1
+                or target.id in imported
+            ):
+                continue
+            if _integer_expression(node.value, known=known):
+                known.add(ast.dump(ast.parse(target.id, mode="eval").body))
+            value = node.value
+            if (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and isinstance(value.func.value, ast.Name)
+                and value.func.value.id == "self"
+                and value.func.attr in methods
+            ):
+                for field in records[methods[value.func.attr]]:
+                    known.add(
+                        ast.dump(ast.parse(f"{target.id}.{field}", mode="eval").body),
+                    )
+        if known == previous:
+            break
+    return known
+
+
+def _function_statements(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> tuple[str, ...]:
+    """Return a function body independent of its docstring and generated name."""
+    return tuple(
+        ast.dump(statement)
+        for statement in node.body
+        if not (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+        )
+    )
+
+
+def _integer_expression(node: ast.expr, *, known: set[str]) -> bool:
+    """Prove a scalar integer through literals, builtins, or single-assignment facts."""
+    if ast.dump(node) in known:
+        return True
+    if isinstance(node, ast.Constant):
+        return type(node.value) is int
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        return node.func.id in known and node.func.id in {"len", "int"}
+    if isinstance(node, ast.UnaryOp) and isinstance(
+        node.op,
+        ast.UAdd | ast.USub | ast.Invert,
+    ):
+        return _integer_expression(node.operand, known=known)
+    if isinstance(node, ast.BinOp) and isinstance(
+        node.op,
+        ast.Add
+        | ast.Sub
+        | ast.Mult
+        | ast.FloorDiv
+        | ast.Mod
+        | ast.LShift
+        | ast.RShift
+        | ast.BitAnd
+        | ast.BitOr
+        | ast.BitXor,
+    ):
+        return _integer_expression(node.left, known=known) and _integer_expression(
+            node.right,
+            known=known,
+        )
+    return False
 
 
 def _numpy_member(node: ast.expr) -> str:
