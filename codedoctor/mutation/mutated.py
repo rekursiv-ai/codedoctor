@@ -120,6 +120,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=_DESCRIPTION,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        # The gate hands every path as one @argfile; argv overflows ARG_MAX.
+        fromfile_prefix_chars="@",  # pragma: no mutate -- holds "@" either way.
     )
     flags, root = _parse_args(parser)
     seed, workers = flags.seed, flags.workers or default_workers()

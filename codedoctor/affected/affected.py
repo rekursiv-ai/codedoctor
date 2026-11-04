@@ -71,6 +71,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(__doc__ or "").strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        # The gate hands every path as one @argfile; argv overflows ARG_MAX.
+        fromfile_prefix_chars="@",  # pragma: no mutate -- holds "@" either way.
     )
     flags = _parse_args(parser)
     depth = 0 if _skipped(flags.skip_token) else flags.depth

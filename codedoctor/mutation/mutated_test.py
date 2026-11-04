@@ -908,6 +908,28 @@ def test_emitting_filters_samples_without_running(
     assert "skipped" not in output.err
 
 
+def test_the_paths_come_from_the_gates_argfile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--all-files`` as argv overflowed macOS's ``ARG_MAX``; the gate hands an @argfile."""
+    root = _repo(tmp_path, body=_TWO_FUNCTIONS)
+    (root / "mutation.args").write_text("pkg/mod.py\n")
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["mutated", "--emit", "filters", "--", "@mutation.args"],
+    )
+
+    assert mutated.main() == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "pkg.mod.x_first__mutmut_*",
+        "pkg.mod.x_second__mutmut_*",
+    ]
+
+
 def test_the_root_is_the_directory_of_the_nearest_pyproject(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

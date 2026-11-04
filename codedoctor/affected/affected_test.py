@@ -1168,6 +1168,25 @@ def test_the_command_line_never_runs_a_subprocess(
     assert "lib_test.py::test_helper" in capfd.readouterr().out.split()
 
 
+def test_the_command_line_reads_its_files_from_the_gates_argfile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """``--all-files`` as argv overflowed macOS's ``ARG_MAX``; the gate hands an @argfile."""
+    database = _index(tmp_path)
+    _tree(tmp_path)
+    argfile = tmp_path / "walk.args"
+    argfile.write_text("lib.py\n")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["affected.py", "--database", str(database), "--", f"@{argfile}"],
+    )
+    assert affected.main() == 0
+    assert "lib_test.py::test_helper" in capfd.readouterr().out.split()
+
+
 def test_a_worker_exception_still_closes_every_handle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
