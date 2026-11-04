@@ -165,6 +165,24 @@ def test_main_floors_each_changed_source_by_its_sidecar(
     assert "sibling.py" not in out
 
 
+def test_main_reads_its_paths_from_the_gates_argfile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--all-files`` as argv overflowed macOS's ``ARG_MAX``; the gate hands an @argfile."""
+    _tree(tmp_path, {"pkg/m.py": _SOURCE, "coverage.args": "pkg/m.py\n"})
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["coverage_floor", "--floor", "pkg/=100", "--", "@coverage.args"],
+    )
+
+    assert coverage_floor.main() == 1
+    assert capsys.readouterr().out == "coverage-floor: pkg/m.py has no sidecar test\n"
+
+
 def _padded(count: int) -> str:
     """Return ``_SOURCE`` plus ``count`` always-run statements."""
     return _SOURCE + "".join(f"X{i} = {i}\n" for i in range(count))

@@ -812,6 +812,20 @@ def test_a_temp_dir_behind_a_symlink_maps_back_onto_the_checkout(
     assert capsys.readouterr().out == _FINDING + _SUMMARY
 
 
+def test_the_paths_come_from_the_gates_argfile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--all-files`` as argv overflowed macOS's ``ARG_MAX``; the gate hands an @argfile."""
+    _project(tmp_path, monkeypatch=monkeypatch)
+    (tmp_path / "fixer.args").write_text("m.py\n")
+    _replay(monkeypatch, flagged=True)
+
+    assert _main(monkeypatch, "--", "@fixer.args") == 1
+    assert capsys.readouterr().out == _FINDING + _SUMMARY
+
+
 def test_the_project_root_is_the_nearest_basedpyright_config(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text("[tool.basedpyright]\n")
     (tmp_path / "pkg" / "deep").mkdir(parents=True)
