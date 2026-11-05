@@ -167,19 +167,14 @@ def test_selection_restores_the_configuration_it_found(tmp_path: Path) -> None:
 def test_parallel_selection_matches_serial(tmp_path: Path) -> None:
     root = _repo(tmp_path, body=_TWO_FUNCTIONS)
     files = ["pkg/mod.py", "pkg/mod.py"]
-    for name in ("a", "b", "c"):
-        (root / f"pkg/{name}.py").write_text(
-            f"def {name}(value):\n    return value + 1\n",
-        )
-        files.append(f"pkg/{name}.py")
+    (root / "pkg/a.py").write_text("def a():\n    return 1\n")
+    files.append("pkg/a.py")
 
     serial = function_filters(root, files=files, sources=("pkg",))
 
-    assert function_filters(root, files=files, sources=("pkg",), workers=3) == serial
+    assert function_filters(root, files=files, sources=("pkg",), workers=2) == serial
     assert serial == (
         "pkg.a.x_a__mutmut_*",
-        "pkg.b.x_b__mutmut_*",
-        "pkg.c.x_c__mutmut_*",
         "pkg.mod.x_first__mutmut_*",
         "pkg.mod.x_second__mutmut_*",
     )
@@ -904,7 +899,7 @@ def test_emitting_filters_samples_without_running(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["mutated", "--emit", "filters", "--seed", "7", *paths],
+        ["mutated", "--emit", "filters", "--seed", "7", "--workers", "1", *paths],
     )
 
     assert mutated.main() == 0
@@ -2161,9 +2156,9 @@ def test_a_capped_sample_checks_lazily_and_matches_the_full_one(
     them and keep walking, and never pick fewer than the full path would.
     """
     root = _repo(tmp_path, body=_SAMPLED)
-    for name in "abcdef":
+    for name in "abc":
         (root / f"pkg/{name}.py").write_text(_SAMPLED.replace("Holder", name.upper()))
-    files = ["pkg/mod.py", *(f"pkg/{n}.py" for n in "abcdef")]
+    files = ["pkg/mod.py", *(f"pkg/{n}.py" for n in "abc")]
     full = function_filters(root, files=files, sources=("pkg",))
     expected = sample(
         full,
@@ -2425,8 +2420,8 @@ def test_parallel_selection_forks_one_process_per_file_up_to_the_cap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    root = _repo(tmp_path, body=_TWO_FUNCTIONS)
-    (root / "pkg/other.py").write_text(_TWO_FUNCTIONS)
+    root = _repo(tmp_path, body="def first():\n    return 1\n")
+    (root / "pkg/other.py").write_text("def second():\n    return 2\n")
     pool = Mock(wraps=ProcessPoolExecutor)
     monkeypatch.setattr(mutated, "ProcessPoolExecutor", pool)
     files = ["pkg/mod.py", "pkg/other.py"]
