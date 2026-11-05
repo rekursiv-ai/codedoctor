@@ -6,10 +6,10 @@ exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$
 Keep the shared CodeGraph backbone and this worktree's overlay current.
 
 Hook mode runs only when PRECOMMIT_CODEGRAPH_PYTEST or PRECOMMIT_CODEGRAPH_TYPECHECK
-holds a positive integer. It installs the CLI if missing, starts building the
-backbone in the background when none exists, and otherwise indexes this
-worktree's changes from the backbone into its overlay. It never fails a commit:
-a problem is printed, and `affected` independently refuses a stale overlay.
+holds a positive integer. It restores a missing CLI link to an existing cached
+index, installs the CLI if missing, starts building the backbone in the background
+when none exists, and indexes this worktree's changes into its overlay. It never
+fails a commit: a problem is printed, and `affected` refuses a stale overlay.
 
 --refresh republishes the backbone at origin/main; a timer runs it with --fetch.
 
@@ -132,6 +132,11 @@ def sync(
       problem: Why the gates must select without the graph; empty otherwise.
 
     """
+    cached_cli = backbone.overlay_database(caches, root=root).parent / "cli"
+    if (cached_cli / "codegraph.db").is_file() and (
+        problem := link_cli_index(root, caches=caches)
+    ):
+        return problem
     if which("codegraph") is None:
         run(["npm", "install", "-g", "@colbymchenry/codegraph"])
         if which("codegraph") is None:
@@ -234,13 +239,13 @@ def link_cli_index(root: Path, *, caches: Path) -> str:
     if index.exists() or index.is_symlink():
         return ""
     database = backbone.backbone_database(caches)
-    if not database.is_file():
+    home = backbone.overlay_database(caches, root=root).parent / "cli"
+    seeded = home / "codegraph.db"
+    if not seeded.is_file() and not database.is_file():
         return (
             "No CodeGraph backbone to seed from; run --refresh, or commit once "
             "with PRECOMMIT_CODEGRAPH_PYTEST set."
         )
-    home = backbone.overlay_database(caches, root=root).parent / "cli"
-    seeded = home / "codegraph.db"
     try:
         home.mkdir(parents=True, exist_ok=True)
         if not seeded.exists():

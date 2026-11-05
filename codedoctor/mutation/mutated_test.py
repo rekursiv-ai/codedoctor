@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from functools import partial
 from multiprocessing.context import ForkContext
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol, cast
@@ -16,6 +17,7 @@ import importlib
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -24,12 +26,14 @@ import time
 import tomllib
 
 from mutmut import configuration
+from mutmut.mutation.data import LineSpan, MutantLineSpans, SourceFileMutationData
 from mutmut.mutation.file_mutation import create_mutations
 from mutmut.mutation.pragma_handling import PragmaParseError
 from mutmut.mutation.trampoline_templates import CLASS_NAME_SEPARATOR
 from mutmut.state import state
 from treekle import from_plain
 
+import libcst as cst
 import numpy as np
 import pytest
 
@@ -2728,9 +2732,11 @@ def test_a_finding_fails_the_run_only_when_blocking_is_on(
     out = capsys.readouterr().out
     # Either way the finding is printed; advice says so instead of failing.
     assert "  pkg/mod.py\n" in out
-    assert ("mutation: advisory, so nothing above fails this run" in out) is (
-        status == 0
+    advisory = (
+        "mutation: advisory, so nothing above fails this run; "
+        "PRECOMMIT_MUTATION_BLOCKING=1 makes it fail.\n"
     )
+    assert out.endswith(advisory) is (status == 0)
 
 
 def _unusable_snapshot(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3140,7 +3146,10 @@ def test_a_shard_past_its_limit_is_reported_and_costs_no_other(
         timeout_sec=900.0,
     )
 
-    assert report.failure == "mutation: pkg/mod.py: mutmut ran past its 900 s limit"
+    assert report == ShardReport(
+        source="pkg/mod.py",
+        failure="mutation: pkg/mod.py: mutmut ran past its 900 s limit",
+    )
 
 
 def test_mutmut_retries_segfaulted_and_unrun_mutants_once(
@@ -3255,6 +3264,7 @@ def test_a_mutmut_crash_reports_the_tail_of_its_output(
         timeout_sec=None,
     )
 
+    assert report.source == "pkg/mod.py"
     assert report.failure == (
         "".join(f"out {n}\n" for n in range(21, 60))
         + "err\nmutation: pkg/mod.py: mutmut exited 3 before recording results; "
@@ -3388,6 +3398,716 @@ def test_parsing_never_sizes_the_pool(monkeypatch: pytest.MonkeyPatch) -> None:
     parser.parse_args(["--workers", "2"])
 
     assert sized == []
+
+
+def _recorded_results(snapshot: Path, *, indexed: bool) -> None:
+    """Write real mutmut metadata and generated functions into a test snapshot."""
+    original = snapshot / "pkg/mod.py"
+    original.parent.mkdir(parents=True, exist_ok=True)
+    original.write_text(
+        "class Window:\n    start: int\n\n"
+        "class Builder:\n    def window(self) -> Window: ...\n"
+        "    def g(self):\n        window = self.window()\n"
+        "        return np.arange(window.start, dtype=np.int64)\n",
+    )
+    path = snapshot / "mutants/pkg/mod.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "def x_f__mutmut_orig():\n    return cast(int, value)\n\n"
+        "def x_f__mutmut_1():\n    return cast(None, value)\n\n"
+        "def x_f__mutmut_2():\n    return cast(int, value) + 1\n\n"
+        "def x_g__mutmut_orig(self):\n    window = self.window()\n"
+        "    return np.arange(window.start, dtype=np.int64)\n\n"
+        "def x_g__mutmut_1(self):\n    window = self.window()\n"
+        "    return np.arange(window.start)\n\n"
+        "def x_other__mutmut_orig():\n    return 1\n\n"
+        "def x_other__mutmut_1():\n    return 2\n",
+    )
+    data = SourceFileMutationData(path=path)
+    data.exit_code_by_key = {
+        "pkg.mod.x_f__mutmut_1": 0,
+        "pkg.mod.x_f__mutmut_2": 0,
+        "pkg.mod.x_f__mutmut_3": 1,
+        "pkg.mod.x_f__mutmut_4": None,
+        "pkg.mod.x_f__mutmut_5": 33,
+        "pkg.mod.x_g__mutmut_1": 0,
+        "pkg.mod.x_other__mutmut_1": 0,
+    }
+    data.save()
+    if indexed:
+        functions = ast.parse(path.read_text()).body
+        MutantLineSpans(
+            path=path,
+            span_by_function_name={
+                node.name: LineSpan(node.lineno, node.end_lineno or node.lineno)
+                for node in functions
+                if isinstance(node, ast.FunctionDef)
+            },
+        ).save()
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_collected_results_filter_equivalents_and_preserve_other_outcomes(
+    tmp_path: Path,
+    *,
+    indexed: bool,
+) -> None:
+    _recorded_results(tmp_path, indexed=indexed)
+    shard = Shard(
+        source="pkg/mod.py",
+        filters=(
+            "pkg.mod.x_f__mutmut_*",
+            "pkg.mod.x_g__mutmut_*",
+            "pkg.mod.x_h__mutmut_*",
+        ),
+    )
+    report = mutated._collect(tmp_path, shard=shard)
+    assert report == ShardReport(
+        source="pkg/mod.py",
+        outcomes={
+            "survived": ("pkg.mod.x_f__mutmut_2",),
+            "no tests": ("pkg.mod.x_f__mutmut_5",),
+            "inconclusive": ("pkg.mod.x_f__mutmut_4 (not checked, exit None)",),
+            "unchecked": ("pkg.mod.x_h__mutmut_*",),
+        },
+        diffs={
+            "pkg.mod.x_f__mutmut_2": (
+                "--- pkg/mod.py\n+++ pkg/mod.py\n@@ -1,2 +1,2 @@\n"
+                " def f():\n-    return cast(int, value)\n"
+                "+    return cast(int, value) + 1"
+            ),
+        },
+        checked=5,
+    )
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_generated_function_sources_and_diffs_are_read_in_order(
+    tmp_path: Path,
+    *,
+    indexed: bool,
+) -> None:
+    _recorded_results(tmp_path, indexed=indexed)
+    name = "pkg.mod.x_f__mutmut_2"
+    original, mutant = mutated._functions(name, path=tmp_path / "mutants/pkg/mod.py")
+    assert original.strip() == "def f():\n    return cast(int, value)"
+    assert mutant.strip() == "def f():\n    return cast(int, value) + 1"
+    assert mutated._diff(tmp_path, name=name, source="pkg/mod.py") == (
+        "--- pkg/mod.py\n+++ pkg/mod.py\n@@ -1,2 +1,2 @@\n"
+        " def f():\n-    return cast(int, value)\n+    return cast(int, value) + 1"
+    )
+
+
+def test_template_copy_uses_the_listing_and_preserves_bytes_and_links(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _repo(tmp_path / "repo", body="value = 'café'\n")
+    (root / "pkg/link.py").symlink_to("mod.py")
+    (root / ".hidden").write_bytes(b"\x00\xff")
+    (root / "ignored").write_text("not listed")
+    listing = Mock(
+        return_value=subprocess.CompletedProcess(
+            [],
+            0,
+            "missing\0pkg/mod.py\0pkg/link.py\0.hidden\0",
+            "",
+        ),
+    )
+    monkeypatch.setattr(subprocess, "run", listing)
+    template = tmp_path / "template"
+    mutated.copy_template(root, template=template)
+    listing.assert_called_once_with(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        check=True,
+        text=True,
+    )
+    assert (template / "pkg/mod.py").read_bytes() == (root / "pkg/mod.py").read_bytes()
+    assert (template / "pkg/link.py").is_symlink()
+    assert (template / "pkg/link.py").readlink() == Path("mod.py")
+    assert (template / ".hidden").read_bytes() == b"\x00\xff"
+    assert not (template / "missing").exists()
+    assert not (template / "ignored").exists()
+
+
+def test_shard_runs_real_snapshot_and_collection_around_the_process_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _repo(
+        tmp_path / "repo",
+        body="def f():\n    return 1\n\ndef other():\n    return 2\n",
+    )
+    _runnable(root)
+    (root / "pkg/mod_test.py").write_text("def test_f():\n    pass\n")
+    snapshot = tmp_path / "snapshot"
+    template = _template(root, tmp_path)
+    shard = Shard(source="pkg/mod.py", filters=("pkg.mod.x_f__mutmut_*",))
+    run = Mock(side_effect=_finish_recorded_run)
+    monkeypatch.setattr(mutated, "_run_mutmut", run)
+    report = run_shard(
+        root,
+        shard=shard,
+        snapshot=snapshot,
+        template=template,
+        workers=3,
+        timeout_sec=7.0,
+    )
+    assert report.source == "pkg/mod.py"
+    assert report.failure == ""
+    assert report.checked == 4
+    assert report.outcomes["survived"] == ("pkg.mod.x_f__mutmut_2",)
+    assert report.diffs["pkg.mod.x_f__mutmut_2"].startswith("--- pkg/mod.py\n")
+    assert not snapshot.exists()
+    assert run.call_count == 2
+    first = run.call_args_list[0]
+    assert first.args == (
+        [
+            sys.executable,
+            "-m",
+            "mutmut",
+            "run",
+            "--max-children",
+            "3",
+            "pkg.mod.x_f__mutmut_*",
+            "pkg.mod.x_f__mutmut_1",
+        ],
+    )
+    assert first.kwargs == {
+        "cwd": snapshot,
+        "env": fork_safe_env(single_threaded_env(os.environ)),
+        "timeout_sec": 7.0,
+    }
+
+
+def _finish_recorded_run(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_sec: float | None,
+) -> subprocess.CompletedProcess[str]:
+    """Stand in for mutmut's process, writing its real on-disk output."""
+    del env, timeout_sec
+    settings = from_plain(
+        tomllib.loads((cwd / "pyproject.toml").read_text()),
+        dict[str, dict[str, dict[str, object]]],
+    )["tool"]["mutmut"]
+    assert settings["source_paths"] == ["pkg/mod.py"]
+    assert settings["pytest_add_cli_args_test_selection"] == ["pkg/mod_test.py"]
+    assert (cwd / "mutants/pkg/mod_test.py").is_file()
+    if "pkg.mod.x_f__mutmut_*" in argv:
+        assert (cwd / "pkg/mod.py").read_text() == (
+            "def f():\n    return 1\n\n"
+            "def other():  # pragma: no mutate block\n    return 2\n"
+        )
+    _recorded_results(cwd, indexed=True)
+    return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+def test_no_paired_tests_preserves_the_source_and_failure(tmp_path: Path) -> None:
+    root = _repo(tmp_path / "repo", body="def f():\n    return 1\n")
+    shard = Shard(source="pkg/mod.py", filters=("pkg.mod.x_f__mutmut_*",))
+    assert run_shard(
+        root,
+        shard=shard,
+        snapshot=tmp_path / "snapshot",
+        template=tmp_path,
+        workers=1,
+        timeout_sec=None,
+    ) == ShardReport(
+        source="pkg/mod.py",
+        failure="mutation: pkg/mod.py: no paired tests found",
+    )
+
+
+def test_shards_share_one_real_template_and_remove_their_snapshots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _repo(tmp_path / "repo", body="def f():\n    return 1\n")
+    listing = Mock(return_value=subprocess.CompletedProcess([], 0, "pkg/mod.py\0", ""))
+    monkeypatch.setattr(subprocess, "run", listing)
+    seen: list[tuple[Path, Path, Path, int, float | None]] = []
+    run = Mock(side_effect=partial(_inspect_shard_template, seen=seen))
+    monkeypatch.setattr(mutated, "_mutate", run)
+    shards = tuple(Shard(source=f"{n}.py", filters=(f"{n}.x_f*",)) for n in "ab")
+    reports = mutated._run_shards(
+        root,
+        shards=shards,
+        children=2,
+        parallel=1,
+        timeout_sec=3.0,
+    )
+    assert len(reports) == 2
+    listing.assert_called_once()
+    assert len(seen) == 2
+    assert {item[0] for item in seen} == {root}
+    assert len({item[1] for item in seen}) == 2
+    assert len({item[2] for item in seen}) == 1
+    assert {item[3] for item in seen} == {2}
+    assert {item[4] for item in seen} == {3.0}
+    assert all(not item[1].exists() and not item[2].exists() for item in seen)
+
+
+def _inspect_shard_template(
+    root: Path,
+    *,
+    shard: Shard,
+    snapshot: Path,
+    template: Path,
+    workers: int,
+    timeout_sec: float | None,
+    seen: list[tuple[Path, Path, Path, int, float | None]],
+) -> ShardReport:
+    """Observe the real template from inside each shard's lifetime."""
+    assert (template / "pkg/mod.py").read_bytes() == (root / "pkg/mod.py").read_bytes()
+    snapshot.mkdir()
+    (snapshot / "data").write_text("temporary")
+    seen.append((root, snapshot, template, workers, timeout_sec))
+    return ShardReport(source=shard.source)
+
+
+@pytest.mark.parametrize("seed", ["alpha", "beta", "gamma"])
+def test_uncapped_selection_passes_the_seed_and_restores_configuration(
+    tmp_path: Path,
+    seed: str,
+) -> None:
+    root = _repo(tmp_path, body=_MANY)
+    before = configuration.config()
+    full = function_filters(root, files=["pkg/mod.py"], sources=("pkg",))
+    assert mutated.select_functions(
+        root,
+        files=["pkg/mod.py"],
+        sources=("pkg",),
+        seed=seed,
+        rate=0.25,
+        most=None,
+    ) == (sample(full, seed=seed, size=3), len(full))
+    assert configuration.config() is before
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_capped_selection_restores_configuration_even_after_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fails: bool,
+) -> None:
+    root = _repo(tmp_path, body=_MANY)
+    before = configuration.config()
+    if fails:
+        monkeypatch.setattr(mutated, "_declared", Mock(side_effect=ValueError("parse")))
+        with pytest.raises(ValueError, match=r"^parse$"):
+            mutated.select_functions(
+                root,
+                files=["pkg/mod.py"],
+                sources=("pkg",),
+                seed="",
+                rate=1,
+                most=1,
+            )
+    else:
+        assert mutated.select_functions(
+            root,
+            files=["pkg/mod.py"],
+            sources=("pkg",),
+            seed="",
+            rate=1,
+            most=1,
+        )[0]
+    assert configuration.config() is before
+
+
+def test_shard_priority_is_count_then_source_not_insertion_or_filter_order() -> None:
+    assert plan_shards({"a.py": ("z",), "z.py": ("a", "b"), "b.py": ("a",)}) == (
+        Shard(source="z.py", filters=("a", "b")),
+        Shard(source="a.py", filters=("z",)),
+        Shard(source="b.py", filters=("a",)),
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "raises"),
+    [
+        ('(x or "").split(",")[1]', True),
+        ('(x or "a,b").split(",")[-2]', False),
+        ('(x or "a,b").split(",")[2]', True),
+        ('(x or "a,b").split(",", 0)[1]', True),
+        ('(x or "a,b,").split(",", 1)[1]', False),
+        ('(x or ",a,b").split(",", 1)[-2]', False),
+        ('(x or "a,b").split(",")[1]', False),
+    ],
+)
+def test_raising_fallback_respects_separator_maxsplit_and_index_bounds(
+    source: str,
+    *,
+    raises: bool,
+) -> None:
+    node = ast.parse(source, mode="eval").body
+    assert isinstance(node, ast.Subscript)
+    fallback = mutated._raising_fallback(node)
+    assert (fallback is not None) is raises
+    if raises:
+        assert isinstance(node.value, ast.Call)
+        assert isinstance(node.value.func, ast.Attribute)
+        assert fallback is node.value.func.value
+
+
+@pytest.mark.parametrize("value", ["headers[name]", "headers[1]"])
+def test_header_normalization_preserves_non_string_keys(value: str) -> None:
+    node = ast.parse(value, mode="eval").body
+    assert isinstance(node, ast.Subscript)
+    assert mutated._lowered(node.slice) is node.slice
+
+
+@pytest.mark.parametrize("frame", list("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"))
+def test_crash_tail_removes_indented_spinners_and_preserves_x(frame: str) -> None:
+    output = f"\r  {frame} spinning\r\n\t\nX details\nFAILED test_x\n"
+    assert mutated._tail(output, lines=10) == "X details\nFAILED test_x"
+
+
+def test_mixed_case_proxy_variables_cannot_bypass_the_dead_proxy() -> None:
+    assert fork_safe_env(
+        {
+            "HtTp_PrOxY": "http://live:3128",
+            "ftp_proxy": "http://live:3128",
+            "PATH": "/bin",
+        },
+        platform="darwin",
+    ) == fork_safe_env({"PATH": "/bin"}, platform="darwin")
+
+
+def test_process_runs_in_the_requested_directory_with_only_its_environment(
+    tmp_path: Path,
+) -> None:
+    child = tmp_path / "child"
+    child.mkdir()
+    argv = ["/bin/sh", "-c", 'pwd; echo "$MUTATION_TEST_VALUE"; echo err >&2; exit 3']
+    result = mutated._run_mutmut(
+        argv,
+        cwd=child,
+        env={"MUTATION_TEST_VALUE": "isolated"},
+        timeout_sec=None,
+    )
+    assert cast(list[str], result.args) == argv
+    assert result.returncode == 3
+    assert result.stdout == f"{child}\nisolated\n"
+    assert result.stderr == "err\n"
+
+
+@pytest.mark.parametrize("already_gone", [False, True])
+def test_timed_out_process_is_drained_even_if_its_group_already_exited(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    already_gone: bool,
+) -> None:
+    process = Mock(pid=123, returncode=-9)
+    expired = subprocess.TimeoutExpired(["job"], 0.1)
+    communicate = Mock(side_effect=[expired, ("tail", "err")])
+    process.communicate = communicate
+    process.__enter__ = Mock(return_value=process)
+    process.__exit__ = Mock(return_value=False)
+    popen = Mock(return_value=process)
+    kill = Mock(side_effect=ProcessLookupError if already_gone else None)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setattr(os, "killpg", kill)
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
+        mutated._run_mutmut(["job"], cwd=tmp_path, env={}, timeout_sec=0.1)
+    assert raised.value is expired
+    kill.assert_called_once_with(123, signal.SIGKILL)
+    assert [call.kwargs for call in communicate.call_args_list] == [
+        {"timeout": 0.1},
+        {},
+    ]
+    popen.assert_called_once_with(
+        ["job"],
+        cwd=tmp_path,
+        env={},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+
+def test_report_includes_all_failed_files_and_the_full_attention_message(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reports = [
+        ShardReport(source="b.py", failure="b"),
+        ShardReport(source="a.py", failure="a"),
+        ShardReport(
+            source="c.py",
+            outcomes={"no tests": ("no_tests",), "inconclusive": ("unknown",)},
+        ),
+    ]
+    assert mutated._print_reports(reports) == 1
+    assert capsys.readouterr().out == (
+        "mutation: these files recorded no results; each reason is above:\n"
+        "  a.py\n  b.py\n"
+        "mutation: no test exercised these mutants, so nothing was checked:\n"
+        "  no_tests\nmutation: these mutants have inconclusive results:\n  unknown\n"
+        "\nCheck test coverage of these functions first. Missing test "
+        "selection or sandbox imports can also prevent coverage.\n"
+    )
+
+
+def test_progress_separates_multiple_outcome_counts(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mutated._progress(
+        ShardReport(
+            source="mod.py",
+            checked=5,
+            outcomes={"no tests": ("a", "b"), "survived": ("c",)},
+        ),
+        done=2,
+        total=3,
+    )
+    assert capsys.readouterr().err == (
+        "[mutated] 2/3 mod.py: 5 checked; 2 no tests, 1 survived\n"
+    )
+
+
+def test_main_prefers_changed_functions_from_the_requested_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = _changed_repo(tmp_path)
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mutated",
+            "--emit",
+            "filters",
+            "--prefer-changed",
+            "HEAD",
+            "--max-functions-sampled",
+            "1",
+            "--workers",
+            "1",
+            "pkg/mod.py",
+        ],
+    )
+    assert mutated.main() == 0
+    assert capsys.readouterr().out == "pkg.mod.x_f7__mutmut_*\n"
+
+
+@pytest.mark.parametrize("command", ["diff", "ls-files"])
+def test_change_selection_checks_each_subprocess_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    run = Mock(side_effect=partial(_failing_git_command, command=command))
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(subprocess.CalledProcessError) as raised:
+        mutated.changed_functions(tmp_path, base="BASE", files=["mod.py"])
+    assert raised.value.returncode == 128
+    assert cast(list[str], raised.value.cmd)[1] == command
+
+
+def _failing_git_command(
+    argv: list[str],
+    *,
+    command: str,
+    check: bool = False,
+    **options: object,
+) -> subprocess.CompletedProcess[str]:
+    """Emulate subprocess.run's check behavior without requiring git."""
+    del options
+    if argv[1] == command and check:
+        raise subprocess.CalledProcessError(128, argv)
+    return subprocess.CompletedProcess(argv, 128 if argv[1] == command else 0, "", "")
+
+
+def test_changed_functions_parses_multiple_line_hunks_deletions_and_untracked_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "mod.py").write_text(
+        "def first():\n    return 1\n\ndef second():\n    return 2\n",
+    )
+    (tmp_path / "new.py").write_text("def inline(): return 3\n")
+    (tmp_path / "last.py").write_text("def last(): return 4\n")
+    (tmp_path / "XXXX").write_text("def unrelated(): return 5\n")
+    (tmp_path / "+++ /dev").mkdir(parents=True)
+    (tmp_path / "+++ /dev/null").write_text("def unrelated(): return 6\n")
+    run = Mock(
+        side_effect=[
+            subprocess.CompletedProcess(
+                [],
+                0,
+                "+++ b/mod.py\n@@ -1,2 +1,2 @@\n@@ -5 +5,0 @@\n"
+                "+++ /dev/null\n@@ -1 +1 @@\n+++ b/last.py\n@@ -1 +1 @@\n",
+                "",
+            ),
+            subprocess.CompletedProcess([], 0, "mod.py last.py", ""),
+        ],
+    )
+    monkeypatch.setattr(subprocess, "run", run)
+    assert mutated.changed_functions(
+        tmp_path,
+        base="BASE",
+        files=["mod.py", "new.py", "last.py", "notes.txt"],
+    ) == {
+        "mod.x_first__mutmut_*",
+        "mod.x_second__mutmut_*",
+        "new.x_inline__mutmut_*",
+        "last.x_last__mutmut_*",
+    }
+    assert run.call_args_list[1].args == (
+        ["git", "ls-files", "--", "mod.py", "new.py", "last.py"],
+    )
+
+
+def test_unsupported_bare_identifier_message_has_no_empty_class_prefix(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "mod.py"
+    path.write_text("def K():\n    return 1\n")
+    with pytest.raises(
+        ValueError,
+        match="mutmut does not support identifier",
+    ) as raised:
+        _functions_in(path)
+    assert str(raised.value) == f"{path}: mutmut does not support identifier 'K'"
+
+
+@pytest.mark.parametrize(
+    ("count", "rate", "most", "checks", "size"),
+    [(4, 0.5, 3, 4, 2), (6, 0.5, 3, 5, 3), (3, 1.0, 1, 1, 1)],
+)
+def test_capped_selection_checks_only_until_the_rate_can_fill_the_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    count: int,
+    rate: float,
+    most: int,
+    checks: int,
+    size: int,
+) -> None:
+    root = _repo(tmp_path, body="")
+    files = [f"pkg/m{n}.py" for n in range(count)]
+    for name in files:
+        (root / name).write_text(
+            "def f(x):\n    return x + 1\n\ndef stub():\n    ...\n",
+        )
+    full = function_filters(root, files=files, sources=("pkg",))
+    check = Mock(wraps=mutated.function_filters)
+    monkeypatch.setattr(mutated, "function_filters", check)
+    selected, _ = mutated.select_functions(
+        root,
+        files=files,
+        sources=("pkg",),
+        seed="",
+        rate=rate,
+        most=most,
+        preferred=frozenset(full),
+    )
+    assert selected == sample(full, seed="", size=size)
+    assert check.call_count == checks
+    assert all(call.kwargs["workers"] == 1 for call in check.call_args_list)
+    assert all(
+        len(cast(list[str], call.kwargs["files"])) == 1 for call in check.call_args_list
+    )
+
+
+def test_multiple_broken_sidecars_are_reported_on_separate_lines(
+    tmp_path: Path,
+) -> None:
+    root = _repo(tmp_path, body="def f():\n    return 1\n")
+    for name in ("pkg/mod_test.py", "pkg/test_mod.py"):
+        (root / name).write_text("def broken(:\n")
+    assert run_shard(
+        root,
+        shard=Shard(source="pkg/mod.py", filters=("pkg.mod.x_f__mutmut_*",)),
+        snapshot=tmp_path / "snapshot",
+        template=tmp_path,
+        workers=1,
+        timeout_sec=None,
+    ) == ShardReport(
+        source="pkg/mod.py",
+        failure="mutation: pkg/mod.py: pkg/mod_test.py:1: invalid syntax\n"
+        "mutation: pkg/mod.py: pkg/test_mod.py:1: invalid syntax",
+    )
+
+
+def test_parallel_shard_count_is_an_integer_below_the_file_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    names = [f"pkg/m{n}.py" for n in range(5)]
+    monkeypatch.setattr(
+        mutated,
+        "function_filters",
+        Mock(return_value=tuple(f"pkg.m{n}.x_f__mutmut_*" for n in range(5))),
+    )
+    run = Mock(return_value=[])
+    monkeypatch.setattr(mutated, "_run_shards", run)
+    monkeypatch.setattr(sys, "argv", ["mutated", "--workers", "3", *names])
+    assert mutated.main() == 0
+    assert run.call_args.kwargs["parallel"] == 3
+    assert isinstance(run.call_args.kwargs["parallel"], int)
+
+
+def test_parallel_file_mapping_keeps_large_batches_runnable() -> None:
+    paths = [str(n) for n in range(34)]
+    assert mutated._map_files(str, paths, workers=2) == paths
+
+
+def test_indexed_function_reads_do_not_parse_the_whole_generated_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _recorded_results(tmp_path, indexed=True)
+    path = tmp_path / "mutants/pkg/mod.py"
+    parse = Mock(wraps=cst.parse_module)
+    monkeypatch.setattr(cst, "parse_module", parse)
+    assert mutated._functions("pkg.mod.x_f__mutmut_2", path=path) == (
+        "def f():\n    return cast(int, value)\n",
+        "def f():\n    return cast(int, value) + 1\n",
+    )
+    assert parse.call_count == 2
+    assert all(
+        len(cast(str, call.args[0])) < path.stat().st_size
+        for call in parse.call_args_list
+    )
+
+
+def test_result_collection_reads_utf8_source_under_an_ascii_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _recorded_results(tmp_path, indexed=False)
+    for path in (tmp_path / "pkg/mod.py", tmp_path / "mutants/pkg/mod.py"):
+        path.write_bytes(b"# calf\xc3\xa9\n" + path.read_bytes())
+    monkeypatch.setattr(Path, "read_text", _ascii_default_read_text)
+    report = mutated._collect(
+        tmp_path,
+        shard=Shard(source="pkg/mod.py", filters=("pkg.mod.x_f__mutmut_*",)),
+    )
+    assert report.failure == ""
+    assert report.checked == 4
+    assert report.outcomes["survived"] == ("pkg.mod.x_f__mutmut_2",)
+
+
+def _ascii_default_read_text(
+    path: Path,
+    encoding: str | None = None,
+    errors: str | None = None,
+) -> str:
+    """Read real bytes with an ASCII locale unless the caller chooses a codec."""
+    return path.read_bytes().decode(encoding or "ascii", errors or "strict")
 
 
 if __name__ == "__main__":

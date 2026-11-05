@@ -414,6 +414,98 @@ def test_the_gate_gives_no_worktree_a_cli_index(tmp_path: Path) -> None:
     assert not (overlay.parent / "cli").exists()
 
 
+def test_the_gate_restores_a_removed_cli_link_without_copying(tmp_path: Path) -> None:
+    _refresh(tmp_path, _Tools())
+    root = tmp_path / "root"
+    root.mkdir()
+    caches = tmp_path / "caches"
+    assert codegraph_sync.link_cli_index(root, caches=caches) == ""
+    link = root / ".codegraph"
+    database = link.resolve() / "codegraph.db"
+    before = database.read_bytes(), database.stat().st_ino
+    link.unlink()
+
+    assert _sync(tmp_path, _Tools()) == ""
+
+    assert link.is_symlink()
+    assert link.resolve() == database.parent
+    assert (database.read_bytes(), database.stat().st_ino) == before
+
+
+def test_the_gate_restores_a_cli_link_without_a_backbone(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    caches = tmp_path / "caches"
+    database = backbone.overlay_database(caches, root=root).parent / "cli/codegraph.db"
+    _index(database)
+
+    assert "building one in the background" in _sync(tmp_path, _Tools())
+
+    assert (root / ".codegraph").is_symlink()
+    assert (root / ".codegraph").resolve() == database.parent
+
+
+def test_the_gate_reports_a_cli_link_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    caches = tmp_path / "caches"
+    database = backbone.overlay_database(caches, root=root).parent / "cli/codegraph.db"
+    _index(database)
+
+    def denied(self: Path, target: Path) -> None:
+        assert self == root / ".codegraph"
+        assert target == database.parent
+        raise PermissionError("link denied")
+
+    monkeypatch.setattr(Path, "symlink_to", denied)
+
+    assert "link denied" in _sync(tmp_path, _Tools())
+    assert not (root / ".codegraph").is_symlink()
+
+
+def test_the_gate_does_not_link_an_unseeded_cli_directory(tmp_path: Path) -> None:
+    _refresh(tmp_path, _Tools())
+    root = tmp_path / "root"
+    root.mkdir()
+    home = backbone.overlay_database(tmp_path / "caches", root=root).parent / "cli"
+    home.mkdir(parents=True)
+
+    assert _sync(tmp_path, _Tools()) == ""
+
+    assert not (root / ".codegraph").is_symlink()
+    assert list(home.iterdir()) == []
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+def test_the_gate_preserves_an_existing_cli_index(
+    tmp_path: Path,
+    symlink: bool,
+) -> None:
+    _refresh(tmp_path, _Tools())
+    root = tmp_path / "root"
+    root.mkdir()
+    caches = tmp_path / "caches"
+    assert codegraph_sync.link_cli_index(root, caches=caches) == ""
+    link = root / ".codegraph"
+    link.unlink()
+    own = tmp_path / "own"
+    if symlink:
+        link.symlink_to(own)
+    else:
+        link.mkdir()
+
+    assert _sync(tmp_path, _Tools()) == ""
+
+    assert link.is_symlink() is symlink
+    if symlink:
+        assert link.readlink() == own
+    else:
+        assert list(link.iterdir()) == []
+
+
 def test_a_worktree_gets_a_cli_index_seeded_from_the_backbone(tmp_path: Path) -> None:
     """Without ``.codegraph`` in the worktree, ``codegraph sync`` there refused to run."""
     _refresh(tmp_path, _Tools())
