@@ -164,20 +164,37 @@ def test_selection_restores_the_configuration_it_found(tmp_path: Path) -> None:
     assert configuration.config() is before
 
 
-def test_parallel_selection_matches_serial(tmp_path: Path) -> None:
+def test_parallel_selection_matches_serial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     root = _repo(tmp_path, body=_TWO_FUNCTIONS)
     files = ["pkg/mod.py", "pkg/mod.py"]
     (root / "pkg/a.py").write_text("def a():\n    return 1\n")
     files.append("pkg/a.py")
+    pool = Mock(wraps=_selection_thread_pool)
+    monkeypatch.setattr(mutated, "ProcessPoolExecutor", pool)
 
     serial = function_filters(root, files=files, sources=("pkg",))
-
+    pool.assert_not_called()
     assert function_filters(root, files=files, sources=("pkg",), workers=2) == serial
+    pool.assert_called_once()
     assert serial == (
         "pkg.a.x_a__mutmut_*",
         "pkg.mod.x_first__mutmut_*",
         "pkg.mod.x_second__mutmut_*",
     )
+
+
+def _selection_thread_pool(
+    *,
+    max_workers: int,
+    mp_context: ForkContext,
+) -> ThreadPoolExecutor:
+    """Run concurrent selection; the fork-count test owns real process creation."""
+    assert max_workers == 2
+    assert mp_context.get_start_method() == "fork"
+    return ThreadPoolExecutor(max_workers=max_workers)
 
 
 def test_selection_never_runs_a_subprocess(
