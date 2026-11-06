@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from subprocess import CompletedProcess
-from typing import Final, Literal, NotRequired, TypedDict
+from typing import Final, Literal, NotRequired, TypedDict, cast
 
 import argparse
 import json
@@ -52,6 +52,12 @@ def f(x: Thing, z: object) -> None:
     assert isinstance(x, Named)
     assert isinstance(z, Missing)
 """
+
+
+@pytest.fixture(autouse=True)
+def _single_checker_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RAYON_NUM_THREADS", "1")
+    monkeypatch.setenv("PYREFLY_THREADS", "1")
 
 
 def test_probe_prefixes_only_single_line_name_asserts() -> None:
@@ -887,7 +893,8 @@ def test_the_replayed_report_is_what_basedpyright_says(
 def _pyrefly_project(root: Path, monkeypatch: pytest.MonkeyPatch, source: str) -> None:
     """Make ``root`` the cwd: a pyrefly project holding ``m.py``."""
     (root / "pyproject.toml").write_text(
-        f"[tool.pyrefly]\npython-interpreter-path = {sys.executable!r}\n",
+        f"[tool.pyrefly]\npython-interpreter-path = {sys.executable!r}\n"
+        'skip-interpreter-query = true\npython-version = "3.12"\n',
     )
     (root / "m.py").write_text(source)
     monkeypatch.chdir(root)
@@ -904,6 +911,21 @@ def test_the_pyrefly_probe_reveals_the_asserted_name() -> None:
     )
 
 
+_PYREFLY_REDUNDANT = (
+    "def f(x: int, y: object) -> int:\n"
+    "    assert isinstance(x, int)\n"
+    "    assert isinstance(y, int)\n"
+    "    return x + y\n"
+)
+_PYREFLY_NARROWING = (
+    "def f(y: object) -> int:\n    assert isinstance(y, int)\n    return y\n"
+)
+_PYREFLY_BAD_RETURN = (
+    "def f(y: object) -> int:\n    assert isinstance(y, str)\n    return y\n"
+)
+
+
+@pytest.mark.usefixtures("shared_pyrefly")
 @pytest.mark.parametrize("fix", [False, True], ids=["report", "fix"])
 def test_pyrefly_flags_only_the_redundant_assert(
     tmp_path: Path,
@@ -912,12 +934,7 @@ def test_pyrefly_flags_only_the_redundant_assert(
     fix: bool,
 ) -> None:
     """Real pyrefly: ``x: int`` is redundant, ``y: object`` narrows."""
-    source = (
-        "def f(x: int, y: object) -> int:\n"
-        "    assert isinstance(x, int)\n"
-        "    assert isinstance(y, int)\n"
-        "    return x + y\n"
-    )
+    source = _PYREFLY_REDUNDANT
     _pyrefly_project(tmp_path, monkeypatch, source)
     _replay_clean_ty(monkeypatch)
     argv = ["check.py", "--threads", "1", *(["--fix"] * fix), "m.py"]
@@ -947,6 +964,88 @@ def f() -> int:
 """
 
 
+@pytest.fixture(scope="module")
+def pyrefly_reports(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
+    """Run the real checker once over every distinct integration input."""
+    root = tmp_path_factory.mktemp("pyrefly-reports")
+    sources = [
+        _PYREFLY_REDUNDANT,
+        _FLAGS_NARROWED,
+        _PYREFLY_NARROWING,
+        _PYREFLY_BAD_RETURN,
+    ]
+    with pytest.MonkeyPatch.context() as patch:
+        _pyrefly_project(root, patch, "")
+        patch.setenv("RAYON_NUM_THREADS", "1")
+        patch.setenv("PYREFLY_THREADS", "1")
+        inputs = {
+            f"case{index}.py": unnecessary_assert_isinstance.probe(
+                source,
+                checker="pyrefly",
+            )
+            for index, source in enumerate(sources)
+        }
+        for name, source in inputs.items():
+            (root / name).write_text(source)
+        done = subprocess.run(  # noqa: S603 -- No shell; the venv's own pyrefly.
+            [
+                Path(sys.executable).parent / "pyrefly",
+                "check",
+                "--threads=1",
+                "--output-format=json",
+                "--min-severity=info",
+                "--summary=none",
+                *inputs,
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    assert done.returncode in (0, 1), done.stderr
+    errors = json_loads(done.stdout, dict[str, list[dict[str, object]]])["errors"]
+    return {
+        source: json_dumps(
+            {
+                "errors": [
+                    {**error, "path": "m.py"}
+                    for error in errors
+                    if error["path"] == name
+                ],
+            },
+        )
+        for name, source in inputs.items()
+    }
+
+
+@pytest.fixture
+def shared_pyrefly(
+    pyrefly_reports: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reuse actual diagnostics for identical inputs, retaining the CLI's probe and mapping."""
+    run = subprocess.run
+
+    def replay(
+        argv: Sequence[Path | str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        text: bool,
+        check: bool,
+    ) -> CompletedProcess[str]:
+        if Path(argv[0]).name == "pyrefly":
+            report = pyrefly_reports[(cwd / "m.py").read_text()]
+            return CompletedProcess(argv, 1, stdout=report, stderr="")
+        return cast(
+            "CompletedProcess[str]",
+            run(argv, cwd=cwd, capture_output=capture_output, text=text, check=check),
+        )
+
+    monkeypatch.setattr(subprocess, "run", replay)
+
+
+@pytest.mark.usefixtures("shared_pyrefly")
 @pytest.mark.parametrize(
     ("typechecker", "kept"),
     [
@@ -981,6 +1080,7 @@ def test_typechecker_basedpyright_keeps_an_assert_it_still_narrows(
     assert capsys.readouterr().out.endswith(_SUMMARY)
 
 
+@pytest.mark.usefixtures("shared_pyrefly")
 def test_pyrefly_drops_the_probes_own_findings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -990,7 +1090,7 @@ def test_pyrefly_drops_the_probes_own_findings(
     _pyrefly_project(
         tmp_path,
         monkeypatch,
-        "def f(y: object) -> int:\n    assert isinstance(y, int)\n    return y\n",
+        _PYREFLY_NARROWING,
     )
     monkeypatch.setattr(sys, "argv", ["check.py", "--threads", "1", "m.py"])
 
@@ -998,6 +1098,7 @@ def test_pyrefly_drops_the_probes_own_findings(
     assert capsys.readouterr().out == _SUMMARY
 
 
+@pytest.mark.usefixtures("shared_pyrefly")
 def test_pyrefly_errors_fail_the_run_at_checkout_columns(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1007,7 +1108,7 @@ def test_pyrefly_errors_fail_the_run_at_checkout_columns(
     _pyrefly_project(
         tmp_path,
         monkeypatch,
-        "def f(y: object) -> int:\n    assert isinstance(y, str)\n    return y\n",
+        _PYREFLY_BAD_RETURN,
     )
     monkeypatch.setattr(sys, "argv", ["check.py", "--threads", "1", "m.py"])
 
