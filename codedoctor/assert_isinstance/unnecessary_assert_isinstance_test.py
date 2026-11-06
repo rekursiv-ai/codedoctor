@@ -512,7 +512,7 @@ def test_a_crashed_ty_fails_the_run_and_deletes_nothing(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _project(tmp_path, monkeypatch=monkeypatch)
-    _replay(monkeypatch, flagged=True)
+    _replay(monkeypatch, flagged=True, real_ty=True)
     ty = tmp_path / "bin" / "ty"
     ty.parent.mkdir()
     ty.write_text("#!/bin/sh\necho panic >&2; exit 2\n")
@@ -603,7 +603,7 @@ def test_an_assert_ty_needs_is_not_reported(
     """Basedpyright's verdict is replayed; real ty still needs the narrowing."""
     _project(tmp_path, monkeypatch=monkeypatch)
     (tmp_path / "m.py").write_text(_NEEDED)
-    _replay(monkeypatch, flagged=True)
+    _replay(monkeypatch, flagged=True, real_ty=True)
 
     assert _main(monkeypatch, "--fix", "m.py") == 0
 
@@ -886,7 +886,9 @@ def test_the_replayed_report_is_what_basedpyright_says(
 
 def _pyrefly_project(root: Path, monkeypatch: pytest.MonkeyPatch, source: str) -> None:
     """Make ``root`` the cwd: a pyrefly project holding ``m.py``."""
-    (root / "pyproject.toml").write_text("[tool.pyrefly]\n")
+    (root / "pyproject.toml").write_text(
+        f"[tool.pyrefly]\npython-interpreter-path = {sys.executable!r}\n",
+    )
     (root / "m.py").write_text(source)
     monkeypatch.chdir(root)
     monkeypatch.setenv("WORKERS_DEFAULT", "1")
@@ -917,6 +919,7 @@ def test_pyrefly_flags_only_the_redundant_assert(
         "    return x + y\n"
     )
     _pyrefly_project(tmp_path, monkeypatch, source)
+    _replay_clean_ty(monkeypatch)
     argv = ["check.py", "--threads", "1", *(["--fix"] * fix), "m.py"]
     monkeypatch.setattr(sys, "argv", argv)
 
@@ -965,6 +968,7 @@ def test_typechecker_basedpyright_keeps_an_assert_it_still_narrows(
 ) -> None:
     """Pyrefly calls it redundant; basedpyright reads ``Namespace`` fields as ``Any``."""
     _pyrefly_project(tmp_path, monkeypatch, _FLAGS_NARROWED)
+    _replay_clean_ty(monkeypatch)
     with (tmp_path / "pyproject.toml").open("a") as config:
         config.write('[tool.basedpyright]\ntypeCheckingMode = "all"\n')
     argv = ["check.py", "--threads", "1", *typechecker, "--fix", "m.py"]
@@ -1199,15 +1203,42 @@ _CLEAN_REPORTS: Final = {"pyrefly": '{"errors": []}'}
 """What a checker the test does not fake prints for ``_SOURCE``: nothing."""
 
 
-# Only ``test_the_replayed_report_is_what_basedpyright_says`` and
-# ``test_check_reports_what_a_plain_run_would_at_checkout_columns`` pay it.
+def _replay_clean_ty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replay unrelated ty agreement; ty narrowing has dedicated real-checker tests."""
+    run = subprocess.run
+
+    def replay(
+        argv: Sequence[Path | str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        text: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        assert text
+        if Path(argv[0]).name == "ty":
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return run(
+            argv,
+            cwd=cwd,
+            capture_output=capture_output,
+            text=True,
+            check=check,
+        )
+
+    monkeypatch.setattr(subprocess, "run", replay)
+
+
 def _replay(
     monkeypatch: pytest.MonkeyPatch,
     *,
     flagged: bool,
     extra: Sequence[dict[str, object]] = (),
+    real_ty: bool = False,
 ) -> None:
     """Answer the basedpyright run with ``_found``; node startup costs ~0.6s."""
+    if not real_ty:
+        _replay_clean_ty(monkeypatch)
     run = subprocess.run
 
     def replay(
@@ -1221,7 +1252,7 @@ def _replay(
         assert text
         # A failing check is a report, never an exception.
         assert check is False
-        # Pyrefly finds nothing in ``_SOURCE``; ty runs, as tests fake it.
+        # Pyrefly finds nothing in ``_SOURCE``.
         if argv[0].name in _CLEAN_REPORTS:
             return subprocess.CompletedProcess(
                 argv,

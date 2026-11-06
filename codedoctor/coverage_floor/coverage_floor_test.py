@@ -416,17 +416,26 @@ def test_main_without_a_floored_sidecar_runs_nothing(
 
 def _measured(tmp_path: Path, runs: dict[str, str], *, data: Path) -> None:
     """Write ``runs`` (module path to calling code) as sources, run each measured."""
-    measurement = coverage.Coverage(data_file=str(data))
-    for path, call in runs.items():
-        source = tmp_path / path
-        code = compile(source.read_text(), str(source.resolve()), "exec")
-        measurement.start()
-        try:
+    measurement = coverage.Coverage(
+        data_file=str(data),
+        include=[str((tmp_path / path).resolve()) for path in runs],
+    )
+    compiled = [
+        (
+            compile(source.read_text(), str(source.resolve()), "exec"),
+            compile(call, "<string>", "exec"),
+        )
+        for path, call in runs.items()
+        for source in [tmp_path / path]
+    ]
+    measurement.start()
+    try:
+        for code, call in compiled:
             namespace: dict[str, object] = {}
             exec(code, namespace)  # noqa: S102 -- the test's own fixture.
             exec(call, namespace)  # noqa: S102 -- the test's own fixture.
-        finally:
-            measurement.stop()
+    finally:
+        measurement.stop()
     measurement.save()
 
 
@@ -620,9 +629,8 @@ def test_every_group_runs_at_once(
         cov: Sequence[str],
         data: Path,
     ) -> subprocess.CompletedProcess[str]:
-        del tests, cov
+        del index, tests, cov, data
         started.wait()
-        _recorded(data.with_name(f"{data.name}.{index}"), tmp_path / f"t{index}.py")
         return subprocess.CompletedProcess([], 0, stdout="")
 
     monkeypatch.setattr(coverage_floor, "_pytest", waiting)
