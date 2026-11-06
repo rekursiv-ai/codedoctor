@@ -6,14 +6,16 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from functools import partial
 from multiprocessing.context import ForkContext
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Protocol, cast
+from typing import TYPE_CHECKING, Final, Protocol, TypedDict, cast
 from unittest.mock import Mock
 from urllib import request
 
 import argparse
 import ast
 import fnmatch
+import hashlib
 import importlib
+import json
 import os
 import re
 import shutil
@@ -27,11 +29,11 @@ import tomllib
 
 from mutmut import configuration
 from mutmut.mutation.data import LineSpan, MutantLineSpans, SourceFileMutationData
-from mutmut.mutation.file_mutation import create_mutations
+from mutmut.mutation.file_mutation import create_mutations, mutate_file_contents
 from mutmut.mutation.pragma_handling import PragmaParseError
 from mutmut.mutation.trampoline_templates import CLASS_NAME_SEPARATOR
 from mutmut.state import state
-from treekle import from_plain
+from treekle import from_plain, to_plain
 
 import libcst as cst
 import numpy as np
@@ -41,7 +43,7 @@ from codedoctor.mutation import mutated
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterator, Mapping
 
 from codedoctor.mutation.mutated import (
     Shard,
@@ -687,6 +689,46 @@ class TestMutantOutcomes:
         )
 
         assert outcomes["unchecked"] == ("m.x_g__mutmut_*",)
+
+    @pytest.mark.parametrize("suffix", ["1", "10", "100"])
+    def test_exact_ids_do_not_select_longer_numeric_suffixes(self, suffix: str) -> None:
+        name = f"m.x_f__mutmut_{suffix}"
+        outcomes = mutant_outcomes(
+            dict.fromkeys(
+                ("m.x_f__mutmut_1", "m.x_f__mutmut_10", "m.x_f__mutmut_100"),
+                0,
+            ),
+            filters=(name,),
+        )
+
+        assert outcomes == {
+            "survived": (name,),
+            "no tests": (),
+            "inconclusive": (),
+            "unchecked": (),
+        }
+
+    @pytest.mark.parametrize("code", [None, 1])
+    def test_a_longer_checked_id_cannot_hide_a_missing_exact_id(
+        self,
+        code: int | None,
+    ) -> None:
+        outcomes = mutant_outcomes(
+            {"m.x_f__mutmut_10": code},
+            filters=("m.x_f__mutmut_1",),
+        )
+
+        assert outcomes == {
+            "survived": (),
+            "no tests": (),
+            "inconclusive": (),
+            "unchecked": ("m.x_f__mutmut_1",),
+        }
+
+    def test_empty_explicit_ids_select_nothing(self) -> None:
+        outcomes = mutant_outcomes({"m.x_f__mutmut_1": 0}, filters=())
+
+        assert not any(outcomes.values())
 
 
 class _MutmutCli(Protocol):
@@ -1901,17 +1943,19 @@ def test_broad_run_uses_paired_tests_and_unmutated_support(
         "import pytest\n@pytest.fixture\ndef number():\n    return 2\n",
     )
     (root / "pkg/mod_test.py").write_text(
-        "from pkg.mod import foo\nfrom pathlib import Path\ndef test_foo(number):\n"
-        "    assert foo(number) == 5\n"
+        "from pathlib import Path\ndef test_links():\n"
         "    assert Path('pkg/link.py').is_symlink()\n"
         "    assert Path('package_link').is_symlink()\n",
+    )
+    (root / "pkg/mod_extra_test.py").write_text(
+        "from pkg.mod import foo\ndef test_foo(number):\n    assert foo(number) == 5\n",
     )
     (root / "unrelated_test.py").write_text("raise RuntimeError('must not collect')\n")
     (root / "pkg/mod.py").write_text(
         (root / "pkg/mod.py").read_text().replace("+ 1", "+ 2"),
     )
     monkeypatch.chdir(root)
-    monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py"])
+    monkeypatch.setattr(sys, "argv", ["mutated", "--blocking", "pkg/mod.py"])
 
     assert mutated.main() == 0
     assert not (root / "mutants").exists()
@@ -2070,8 +2114,16 @@ def test_paired_tests_are_the_sidecars_under_the_root(
 ) -> None:
     """Resolved against ``root``, not the cwd, and without a subprocess."""
     root = _repo(tmp_path / "repo", body=_TWO_FUNCTIONS)
-    (root / "pkg/mod_test.py").touch()
-    (root / "pkg/test_mod.py").touch()
+    for name in (
+        "mod_test.py",
+        "test_mod.py",
+        "mod_exec_test.py",
+        "test_mod_delivery.py",
+        "mod_detail.py",
+        "mod_detail_extra_test.py",
+        "modular_test.py",
+    ):
+        (root / "pkg" / name).touch()
     monkeypatch.chdir(tmp_path)
 
     def refuse(*args: object, **kwargs: object) -> None:
@@ -2080,8 +2132,10 @@ def test_paired_tests_are_the_sidecars_under_the_root(
     monkeypatch.setattr(subprocess, "run", refuse)
 
     assert mutated._paired_tests(root, sources=("pkg/mod.py",)) == (
+        "pkg/mod_exec_test.py",
         "pkg/mod_test.py",
         "pkg/test_mod.py",
+        "pkg/test_mod_delivery.py",
     )
     assert Path.cwd() == tmp_path
 
@@ -3493,6 +3547,57 @@ def test_collected_results_filter_equivalents_and_preserve_other_outcomes(
     )
 
 
+def test_exact_collection_counts_only_requested_ids(tmp_path: Path) -> None:
+    _recorded_results(tmp_path, indexed=True)
+    data = SourceFileMutationData(path=tmp_path / "mutants/pkg/mod.py")
+    data.load()
+    data.exit_code_by_key["pkg.mod.x_f__mutmut_10"] = 1
+    data.exit_code_by_key["pkg.mod.x_f__mutmut_100"] = None
+    data.save()
+
+    report = mutated._collect(
+        tmp_path,
+        shard=Shard(source="pkg/mod.py", filters=("pkg.mod.x_f__mutmut_1",)),
+    )
+
+    assert report.checked == 1
+    assert not any(report.outcomes.values())
+
+
+def test_exact_retry_does_not_execute_longer_numeric_suffixes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _recorded_results(tmp_path, indexed=True)
+    data = SourceFileMutationData(path=tmp_path / "mutants/pkg/mod.py")
+    data.load()
+    data.exit_code_by_key = {
+        "pkg.mod.x_f__mutmut_1": None,
+        "pkg.mod.x_f__mutmut_10": -11,
+        "pkg.mod.x_f__mutmut_100": None,
+    }
+    data.save()
+    run = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+    monkeypatch.setattr(mutated, "_run_mutmut", run)
+
+    mutated._retry_inconclusive(
+        tmp_path,
+        shard=Shard(source="pkg/mod.py", filters=("pkg.mod.x_f__mutmut_1",)),
+        timeout_sec=7.0,
+    )
+
+    assert run.call_args.args[0] == [
+        sys.executable,
+        "-m",
+        "mutmut",
+        "run",
+        "--max-children",
+        "1",
+        "pkg.mod.x_f__mutmut_1",
+    ]
+    assert run.call_count == 1
+
+
 @pytest.mark.parametrize("indexed", [False, True])
 def test_generated_function_sources_and_diffs_are_read_in_order(
     tmp_path: Path,
@@ -4121,6 +4226,489 @@ def _ascii_default_read_text(
 ) -> str:
     """Read real bytes with an ASCII locale unless the caller chooses a codec."""
     return path.read_bytes().decode(encoding or "ascii", errors or "strict")
+
+
+def test_remainder_cli_executes_only_requested_null_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root, spec = _remainder_fixture(tmp_path)
+    manifest = tmp_path / "remainder.json"
+    manifest.write_text(json.dumps(to_plain(spec)))
+    before = configuration.config()
+    reference = Path(spec["remainder"]["reference"])
+    retained = reference.read_bytes(), reference.with_suffix(".py.meta").read_bytes()
+    run = Mock(side_effect=_finish_exact_remainder)
+    monkeypatch.setattr(mutated, "_run_mutmut", run)
+    monkeypatch.setattr(mutated, "copy_template", _copy_remainder_template)
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["mutated", "--workers", "1", "--blocking", "--remainder", str(manifest)],
+    )
+
+    assert mutated.main() == 0
+
+    assert run.call_count == 1
+    assert run.call_args.args[0] == [
+        sys.executable,
+        "-m",
+        "mutmut",
+        "run",
+        "--max-children",
+        "1",
+        *spec["remainder"]["mutants"],
+    ]
+    assert "1 checked" in capsys.readouterr().err
+    assert configuration.config() is before
+    assert retained == (
+        reference.read_bytes(),
+        reference.with_suffix(".py.meta").read_bytes(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("invalid", "reason"),
+    [
+        ("duplicate", "remainder IDs must be unique exact generated keys"),
+        ("wildcard", "remainder IDs must be unique exact generated keys"),
+        ("absent", "remainder ID is not retained-null: {name}"),
+        ("ungenerated", "remainder generated IDs are absent"),
+        ("mixed-ungenerated", "remainder generated IDs are absent"),
+        ("checked", "remainder ID is not retained-null: {name}"),
+        ("survived", "remainder ID is not retained-null: {name}"),
+        ("source", "remainder input changed: pkg/mod.py"),
+        ("test", "remainder input changed: pkg/mod_test.py"),
+        ("conftest", "remainder input changed: conftest.py"),
+        ("config", "remainder input changed: pyproject.toml"),
+        ("definition", "remainder generated definition changed: {name}"),
+        ("original", "remainder generated definition changed: {name}"),
+        ("scope", "remainder selected-test scope changed"),
+        ("fingerprint", "remainder fingerprints omit required inputs"),
+        ("absolute-source", "remainder source must be a project-relative Python file"),
+        ("parent-source", "remainder source must be a project-relative Python file"),
+        (
+            "non-python-source",
+            "remainder source must be a project-relative Python file",
+        ),
+        ("empty-filters", "remainder generation filters must belong to its source"),
+        ("foreign-filter", "remainder generation filters must belong to its source"),
+        ("exact-filter", "remainder generation filters must belong to its source"),
+        ("zero-id", "remainder IDs must be unique exact generated keys"),
+        ("foreign-id", "remainder IDs must be unique exact generated keys"),
+        (
+            "absolute-fingerprint",
+            "remainder fingerprint paths must be project-relative",
+        ),
+        ("parent-fingerprint", "remainder fingerprint paths must be project-relative"),
+        ("excluded", "remainder generation filters are outside configured scope"),
+    ],
+)
+def test_remainder_rejects_invalid_identity_before_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    invalid: str,
+    reason: str,
+) -> None:
+    root, spec = _remainder_fixture(tmp_path)
+    remainder = spec["remainder"]
+    reference = Path(remainder["reference"])
+    name = remainder["mutants"][0]
+    if invalid == "duplicate":
+        remainder["mutants"].append(name)
+    elif invalid == "wildcard":
+        remainder["mutants"] = spec["filters"].copy()
+    elif invalid in {"absent", "ungenerated", "mixed-ungenerated"}:
+        remainder["mutants"] = ["pkg.mod.x_f__mutmut_999999"]
+        if invalid != "absent":
+            data = SourceFileMutationData(path=reference)
+            data.load()
+            data.exit_code_by_key[remainder["mutants"][0]] = None
+            data.save()
+        if invalid == "mixed-ungenerated":
+            remainder["mutants"].append(name)
+    elif invalid in {"checked", "survived"}:
+        data = SourceFileMutationData(path=reference)
+        data.load()
+        data.exit_code_by_key[name] = 0 if invalid == "survived" else 1
+        data.save()
+    elif invalid in {"source", "test", "conftest", "config"}:
+        changed = {
+            "source": "pkg/mod.py",
+            "test": "pkg/mod_test.py",
+            "conftest": "conftest.py",
+            "config": "pyproject.toml",
+        }[invalid]
+        with (root / changed).open("a") as handle:
+            handle.write("\n# changed input\n")
+    elif invalid in {"definition", "original"}:
+        function = (
+            name.rsplit(".", 1)[1] if invalid == "definition" else "x_f__mutmut_orig"
+        )
+        reference.write_text(
+            reference.read_text().replace(
+                f"def {function}(",
+                f"@changed\ndef {function}(",
+            ),
+        )
+    elif invalid == "scope":
+        remainder["tests"] = []
+    elif invalid == "fingerprint":
+        del remainder["fingerprints"]["conftest.py"]
+    elif invalid == "absolute-source":
+        spec["source"] = str(root / spec["source"])
+    elif invalid == "parent-source":
+        spec["source"] = "../repo/pkg/mod.py"
+    elif invalid == "non-python-source":
+        spec["source"] = "pkg/mod.txt"
+    elif invalid == "empty-filters":
+        spec["filters"] = []
+    elif invalid == "foreign-filter":
+        spec["filters"] = ["pkg.other.x_f__mutmut_*"]
+    elif invalid == "exact-filter":
+        spec["filters"] = [name]
+    elif invalid == "zero-id":
+        remainder["mutants"] = ["pkg.mod.x_f__mutmut_0"]
+    elif invalid == "foreign-id":
+        remainder["mutants"] = ["pkg.other.x_f__mutmut_1"]
+    elif invalid == "excluded":
+        _runnable(root, source_paths='["other"]')
+        remainder["fingerprints"]["pyproject.toml"] = hashlib.sha256(
+            (root / "pyproject.toml").read_bytes(),
+        ).hexdigest()
+    else:
+        path = (
+            str(root / "pkg/mod.py")
+            if invalid == "absolute-fingerprint"
+            else "../repo/pkg/mod.py"
+        )
+        remainder["fingerprints"][path] = remainder["fingerprints"]["pkg/mod.py"]
+    manifest = tmp_path / "remainder.json"
+    manifest.write_text(json.dumps(to_plain(spec)))
+    run = Mock()
+    monkeypatch.setattr(mutated, "_run_mutmut", run)
+    monkeypatch.setattr(mutated, "copy_template", _copy_remainder_template)
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["mutated", "--workers", "1", "--blocking", "--remainder", str(manifest)],
+    )
+
+    assert mutated.main() == 1
+
+    run.assert_not_called()
+    captured = capsys.readouterr()
+    error = captured.err
+    expected = reason.format(name=remainder["mutants"][0])
+    assert any(line.endswith(f": {expected}") for line in error.splitlines())
+    if invalid in {"ungenerated", "mixed-ungenerated"}:
+        assert (
+            f"[mutated] 1/1 pkg/mod.py: FAILED; {len(remainder['mutants'])} unchecked"
+            in error
+        )
+        assert all(f"  {name}\n" in captured.out for name in remainder["mutants"])
+
+
+@pytest.mark.parametrize("config_change", ["", "pythonpath", "pytest_args"])
+def test_remainder_compares_the_canonical_snapshot_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    config_change: str,
+) -> None:
+    root, spec = _remainder_fixture(tmp_path)
+    template = _template(root, tmp_path)
+    snapshot = tmp_path / "reference-snapshot"
+    copy_snapshot(
+        root,
+        snapshot=snapshot,
+        sources=(spec["source"],),
+        tests=tuple(spec["remainder"]["tests"]),
+        template=template,
+        filters=tuple(spec["filters"]),
+    )
+    spec["remainder"]["fingerprints"]["pyproject.toml"] = hashlib.sha256(
+        (snapshot / "pyproject.toml").read_bytes(),
+    ).hexdigest()
+    config = root / "pyproject.toml"
+    if config_change == "pythonpath":
+        config.write_text(
+            config.read_text().replace(
+                'pythonpath = ["."]',
+                'pythonpath = ["different"]',
+            ),
+        )
+    elif config_change == "pytest_args":
+        config.write_text(
+            config.read_text().replace('"addopts="', '"addopts=--strict-markers"'),
+        )
+    manifest = tmp_path / "remainder.json"
+    manifest.write_text(json.dumps(to_plain(spec)))
+    generate = Mock(wraps=mutate_file_contents)
+    monkeypatch.setattr(mutated, "mutate_file_contents", generate)
+    run = Mock(side_effect=_finish_exact_remainder)
+    monkeypatch.setattr(mutated, "_run_mutmut", run)
+    monkeypatch.setattr(mutated, "copy_template", _copy_remainder_template)
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["mutated", "--workers", "1", "--blocking", "--remainder", str(manifest)],
+    )
+
+    assert mutated.main() == (1 if config_change else 0)
+
+    assert run.call_count == (0 if config_change else 1)
+    assert generate.call_count == (0 if config_change else 1)
+    if config_change:
+        assert ": remainder input changed: pyproject.toml\n" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("directory", [".", "mutants"])
+def test_remainder_validates_both_execution_configurations(
+    tmp_path: Path,
+    directory: str,
+) -> None:
+    _, spec = _remainder_fixture(tmp_path)
+    snapshot = tmp_path / "bound-snapshot"
+    config = snapshot / directory / "pyproject.toml"
+    config.write_text(
+        config.read_text().replace('pythonpath = ["."]', 'pythonpath = ["different"]'),
+    )
+    manifest = tmp_path / "remainder.json"
+    manifest.write_text(json.dumps(to_plain(spec)))
+    shard = mutated._read_remainder(manifest)
+
+    with pytest.raises(
+        ValueError,
+        match=r"^remainder input changed: pyproject[.]toml$",
+    ):
+        mutated._validate_remainder_inputs(
+            snapshot,
+            shard=shard,
+            template=snapshot / "mutants",
+            tests=tuple(spec["remainder"]["tests"]),
+        )
+
+
+def test_remainder_requires_retained_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root, spec = _remainder_fixture(tmp_path)
+    manifest = tmp_path / "remainder.json"
+    manifest.write_text(
+        json.dumps({"source": spec["source"], "filters": spec["filters"]}),
+    )
+    run = Mock()
+    monkeypatch.setattr(mutated, "_run_mutmut", run)
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(sys, "argv", ["mutated", "--remainder", str(manifest)])
+
+    assert mutated.main() == 1
+
+    run.assert_not_called()
+    assert capsys.readouterr().err.endswith(
+        ": remainder manifest must include retained identity\n",
+    )
+
+
+def test_remainder_accepts_fingerprinted_test_nodeids(tmp_path: Path) -> None:
+    root, spec = _remainder_fixture(tmp_path)
+    tests = ("pkg/mod_test.py::test_f",)
+    spec["remainder"]["tests"] = list(tests)
+    snapshot = tmp_path / "nodeid-snapshot"
+    copy_snapshot(
+        root,
+        snapshot=snapshot,
+        sources=(spec["source"],),
+        tests=tests,
+        template=tmp_path / "bound-template",
+        filters=tuple(spec["filters"]),
+    )
+    spec["remainder"]["fingerprints"]["pyproject.toml"] = hashlib.sha256(
+        (snapshot / "pyproject.toml").read_bytes(),
+    ).hexdigest()
+    manifest = tmp_path / "remainder.json"
+    manifest.write_text(json.dumps(to_plain(spec)))
+    shard = mutated._read_remainder(manifest)
+
+    mutated._validate_remainder_inputs(
+        snapshot,
+        shard=shard,
+        template=snapshot / "mutants",
+        tests=tests,
+    )
+
+
+def test_empty_remainder_does_not_launch_a_whole_function(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, spec = _remainder_fixture(tmp_path)
+    spec["remainder"]["mutants"] = []
+    manifest = tmp_path / "remainder.json"
+    manifest.write_text(json.dumps(to_plain(spec)))
+    run = Mock()
+    monkeypatch.setattr(mutated, "_run_mutmut", run)
+    monkeypatch.setattr(mutated, "copy_template", _copy_remainder_template)
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["mutated", "--workers", "1", "--blocking", "--remainder", str(manifest)],
+    )
+
+    assert mutated.main() == 0
+
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "identity",
+    ["matching", "checked-metadata", "changed-definition"],
+)
+def test_remainder_reference_keeps_its_adjacent_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    identity: str,
+) -> None:
+    root, spec = _remainder_fixture(tmp_path)
+    original = Path(spec["remainder"]["reference"])
+    alias = tmp_path / "linked-reference.py"
+    alias.symlink_to(original.name)
+    shutil.copy2(original.with_suffix(".py.meta"), alias.with_suffix(".py.meta"))
+    data = SourceFileMutationData(path=original)
+    data.load()
+    data.exit_code_by_key = dict.fromkeys(data.exit_code_by_key, 1)
+    data.save()
+    if identity == "checked-metadata":
+        data = SourceFileMutationData(path=alias)
+        data.load()
+        data.exit_code_by_key = dict.fromkeys(data.exit_code_by_key, 1)
+        data.save()
+    elif identity == "changed-definition":
+        original.write_text(
+            original.read_text().replace(
+                "def x_f__mutmut_orig(",
+                "@changed\ndef x_f__mutmut_orig(",
+            ),
+        )
+    spec["remainder"]["reference"] = alias.name
+    manifest = tmp_path / "remainder.json"
+    manifest.write_text(json.dumps(to_plain(spec)))
+    run = Mock(side_effect=_finish_exact_remainder)
+    monkeypatch.setattr(mutated, "_run_mutmut", run)
+    monkeypatch.setattr(mutated, "copy_template", _copy_remainder_template)
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["mutated", "--workers", "1", "--blocking", "--remainder", str(manifest)],
+    )
+
+    assert mutated.main() == (0 if identity == "matching" else 1)
+
+    assert run.call_count == (1 if identity == "matching" else 0)
+
+
+class _RemainderInput(TypedDict):
+    mutants: list[str]
+    reference: str
+    tests: list[str]
+    fingerprints: dict[str, str]
+
+
+class _RemainderShardInput(TypedDict):
+    source: str
+    filters: list[str]
+    remainder: _RemainderInput
+
+
+def _remainder_fixture(tmp_path: Path) -> tuple[Path, _RemainderShardInput]:
+    root = _repo(tmp_path / "repo", body="def f(value):\n    return value + 1\n")
+    _runnable(root)
+    (root / "pkg/__init__.py").touch()
+    (root / "pkg/mod_test.py").write_text(
+        "from pkg.mod import f\ndef test_f():\n    assert f(2) == 3\n",
+    )
+    (root / "conftest.py").write_text("# retained test configuration\n")
+    generated = mutate_file_contents("pkg/mod.py", (root / "pkg/mod.py").read_text())
+    reference = tmp_path / "reference.py"
+    reference.write_text(generated.code)
+    names = [f"pkg.mod.{name}" for name in generated.mutant_names]
+    data = SourceFileMutationData(path=reference)
+    data.exit_code_by_key = dict.fromkeys(names)
+    data.exit_code_by_key[names[0]] = 1
+    data.save()
+    template = tmp_path / "bound-template"
+    shutil.copytree(root, template, symlinks=True)
+    snapshot = tmp_path / "bound-snapshot"
+    copy_snapshot(
+        root,
+        snapshot=snapshot,
+        sources=("pkg/mod.py",),
+        tests=("pkg/mod_test.py",),
+        template=template,
+        filters=("pkg.mod.x_f__mutmut_*",),
+    )
+    return root, {
+        "source": "pkg/mod.py",
+        "filters": ["pkg.mod.x_f__mutmut_*"],
+        "remainder": {
+            "mutants": [names[-1]],
+            "reference": str(reference),
+            "tests": ["pkg/mod_test.py"],
+            "fingerprints": {
+                name: hashlib.sha256(
+                    (
+                        (
+                            snapshot
+                            if name in {"pkg/mod.py", "pyproject.toml"}
+                            else snapshot / "mutants"
+                        )
+                        / name
+                    ).read_bytes(),
+                ).hexdigest()
+                for name in (
+                    "pkg/mod.py",
+                    "pkg/mod_test.py",
+                    "conftest.py",
+                    "pyproject.toml",
+                )
+            },
+        },
+    }
+
+
+def _copy_remainder_template(root: Path, *, template: Path) -> None:
+    shutil.copytree(root, template, symlinks=True)
+
+
+def _finish_exact_remainder(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout_sec: float | None,
+) -> subprocess.CompletedProcess[str]:
+    del env, timeout_sec
+    path = cwd / "mutants/pkg/mod.py"
+    data = SourceFileMutationData(path=path)
+    data.load()
+    assert data.exit_code_by_key
+    assert data.hash_by_function_name
+    assert all(code is None for code in data.exit_code_by_key.values())
+    for name in argv[6:]:
+        assert "*" not in name
+        data.exit_code_by_key[name] = 1
+    data.save()
+    return subprocess.CompletedProcess(argv, 0, "", "")
 
 
 if __name__ == "__main__":

@@ -1099,6 +1099,68 @@ def test_the_sidecar_probe_finds_a_sibling_tests_directory(tmp_path: Path) -> No
     ) == ["pkg/tests/thing_test.py"]
 
 
+@pytest.mark.parametrize("directory", ["pkg", "pkg/tests"])
+def test_source_sidecars_include_splits_but_not_longer_modules_tests(
+    tmp_path: Path,
+    directory: str,
+) -> None:
+    package = tmp_path / "pkg"
+    tests = tmp_path / directory
+    tests.mkdir(parents=True)
+    for name in ("thing.py", "thing_detail.py", "thing_deep.py", "thing_multi_part.py"):
+        (package / name).touch()
+    (package / "thing_directory.py").mkdir()
+    (tests / "thing_directory_extra_test.py").touch()
+    (tests / "thing_not_file_test.py").mkdir()
+    for name in (
+        "thing_test.py",
+        "thing_exec_test.py",
+        "thing_exec_test_more_test.py",
+        "test_thing_delivery.py",
+        "thing_detail_test.py",
+        "test_thing_detail.py",
+        "thing_deep_extra_test.py",
+        "thing_multi_part_extra_test.py",
+        "thingy_test.py",
+        "other_test.py",
+    ):
+        (tests / name).touch()
+
+    assert harvest(
+        tmp_path / "absent.db",
+        changed=["pkg/thing.py"],
+        depth=0,
+        emit="nodeids",
+    ) == sorted(
+        f"{directory}/{name}"
+        for name in (
+            "thing_test.py",
+            "thing_exec_test.py",
+            "thing_exec_test_more_test.py",
+            "test_thing_delivery.py",
+            "thing_directory_extra_test.py",
+        )
+    )
+
+
+def test_changed_split_test_does_not_select_its_siblings(tmp_path: Path) -> None:
+    for name in ("thing.py", "thing_exec_test.py", "thing_delivery_test.py"):
+        (tmp_path / name).touch()
+
+    assert harvest(
+        tmp_path / "absent.db",
+        changed=["thing_exec_test.py", "thing.py"],
+        depth=0,
+        emit="nodeids",
+    ) == ["thing_delivery_test.py", "thing_exec_test.py"]
+    assert harvest(
+        tmp_path / "absent.db",
+        changed=["thing_exec_test.py"],
+        depth=0,
+        emit="nodeids",
+    ) == ["thing_exec_test.py"]
+
+
 def test_workers_do_not_share_one_seeds_line_ranges(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

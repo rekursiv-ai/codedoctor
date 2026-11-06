@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from subprocess import CompletedProcess
+from typing import Final, Literal, NotRequired, TypedDict
 
 import argparse
 import json
@@ -11,16 +14,13 @@ import subprocess
 import sys
 import tempfile
 
-from treekle import json_loads
+from treekle import json_dumps, json_loads
 
 import pytest
 
 from codedoctor.assert_isinstance import unnecessary_assert_isinstance
 from codedoctor.assert_isinstance.unnecessary_assert_isinstance import Diagnostic
 
-
-if TYPE_CHECKING:
-    from collections.abc import Sequence
 
 _SOURCE = """\
 def f(x: int, y: object) -> int:
@@ -1405,6 +1405,522 @@ def test_parsing_never_sizes_the_pool(monkeypatch: pytest.MonkeyPatch) -> None:
     parser.parse_args(["--threads", "2"])
 
     assert sized == []
+
+
+@pytest.mark.parametrize("checker", ["basedpyright", "pyrefly"])
+@pytest.mark.parametrize("change", ["new", "line", "column", "rule", "message", "file"])
+def test_cross_checkers_retain_asserts_when_diagnostic_identity_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checker: str,
+    change: str,
+) -> None:
+    """Compare schema-valid boundary pairs, without asserting producer reachability."""
+    (tmp_path / "m.py").write_text(_NEEDED + "\nother: int = ''\n")
+    (tmp_path / "other.py").write_text("other: int = ''\n")
+    rule = "reportReturnType" if checker == "basedpyright" else "bad-return"
+    after = _ReportedFinding(line=3, column=12, rule=rule, message="Expected int")
+    before = {
+        "line": replace(after, line=5),
+        "column": replace(after, column=5),
+        "rule": replace(
+            after,
+            rule=(
+                "reportAssignmentType"
+                if checker == "basedpyright"
+                else "bad-assignment"
+            ),
+        ),
+        "message": replace(after, message="Expected str"),
+        "file": replace(after, path="other.py"),
+    }
+    replay = _CrossCheckReplay(
+        root=tmp_path,
+        before=[] if change == "new" else [before[change]],
+        after=[after],
+    )
+    monkeypatch.setattr(subprocess, "run", replay)
+    site = (tmp_path / "m.py", 2)
+
+    assert unnecessary_assert_isinstance.still_needed(
+        {site},
+        root=tmp_path,
+        checkers=[Path(sys.executable).parent / checker],
+    ) == {site}
+    assert (tmp_path / "m.py").read_text() == _NEEDED + "\nother: int = ''\n"
+
+
+@pytest.mark.parametrize("checker", ["basedpyright", "pyrefly"])
+def test_existing_diagnostics_do_not_make_redundant_asserts_necessary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checker: str,
+) -> None:
+    source = _SOURCE + "\nother: str = 1\n"
+    (tmp_path / "m.py").write_text(source)
+    finding = _ReportedFinding(
+        line=10,
+        column=14,
+        rule="reportAssignmentType" if checker == "basedpyright" else "bad-assignment",
+        message="Expected str",
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _CrossCheckReplay(root=tmp_path, before=[finding], after=[finding]),
+    )
+
+    assert (
+        unnecessary_assert_isinstance.still_needed(
+            {(tmp_path / "m.py", 2)},
+            root=tmp_path,
+            checkers=[Path(sys.executable).parent / checker],
+        )
+        == set()
+    )
+    assert (tmp_path / "m.py").read_text() == source
+
+
+@pytest.mark.parametrize("kind", ["file-level", "unruled"])
+def test_basedpyright_cross_checks_accept_optional_diagnostic_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    """File-level findings omit range; checker syntax findings may omit rule."""
+    (tmp_path / "m.py").write_text(_NEEDED)
+    finding = (
+        _ReportedFinding(
+            line=1,
+            column=1,
+            rule="reportImportCycles",
+            message="Import cycle detected",
+            ranged=False,
+        )
+        if kind == "file-level"
+        else _ReportedFinding(line=3, column=12, rule="", message="Unexpected token")
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _CrossCheckReplay(root=tmp_path, before=[finding], after=[finding]),
+    )
+
+    assert (
+        unnecessary_assert_isinstance.still_needed(
+            {(tmp_path / "m.py", 2)},
+            root=tmp_path,
+            checkers=[Path(sys.executable).parent / "basedpyright"],
+        )
+        == set()
+    )
+
+
+@pytest.mark.cli_node
+@pytest.mark.parametrize("checker", ["basedpyright", "pyrefly"])
+def test_real_cross_checkers_distinguish_necessary_and_redundant_asserts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checker: str,
+) -> None:
+    _project(tmp_path, monkeypatch=monkeypatch)
+    with (tmp_path / "pyproject.toml").open("a") as config:
+        config.write(f"[tool.pyrefly]\npython-interpreter-path = {sys.executable!r}\n")
+    (tmp_path / "need.py").write_text(_NEEDED)
+    needed = (tmp_path / "need.py", 2)
+
+    assert unnecessary_assert_isinstance.still_needed(
+        {needed, (tmp_path / "m.py", 2)},
+        root=tmp_path,
+        checkers=[Path(sys.executable).parent / checker],
+    ) == {needed}
+    assert (tmp_path / "need.py").read_text() == _NEEDED
+    assert (tmp_path / "m.py").read_text() == _SOURCE
+
+
+@pytest.mark.parametrize("option", ["--checker", "--typechecker"])
+def test_main_rejects_unsupported_checker_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    option: str,
+) -> None:
+    _project(tmp_path, monkeypatch=monkeypatch)
+    monkeypatch.setattr(subprocess, "run", _MainReplay(root=tmp_path))
+
+    with pytest.raises(SystemExit) as raised:
+        _main(monkeypatch, option, "unsupported", "--", "m.py")
+
+    assert raised.value.code == 2
+    assert (tmp_path / "m.py").read_text() == _SOURCE
+
+
+@pytest.mark.parametrize("checker", ["basedpyright", "pyrefly"])
+@pytest.mark.parametrize("agreement", ["pyrefly", "basedpyright", "both"])
+def test_explicit_checker_choices_dispatch_and_fix_only_with_agreement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checker: str,
+    agreement: str,
+) -> None:
+    _project(tmp_path, monkeypatch=monkeypatch)
+    with (tmp_path / "pyproject.toml").open("a") as config:
+        config.write("[tool.pyrefly]\n")
+    other = "pyrefly" if checker == "basedpyright" else "basedpyright"
+    typecheckers = ["pyrefly", "basedpyright"] if agreement == "both" else [agreement]
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _MainReplay(root=tmp_path, needed_by=other),
+    )
+    kept = other in typecheckers
+
+    assert _main(
+        monkeypatch,
+        "--checker",
+        checker,
+        "--fix",
+        "--typechecker",
+        *typecheckers,
+        "--",
+        "m.py",
+    ) == int(not kept)
+    expected = (
+        _SOURCE if kept else _SOURCE.replace("    assert isinstance(x, int)\n", "", 1)
+    )
+    assert (tmp_path / "m.py").read_text() == expected
+
+
+@pytest.mark.parametrize("after", [False, True], ids=["baseline", "removed-copy"])
+@pytest.mark.parametrize(
+    ("status", "stdout"),
+    [(1, ""), (2, "partial output\n"), (101, "partial output\n")],
+    ids=["missing-report", "failure-with-output", "panic-with-output"],
+)
+def test_main_fix_preserves_asserts_when_cross_checker_fails_after_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    after: bool,
+    status: int,
+    stdout: str,
+) -> None:
+    _project(tmp_path, monkeypatch=monkeypatch)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _MainReplay(
+            root=tmp_path,
+            crash_status=status,
+            crash_stdout=stdout,
+            crash_after=after,
+        ),
+    )
+
+    assert _main(monkeypatch, "--fix", "m.py") == status
+    assert (tmp_path / "m.py").read_text() == _SOURCE
+    assert capsys.readouterr().err == "checker stopped\n"
+
+
+@pytest.mark.parametrize("first", ["a.py", "notes.txt"], ids=["excluded", "unlintable"])
+def test_marker_prefilter_does_not_end_the_scan_before_later_asserts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first: str,
+) -> None:
+    _project(tmp_path, monkeypatch=monkeypatch, houselint='exclude = ["a.py"]\n')
+    marker = "x = 1  # house-ignore[unnecessary-assert-isinstance] -- Kept.\n"
+    (tmp_path / first).write_text(marker)
+    _replay(monkeypatch, flagged=True)
+
+    assert _main(monkeypatch, "--fix", first, "m.py") == 1
+    assert (tmp_path / first).read_text() == marker
+    assert (tmp_path / "m.py").read_text() == _SOURCE.replace(
+        "    assert isinstance(x, int)\n",
+        "",
+        1,
+    )
+
+
+@pytest.mark.parametrize("checker", ["basedpyright", "pyrefly"])
+def test_a_probe_separator_in_a_comment_does_not_hide_the_assert(
+    tmp_path: Path,
+    checker: str,
+) -> None:
+    source = (
+        "def f(x: int) -> None:\n"
+        "    assert isinstance(x, int)  # example ; assert isinstance(y, int)\n"
+    )
+    root = tmp_path / "root"
+    overlay = tmp_path / "overlay"
+    root.mkdir()
+    overlay.mkdir()
+    (root / "m.py").write_text(source)
+    (overlay / "m.py").write_text(
+        unnecessary_assert_isinstance.probe(source, checker=checker),
+    )
+    report = _checker_report(checker, cwd=overlay, findings=[_redundancy(checker)])
+    parse = (
+        unnecessary_assert_isinstance.diagnostics
+        if checker == "basedpyright"
+        else unnecessary_assert_isinstance.pyrefly_diagnostics
+    )
+
+    found = parse(report, overlay=overlay, root=root)
+
+    assert len(found) == 1
+    assert (found[0].path, found[0].line, found[0].column, found[0].redundant) == (
+        root / "m.py",
+        2,
+        5,
+        True,
+    )
+    assert (root / "m.py").read_text() == source
+
+
+@pytest.mark.parametrize("checker", ["basedpyright", "pyrefly"])
+def test_main_fix_deletes_an_assert_with_a_probe_separator_in_its_comment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    checker: str,
+) -> None:
+    _project(tmp_path, monkeypatch=monkeypatch)
+    with (tmp_path / "pyproject.toml").open("a") as config:
+        config.write("[tool.pyrefly]\n")
+    source = (
+        "def f(x: int) -> int:\n"
+        "    assert isinstance(x, int)  # example ; assert isinstance(y, int)\n"
+        "    return x\n"
+    )
+    path = tmp_path / "m.py"
+    path.write_text(source)
+    monkeypatch.setattr(subprocess, "run", _MainReplay(root=tmp_path))
+
+    assert _main(monkeypatch, "--checker", checker, "--fix", "m.py") == 1
+
+    assert path.read_text() == "def f(x: int) -> int:\n    return x\n"
+    assert capsys.readouterr() == (
+        _FINDING + _SUMMARY,
+        "Deleted 1 unnecessary assert(s).\n",
+    )
+
+
+@pytest.mark.parametrize("nested", ["data/deep", "data/.hidden/deep"])
+def test_source_free_nested_directories_do_not_prevent_exact_cover(
+    tmp_path: Path,
+    nested: str,
+) -> None:
+    _tree(tmp_path, "pkg/a.py", f"pkg/{nested}/notes.txt")
+
+    assert unnecessary_assert_isinstance.cover(
+        [tmp_path / "pkg/a.py"],
+        root=tmp_path,
+    ) == [tmp_path / "pkg"]
+
+
+class _Position(TypedDict):
+    line: int
+    character: int
+
+
+class _Range(TypedDict):
+    start: _Position
+    end: _Position
+
+
+class _BasedDiagnostic(TypedDict):
+    file: str
+    severity: Literal["error", "warning", "information"]
+    message: str
+    range: NotRequired[_Range]
+    rule: NotRequired[str]
+
+
+class _BasedReport(TypedDict):
+    generalDiagnostics: list[_BasedDiagnostic]
+
+
+class _PyreflyDiagnostic(TypedDict):
+    path: str
+    line: int
+    column: int
+    name: str
+    description: str
+    severity: Literal["error", "warn", "info"]
+
+
+class _PyreflyReport(TypedDict):
+    errors: list[_PyreflyDiagnostic]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ReportedFinding:
+    line: int
+    column: int
+    rule: str
+    message: str
+    path: str = "m.py"
+    severity: Literal["error", "warning", "information"] = "error"
+    ranged: bool = True
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _CrossCheckReplay:
+    root: Path
+    before: Sequence[_ReportedFinding]
+    after: Sequence[_ReportedFinding]
+
+    def __call__(
+        self,
+        argv: Sequence[Path | str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        text: bool,
+        check: bool,
+    ) -> CompletedProcess[str]:
+        del capture_output, text, check
+        findings = self.before if cwd == self.root else self.after
+        return CompletedProcess(
+            argv,
+            int(bool(findings)),
+            stdout=_checker_report(Path(argv[0]).name, cwd=cwd, findings=findings),
+            stderr="",
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _MainReplay:
+    root: Path
+    needed_by: str = ""
+    crash_status: int = 0
+    crash_stdout: str = ""
+    crash_after: bool = False
+
+    def __call__(
+        self,
+        argv: Sequence[Path | str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        text: bool,
+        check: bool,
+    ) -> CompletedProcess[str]:
+        del capture_output, text, check
+        checker = Path(argv[0]).name
+        findings: list[_ReportedFinding]
+        if any(
+            "; assert isinstance(" in line.partition("#")[0]
+            for line in (cwd / "m.py").read_text().splitlines()
+        ):
+            findings = [_redundancy(checker)]
+        elif (
+            checker == "ty"
+            and self.crash_status
+            and self.crash_after == (cwd != self.root)
+        ):
+            return CompletedProcess(
+                argv,
+                self.crash_status,
+                stdout=self.crash_stdout,
+                stderr="checker stopped\n",
+            )
+        elif checker == self.needed_by and cwd != self.root:
+            findings = [
+                _ReportedFinding(
+                    line=8,
+                    column=12,
+                    rule=(
+                        "reportReturnType"
+                        if checker == "basedpyright"
+                        else "bad-return"
+                    ),
+                    message="Expected int",
+                ),
+            ]
+        else:
+            findings = []
+        return CompletedProcess(
+            argv,
+            int(bool(findings)),
+            stdout=_checker_report(checker, cwd=cwd, findings=findings),
+            stderr="",
+        )
+
+
+def _redundancy(checker: str) -> _ReportedFinding:
+    """Describe the checker's existing probe verdict fixture."""
+    return _ReportedFinding(
+        line=2,
+        column=5,
+        severity="warning" if checker == "basedpyright" else "information",
+        rule=(
+            "reportUnnecessaryIsInstance"
+            if checker == "basedpyright"
+            else "reveal-type"
+        ),
+        message=(
+            'Unnecessary isinstance call; "int" is always an instance of "int"'
+            if checker == "basedpyright"
+            else "revealed type: Never"
+        ),
+    )
+
+
+def _checker_report(
+    checker: str,
+    *,
+    cwd: Path,
+    findings: Sequence[_ReportedFinding],
+) -> str:
+    """Serialize checker schemas, not evidence of emitted identity-only pairs."""
+    if checker == "ty":
+        return "".join(
+            f"{cwd / f.path}:{f.line}:{f.column}: error[{f.rule}] {f.message}\n"
+            for f in findings
+        )
+    if checker == "basedpyright":
+        items: list[_BasedDiagnostic] = []
+        for finding in findings:
+            item: _BasedDiagnostic = {
+                "file": str(cwd / finding.path),
+                "severity": finding.severity,
+                "message": finding.message,
+            }
+            if finding.ranged:
+                item["range"] = {
+                    "start": {
+                        "line": finding.line - 1,
+                        "character": finding.column - 1,
+                    },
+                    "end": {"line": finding.line - 1, "character": finding.column},
+                }
+            if finding.rule:
+                item["rule"] = finding.rule
+            items.append(item)
+        based: _BasedReport = {"generalDiagnostics": items}
+        return json_dumps(based)
+    pyrefly: _PyreflyReport = {
+        "errors": [
+            {
+                "path": finding.path,
+                "line": finding.line,
+                "column": finding.column,
+                "name": finding.rule,
+                "description": finding.message,
+                "severity": (
+                    "warn"
+                    if finding.severity == "warning"
+                    else "info"
+                    if finding.severity == "information"
+                    else "error"
+                ),
+            }
+            for finding in findings
+        ],
+    }
+    return json_dumps(pyrefly)
 
 
 if __name__ == "__main__":

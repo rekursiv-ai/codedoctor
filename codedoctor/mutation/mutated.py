@@ -49,7 +49,7 @@ from concurrent.futures import (
     as_completed,
 )
 from contextlib import chdir
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from functools import partial
 from multiprocessing.context import ForkContext
@@ -61,6 +61,7 @@ import argparse
 import ast
 import bisect
 import contextlib
+import fnmatch
 import hashlib
 import io
 import math
@@ -78,14 +79,14 @@ import tomllib
 from libcst import ClassDef, FunctionDef
 from mutmut import configuration
 from mutmut.configuration import config, reset_config
-from mutmut.mutation.data import SourceFileMutationData
+from mutmut.mutation.data import MutantLineSpans, SourceFileMutationData
 from mutmut.mutation.diff_apply import (
     get_diff_for_mutant,
     read_functions_from_index,
     read_mutant_function,
     read_original_function,
 )
-from mutmut.mutation.file_mutation import create_mutations
+from mutmut.mutation.file_mutation import create_mutations, mutate_file_contents
 from mutmut.mutation.trampoline_templates import (
     CLASS_NAME_SEPARATOR,
     mangle_function_name,
@@ -93,7 +94,7 @@ from mutmut.mutation.trampoline_templates import (
 from mutmut.stats import status_by_exit_code
 from mutmut.utils.format_utils import get_mutant_name
 from tomlkit.items import Table
-from treekle import ReadError, from_plain
+from treekle import ReadError, from_plain, json_loads
 
 import libcst as cst
 import tomlkit
@@ -133,26 +134,35 @@ def main() -> int:
     )
     flags, root = _parse_args(parser)
     seed, workers = flags.seed, flags.workers or default_workers()
+    if flags.remainder is not None and flags.paths != [Path()]:
+        parser.error("remainder manifests cannot be combined with paths")
     try:
-        named = _project_relative(
-            walk.expand(flags.paths, suffixes={".py"}),
-            root=root,
-        )
-        preferred = (
-            frozenset[str]()
-            if flags.prefer_changed is None
-            else changed_functions(root, base=flags.prefer_changed, files=named)
-        )
-        filters, candidates = select_functions(
-            root,
-            files=named,
-            sources=mutable_sources(root),
-            seed=seed,
-            rate=flags.function_sample_rate,
-            most=flags.max_functions_sampled,
-            workers=workers,
-            preferred=preferred,
-        )
+        if flags.remainder is not None:
+            shard = _read_remainder(flags.remainder)
+            shards = (shard,)
+            named, filters = [shard.source], shard.filters
+            candidates = len(filters)
+        else:
+            named = _project_relative(
+                walk.expand(flags.paths, suffixes={".py"}),
+                root=root,
+            )
+            preferred = (
+                frozenset[str]()
+                if flags.prefer_changed is None
+                else changed_functions(root, base=flags.prefer_changed, files=named)
+            )
+            filters, candidates = select_functions(
+                root,
+                files=named,
+                sources=mutable_sources(root),
+                seed=seed,
+                rate=flags.function_sample_rate,
+                most=flags.max_functions_sampled,
+                workers=workers,
+                preferred=preferred,
+            )
+            shards = plan_shards(_filters_by_source(filters, files=named))
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         sys.stderr.write(f"mutation: cannot select functions: {error}\n")
         return 1
@@ -172,7 +182,6 @@ def main() -> int:
         return 0
     if not filters:
         return 0
-    shards = plan_shards(_filters_by_source(filters, files=named))
     # Measured on 1178 mutants: one mutmut parent records 34 mutants/s with 8
     # children and 37/s with 64. Past 8 children, only more parents help, so
     # the budget is split across shards first: 24 workers ran 4 shards 3 at a
@@ -467,6 +476,17 @@ class Shard:
 
     source: str
     filters: tuple[str, ...]
+    remainder: Remainder | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Remainder:
+    """Exact unrun variants and fingerprints of their retained canonical snapshot."""
+
+    mutants: tuple[str, ...]
+    reference: Path
+    tests: tuple[str, ...]
+    fingerprints: Mapping[str, str]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -769,7 +789,6 @@ def mutant_outcomes(
         of that function ran. Killed and timed-out mutants are omitted.
 
     """
-    prefixes = _prefixes(filters)
     outcomes: dict[str, list[str]] = {
         "no tests": [],
         "inconclusive": [],
@@ -778,7 +797,9 @@ def mutant_outcomes(
     }
     for name, code in sorted(exit_codes.items()):
         status = status_by_exit_code[code]
-        if not name.startswith(prefixes) or status in {
+        if not any(
+            fnmatch.fnmatchcase(name, pattern) for pattern in filters
+        ) or status in {
             "killed",
             "timeout",
             "caught by type check",
@@ -792,7 +813,7 @@ def mutant_outcomes(
         pattern
         for pattern in filters
         if not any(
-            name.startswith(pattern.removesuffix("*")) and code is not None
+            fnmatch.fnmatchcase(name, pattern) and code is not None
             for name, code in exit_codes.items()
         )
     ]
@@ -810,6 +831,7 @@ class _Flags(Protocol):
     emit: str
     explain: bool
     blocking: bool
+    remainder: Path | None
 
 
 def _parse_args(
@@ -910,6 +932,12 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Write the selected functions to stderr.",
     )
+    parser.add_argument(
+        "--remainder",
+        type=Path,
+        metavar="JSON",
+        help="Run the exact retained-null IDs in a Shard manifest, without sampling.",
+    )
     blocking = positive(os.environ.get("PRECOMMIT_MUTATION_BLOCKING"))
     parser.add_argument(
         "--blocking",
@@ -1005,7 +1033,13 @@ def _mutate(
     timeout_sec: float | None,
 ) -> ShardReport:
     """Lay out ``snapshot``, run mutmut there, and read back what it recorded."""
+    if shard.remainder is not None and not shard.remainder.mutants:
+        return ShardReport(source=shard.source)
     tests = _paired_tests(root, sources=(shard.source,))
+    if shard.remainder is not None and set(shard.filters) - set(
+        function_filters(root, files=[shard.source], sources=mutable_sources(root)),
+    ):
+        raise ValueError("remainder generation filters are outside configured scope")
     if not tests:
         return ShardReport(
             source=shard.source,
@@ -1029,7 +1063,22 @@ def _mutate(
     # Wildcards select mutant keys; mutmut also matches them against bare
     # function keys for clean tests. Exact names take its suffix-stripping
     # branch, so include one representative per function for that lookup.
-    selectors = (*shard.filters, *(f.removesuffix("*") + "1" for f in shard.filters))
+    if shard.remainder is None:
+        selectors = (
+            *shard.filters,
+            *(f.removesuffix("*") + "1" for f in shard.filters),
+        )
+    else:
+        _validate_remainder_inputs(
+            snapshot,
+            shard=shard,
+            template=snapshot / "mutants",
+            tests=tests,
+        )
+        if report := _prepare_remainder(snapshot, shard=shard):
+            return report
+        selectors = shard.remainder.mutants
+        shard = replace(shard, filters=selectors)
     completed = _run_mutmut(
         [
             sys.executable,
@@ -1053,6 +1102,117 @@ def _mutate(
         )
     _retry_inconclusive(snapshot, shard=shard, timeout_sec=timeout_sec)
     return _collect(snapshot, shard=shard)
+
+
+def _read_remainder(manifest: Path) -> Shard:
+    """Read one shard with exact IDs and retained input fingerprints."""
+    shard = json_loads(manifest.read_bytes(), Shard)
+    remainder = shard.remainder
+    if remainder is None:
+        raise ValueError("remainder manifest must include retained identity")
+    source = Path(shard.source)
+    if source.is_absolute() or ".." in source.parts or source.suffix != ".py":
+        raise ValueError("remainder source must be a project-relative Python file")
+    prefix = get_mutant_name(source, mutant_method_name="")
+    if not shard.filters or any(
+        not pattern.startswith(prefix)
+        or re.fullmatch(r".+__mutmut_\*", pattern) is None
+        for pattern in shard.filters
+    ):
+        raise ValueError("remainder generation filters must belong to its source")
+    names = remainder.mutants
+    if len(set(names)) != len(names) or any(
+        re.fullmatch(r".+__mutmut_[1-9][0-9]*", name) is None
+        or not any(fnmatch.fnmatchcase(name, pattern) for pattern in shard.filters)
+        for name in names
+    ):
+        raise ValueError("remainder IDs must be unique exact generated keys")
+    return replace(
+        shard,
+        remainder=replace(
+            remainder,
+            reference=manifest.absolute().parent / remainder.reference,
+        ),
+    )
+
+
+def _validate_remainder_inputs(
+    root: Path,
+    *,
+    shard: Shard,
+    template: Path,
+    tests: tuple[str, ...],
+) -> None:
+    """Reject changed source, tests, conftests, or config in the canonical snapshot."""
+    remainder = shard.remainder
+    assert isinstance(remainder, Remainder)
+    if tests != remainder.tests:
+        raise ValueError("remainder selected-test scope changed")
+    inputs = {shard.source, "pyproject.toml", *(test.split("::")[0] for test in tests)}
+    inputs.update(
+        (parent / "conftest.py").as_posix()
+        for name in tuple(inputs)
+        for parent in Path(name).parents
+        if (template / parent / "conftest.py").is_file()
+    )
+    if inputs - remainder.fingerprints.keys():
+        raise ValueError("remainder fingerprints omit required inputs")
+    for name, digest in remainder.fingerprints.items():
+        path = Path(name)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("remainder fingerprint paths must be project-relative")
+        if name == "pyproject.toml":
+            bases = (root, template)
+        else:
+            bases = (root,) if name == shard.source else (template,)
+        for base in bases:
+            if hashlib.sha256((base / path).read_bytes()).hexdigest() != digest:
+                raise ValueError(f"remainder input changed: {name}")
+
+
+def _prepare_remainder(snapshot: Path, *, shard: Shard) -> ShardReport | None:
+    """Compare retained-null IDs and native generated definitions before execution."""
+    remainder = shard.remainder
+    assert isinstance(remainder, Remainder)
+    data = SourceFileMutationData(path=remainder.reference)
+    data.load()
+    for name in remainder.mutants:
+        if name not in data.exit_code_by_key or data.exit_code_by_key[name] is not None:
+            raise ValueError(f"remainder ID is not retained-null: {name}")
+    previous = configuration._config  # noqa: SLF001 -- mutmut exposes no way to restore its configuration.
+    with chdir(snapshot):
+        reset_config()
+        try:
+            generated = mutate_file_contents(
+                shard.source,
+                (snapshot / shard.source).read_bytes().decode(),
+            )
+        finally:
+            configuration._config = previous  # noqa: SLF001 -- mutmut exposes no way to restore its configuration.
+    fresh = snapshot / "mutants" / shard.source
+    fresh.write_bytes(generated.code.encode())
+    MutantLineSpans(
+        path=fresh,
+        span_by_function_name=generated.line_span_by_function_name,
+    ).save()
+    names = {
+        get_mutant_name(Path(shard.source), mutant_method_name=name)
+        for name in generated.mutant_names
+    }
+    if any(name not in names for name in remainder.mutants):
+        return ShardReport(
+            source=shard.source,
+            outcomes={"unchecked": remainder.mutants},
+            failure=f"mutation: {shard.source}: remainder generated IDs are absent",
+        )
+    for name in remainder.mutants:
+        if _functions(name, path=fresh) != _functions(name, path=remainder.reference):
+            raise ValueError(f"remainder generated definition changed: {name}")
+    data = SourceFileMutationData(path=fresh)
+    data.exit_code_by_key = dict.fromkeys(names)
+    data.hash_by_function_name = dict(generated.hash_by_function_name)
+    data.save()
+    return None
 
 
 def _unparsable(root: Path, *, tests: tuple[str, ...]) -> list[str]:
@@ -1084,7 +1244,7 @@ def _retry_inconclusive(
     names = tuple(
         name
         for name, code in sorted(data.exit_code_by_key.items())
-        if name.startswith(_prefixes(shard.filters))
+        if any(fnmatch.fnmatchcase(name, pattern) for pattern in shard.filters)
         and (code is None or status_by_exit_code[code] == "segfault")
     )
     if names:
@@ -1210,15 +1370,11 @@ def _collect(snapshot: Path, *, shard: Shard) -> ShardReport:
         outcomes={**outcomes, "survived": tuple(diffs)},
         diffs=diffs,
         checked=sum(
-            code is not None and name.startswith(_prefixes(shard.filters))
+            code is not None
+            and any(fnmatch.fnmatchcase(name, pattern) for pattern in shard.filters)
             for name, code in data.exit_code_by_key.items()
         ),
     )
-
-
-def _prefixes(filters: tuple[str, ...]) -> tuple[str, ...]:
-    """Return the mutant-name prefixes that ``filters`` select."""
-    return tuple(name.removesuffix("*") for name in filters)
 
 
 def _diff(snapshot: Path, *, name: str, source: str) -> str:
