@@ -2011,8 +2011,12 @@ def _skip_unselected(path: Path, *, name: str, filters: tuple[str, ...]) -> None
 def _is_test(path: str) -> bool:
     """Return whether ``path`` is a test module rather than a source one."""
     name = Path(path).name
+    # A hand-run ``*_parity.py`` script is a test no other test pairs, so the shard
+    # that mutated one failed with "no paired tests found".
     return (
-        name == "conftest.py" or name.endswith("_test.py") or name.startswith("test_")
+        name == "conftest.py"
+        or name.endswith(("_test.py", "_parity.py"))
+        or name.startswith("test_")
     )
 
 
