@@ -4073,7 +4073,8 @@ def test_parallel_shard_count_is_an_integer_below_the_file_count(
 
 
 def test_parallel_file_mapping_keeps_large_batches_runnable() -> None:
-    paths = [str(n) for n in range(34)]
+    # Two workers need 32 paths before chunksize exceeds one.
+    paths = [str(n) for n in range(2 * 8 * 2)]
     assert mutated._map_files(str, paths, workers=2) == paths
 
 
