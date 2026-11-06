@@ -790,8 +790,6 @@ class UserdirsNamespaceRule:
           findings: One per violation, in source order.
 
         """
-        if "_dir()" not in unit.source:
-            return ()
         findings: list[Finding] = []
         for node in unit.nodes(ast.BinOp):
             if not (isinstance(node.op, ast.Div) and _is_userdirs_call(node.left)):
@@ -851,8 +849,6 @@ class UserdirsWrapperRule:
           findings: One per violation, in source order.
 
         """
-        if "_dir()" not in unit.source:
-            return ()
         tree = unit.tree
         if tree is None:
             return ()
@@ -920,8 +916,6 @@ class CacheKwargRule:
           findings: One per violation, in source order.
 
         """
-        if not re.search(r"cache_dir=|model_dir=|hub\.set_dir", unit.source):
-            return ()
         # A kwarg on a function THIS module defines is its own API, not a
         # library's cache override.
         local_defs = {d.name for d in unit.nodes(*_DEF_KINDS)}
@@ -1040,8 +1034,6 @@ class TmpLiteralRule:
 
         """
         prefix = "/" + "tmp"
-        if prefix not in unit.source:
-            return ()
         return tuple(
             Finding(
                 path=unit.path,
@@ -1161,8 +1153,6 @@ class CwdFinalRule:
           findings: One per violation, in source order.
 
         """
-        if "Path(__file__)" not in unit.source:
-            return ()
         tree = unit.tree
         if tree is None:
             return ()
@@ -1757,8 +1747,6 @@ class NestedTryRule:
           findings: One per violation, in source order.
 
         """
-        if "try:" not in unit.source:
-            return ()
         findings: list[Finding] = []
         for outer in unit.nodes(ast.Try):
             if not outer.handlers:
@@ -1879,8 +1867,6 @@ class FluentNameRule:
           findings: One per violation, in source order.
 
         """
-        if not any(f"{e}(" in unit.source for e in self.endings):
-            return ()
         return tuple(
             Finding(
                 path=unit.path,
@@ -2431,8 +2417,6 @@ class UnderscoreParamRule:
           findings: One per violation, in source order.
 
         """
-        if not _UNDERSCORE_PARAM_PROBE.search(unit.source):
-            return ()
         return tuple(
             Finding(
                 path=unit.path,
@@ -2464,8 +2448,6 @@ class UnderscoreParamRule:
           rewritten: The full new source, or None when nothing changes.
 
         """
-        if not _UNDERSCORE_PARAM_PROBE.search(unit.source):
-            return None
         starts = _cached_line_starts(unit.source)
         edits: list[tuple[int, int, str]] = []
         for node in unit.nodes(*_DEF_KINDS):
@@ -2550,8 +2532,6 @@ class NegatedCompareRule:
           findings: One per violation, in source order.
 
         """
-        if "not " not in unit.source:
-            return ()
         return tuple(
             Finding(
                 path=unit.path,
@@ -2586,8 +2566,6 @@ class NegatedCompareRule:
           rewritten: The full new source, or None when nothing changes.
 
         """
-        if "not " not in unit.source:
-            return None
         # Unparsed as one node so an operand binding looser than the comparison
         # (``not (a or b) < 0``) keeps its parentheses.
         return _splice_nodes(
@@ -2628,8 +2606,6 @@ class NegatedTernaryRule:
           findings: One per violation, in source order.
 
         """
-        if "if not " not in unit.source:
-            return ()
         return tuple(
             Finding(
                 path=unit.path,
@@ -2651,8 +2627,6 @@ class NegatedTernaryRule:
           rewritten: The full new source, or None when nothing changes.
 
         """
-        if "if not " not in unit.source:
-            return None
         # Unparsed as one node: a ternary or lambda arm moved to the front
         # needs parentheses the original position did not.
         return _splice_nodes(
@@ -2687,8 +2661,6 @@ class SuperOnlyRule:
           findings: One per violation, in source order.
 
         """
-        if "super(" not in unit.source:
-            return ()
         return tuple(
             Finding(
                 path=unit.path,
@@ -2710,8 +2682,6 @@ class SuperOnlyRule:
           rewritten: The full new source, or None when nothing changes.
 
         """
-        if "super(" not in unit.source:
-            return None
         found = [
             n
             for n in unit.nodes(ast.FunctionDef, ast.AsyncFunctionDef)
@@ -2763,8 +2733,6 @@ class TensorValueGuardRule:
           findings: One per violation, in source order.
 
         """
-        if not re.search(r"\.(item|all|any)\(\)", unit.source):
-            return ()
         findings: list[Finding] = []
         # A ``while`` or a ternary is never a precondition; only these two are.
         for node in unit.nodes(ast.If, ast.Assert):
@@ -3547,7 +3515,7 @@ class AnnotationImportRule:
 
         """
         tree = unit.tree
-        if tree is None or "import " not in unit.source:
+        if tree is None:
             return ()
         imported = _runtime_imports(tree)
         if not imported:
@@ -3636,8 +3604,6 @@ class FinalInlineRule:
         """
         tree = unit.tree
         if tree is None:
-            return ()
-        if not re.search(r"\bFinal\b|re\.compile\(", unit.source):
             return ()
         reads = _module_name_reads(unit)
         sibling = unit.path.with_name(f"{unit.path.stem}_test.py")
@@ -3951,8 +3917,6 @@ class LazyImportCostRule:
           findings: One per violation, in source order.
 
         """
-        if "import " not in unit.source:
-            return ()
         tree = unit.tree
         if tree is None:
             return ()
@@ -4063,8 +4027,6 @@ class AssertRule:
         tree = unit.tree
         if tree is None:
             return ()
-        if "assert " not in unit.source:
-            return ()
         return tuple(
             Finding(
                 path=unit.path,
@@ -4092,8 +4054,6 @@ class AssertRule:
         """
         tree = unit.tree
         if tree is None:
-            return None
-        if "assert " not in unit.source:
             return None
         comments = {
             tok.start[0]: tok.string
@@ -4207,8 +4167,6 @@ class TreekleTorchLoadRule:
           findings: One per violation, in source order.
 
         """
-        if "torch.load" not in unit.source or "from_plain" not in unit.source:
-            return ()
         loaded = {
             target.id
             for node in unit.nodes(ast.Assign, ast.AnnAssign)
@@ -4341,8 +4299,6 @@ class LoggingFstringRule:
 
     def _sites(self, unit: Unit) -> Iterator[tuple[ast.Call, ast.JoinedStr]]:
         """Yield each logging call and its f-string message."""
-        if 'f"' not in unit.source and "f'" not in unit.source:
-            return
         for node in unit.nodes(ast.Call):
             if not (
                 isinstance(node.func, ast.Attribute)
@@ -5115,7 +5071,6 @@ def _is_exempt_comment(text: str) -> bool:
     )
 
 
-_UNDERSCORE_PARAM_PROBE = re.compile(r"[(,]\s*\*{0,2}_[A-Za-z]")
 # ruff's own S105/S106 name test (flake8_bandit/helpers.rs).
 _SECRET_KEYWORD = re.compile(
     r"(^|_)(?i:pas+wo?r?d|pass(phrase)?|pwd|token|secrete?)($|_)",
@@ -5450,7 +5405,7 @@ def _imported_modules(node: ast.Import | ast.ImportFrom) -> Iterator[str]:
 def _single_use_helpers(unit: Unit) -> list[_SingleUseHelper]:
     """Private top-level defs read once whose body is one ``return <expr>``."""
     tree = unit.tree
-    if tree is None or "def _" not in unit.source:
+    if tree is None:
         return []
     reads = _module_name_reads(unit)
     candidates: list[ast.FunctionDef] = []

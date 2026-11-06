@@ -9,6 +9,8 @@ import ast
 import json
 import textwrap
 
+from treekle import json_loads
+
 import pytest
 
 from codedoctor.lint import houselint, houselint_rules
@@ -137,6 +139,135 @@ def test_every_new_rule_is_registered_and_satisfies_the_protocol() -> None:
     assert "emdash" in names
     assert "module-side-effects" in names
     assert "fmt-directive" in names
+
+
+@pytest.mark.parametrize(
+    ("rule", "source", "line"),
+    [
+        (UserdirsWrapperRule(), "ROOT = state_dir ()\n", 1),
+        (UserdirsWrapperRule(), "ROOT = (state_dir)()\n", 1),
+        (UserdirsNamespaceRule(), 'path = state_dir () / "wrong"\n', 1),
+        (UserdirsNamespaceRule(), 'path = (state_dir)() / "wrong"\n', 1),
+        (UnderscoreParamRule(), "def f(  # Input.\n    _value,\n):\n    pass\n", 2),
+        (CacheKwargRule(), "load(cache_dir = root)\n", 1),
+        (CacheKwargRule(), "load(model_dir = root)\n", 1),
+        (CacheKwargRule(), "(torch.hub).set_dir(root)\n", 1),
+        (CwdFinalRule(), "root = Path( __file__ )\n", 1),
+        (CwdFinalRule(), "root = (Path)(__file__)\n", 1),
+        (
+            NestedTryRule(),
+            (
+                "try :\n    try :\n        pass\n    except A:\n        pass\n"
+                "except B:\n    pass\n"
+            ),
+            2,
+        ),
+        (FluentNameRule(), "def schema_of (): ...\n", 1),
+        (FluentNameRule(), "def schema_of[T](x: T) -> T: return x\n", 1),
+        (TmpLiteralRule(), r'path = "\x2ftmp/x"' + "\n", 1),
+        (TmpLiteralRule(), 'path = "/" "tmp/x"\n', 1),
+        (AssertRule(), "assert(x)\n", 1),
+        (AssertRule(), "assert\tx\n", 1),
+        (TensorValueGuardRule(), "assert x.item( )\n", 1),
+        (TensorValueGuardRule(), "assert (x.item)()\n", 1),
+        (TensorValueGuardRule(), "assert x . item()\n", 1),
+        (TensorValueGuardRule(), "assert x.all(dim=0)\n", 1),
+        (TensorValueGuardRule(methods=("tolist",)), "assert x.tolist()\n", 1),
+        (NegatedCompareRule(), "value = not(x < 0)\n", 1),
+        (NegatedCompareRule(), "value = not\t(x < 0)\n", 1),
+        (NegatedTernaryRule(), "value = a if (not x) else b\n", 1),
+        (NegatedTernaryRule(), "value = a if  not x else b\n", 1),
+        (
+            SuperOnlyRule(),
+            "class B(A):\n    def f(self):\n        return (super)().f()\n",
+            2,
+        ),
+        (
+            AnnotationImportRule(costs_ms={"torch": 100}),
+            "import\ttorch\nvalue: torch.Tensor\n",
+            1,
+        ),
+        (
+            AnnotationImportRule(costs_ms={"torch": 100}),
+            "from torch import(Tensor)\nvalue: Tensor\n",
+            1,
+        ),
+        (
+            LazyImportCostRule(costs_ms={"torch": 100}),
+            "import\ttorch\ndef a(): ...\ndef b(): ...\n",
+            1,
+        ),
+        (LoggingFstringRule(), 'logger.info(F"{x}")\n', 1),
+        (LoggingFstringRule(), 'logger.info(fr"{x}")\n', 1),
+        (LoggingFstringRule(), 'logger.info(RF"{x}")\n', 1),
+        (FinalInlineRule(), '_PAT = (re).compile("x")\nvalue = _PAT\n', 1),
+        (FinalInlineRule(), '_PAT = re . compile ("x")\nvalue = _PAT\n', 1),
+        (
+            SingleUseHelperRule(),
+            "def  _helper(x):\n    return x + 1\ndef run():\n    return _helper(2)\n",
+            1,
+        ),
+        (
+            SingleUseHelperRule(),
+            "def\t_helper(x):\n    return x + 1\ndef run():\n    return _helper(2)\n",
+            1,
+        ),
+    ],
+)
+def test_ast_rules_recognize_equivalent_python_spellings(
+    tmp_path: Path,
+    rule: Rule,
+    source: str,
+    line: int,
+) -> None:
+    assert [finding.line for finding in _findings(tmp_path, rule, source)] == [line]
+
+
+@pytest.mark.parametrize(
+    ("rule", "source", "expected"),
+    [
+        (NegatedCompareRule(), "value = not(x < 0)\n", "value = x >= 0\n"),
+        (
+            NegatedTernaryRule(),
+            "value = a if (not x) else b\n",
+            "value = b if x else a\n",
+        ),
+        (
+            LoggingFstringRule(),
+            'logger.info(F"{x}")\n',
+            'logger.info("%s", x)\n',
+        ),
+        (
+            AssertRule(),
+            "assert(x)\n",
+            'if not x:\n    raise ValueError("Expected x.")\n',
+        ),
+        (
+            SuperOnlyRule(),
+            (
+                "class B(A):\n    def f(self):\n        return (super)().f()\n"
+                "    def keep(self):\n        return 1\n"
+            ),
+            "class B(A):\n    def keep(self):\n        return 1\n",
+        ),
+    ],
+)
+def test_ast_rule_fixes_preserve_equivalent_python_spellings(
+    tmp_path: Path,
+    rule: Rule,
+    source: str,
+    expected: str,
+) -> None:
+    assert _fixed(tmp_path, rule, source) == expected
+    assert not _findings(tmp_path, rule, expected)
+    assert _fixed(tmp_path, rule, expected) is None
+
+
+def test_assert_fix_continues_after_an_unrewritable_ordering(tmp_path: Path) -> None:
+    source = "assert a <= b\nassert ready\n"
+    assert _fixed(tmp_path, AssertRule(), source) == (
+        'assert a <= b\nif not ready:\n    raise ValueError("Expected ready.")\n'
+    )
 
 
 # -- emdash ------------------------------------------------------------------
@@ -670,6 +801,30 @@ def test_cwd_final_fix_is_idempotent_and_parses(tmp_path: Path) -> None:
 def test_cwd_final_skips_without_pathlib_import(tmp_path: Path) -> None:
     body = "value = Path(__file__).resolve().parent\n"
     assert _fixed(tmp_path, CwdFinalRule(), body) is None
+
+
+def test_cwd_final_fix_preserves_an_existing_this_binding(tmp_path: Path) -> None:
+    body = (
+        "from pathlib import Path\n"
+        "from typing import Final\n"
+        "_THIS: Final = Path(__file__).resolve()\n"
+        "_CWD: Final = _THIS.parent\n"
+        "other = Path(__file__).resolve()\n"
+    )
+    rule = CwdFinalRule()
+    assert [f.line for f in _findings(tmp_path, rule, body)] == [5]
+
+    fixed = _fixed(tmp_path, rule, body)
+
+    assert fixed == (
+        "from pathlib import Path\n"
+        "from typing import Final\n"
+        "_THIS: Final = Path(__file__).resolve()\n"
+        "_CWD: Final = _THIS.parent\n"
+        "other = _THIS\n"
+    )
+    assert not _findings(tmp_path, rule, fixed)
+    assert _fixed(tmp_path, rule, fixed) is None
 
 
 def test_cwd_final_findings_skip_the_canonical_bindings(tmp_path: Path) -> None:
@@ -4702,11 +4857,32 @@ def test_treekle_over_a_torch_load_is_reported(tmp_path: Path, read: str) -> Non
 
 
 @pytest.mark.parametrize(
+    ("source", "line"),
+    [
+        ("model = from_plain(torch . load(path), Model)\n", 1),
+        ("model = from_plain((torch).load(path), Model)\n", 1),
+        ("model = from_plain(torch\\\n .load(path), Model)\n", 1),
+        ("state = torch . load(path)\nmodel = from_plain(state, Model)\n", 2),
+        ("state: object = (torch).load(path)\nmodel = from_plain(state, Model)\n", 2),
+    ],
+)
+def test_treekle_torch_load_detection_uses_python_syntax(
+    tmp_path: Path,
+    source: str,
+    line: int,
+) -> None:
+    assert [f.line for f in _findings(tmp_path, TreekleTorchLoadRule(), source)] == [
+        line,
+    ]
+
+
+@pytest.mark.parametrize(
     "read",
     [
         "from_plain(state, dict[str, object])",
         "from_plain(state['step']['model'], dict[str, Tensor])",
         "from_plain(state.get('model'), dict[str, Tensor])",
+        "from_plain(cast(object, state['model']), dict[str, Tensor])",
     ],
 )
 def test_treekle_over_a_payload_bound_to_a_name_is_reported(
@@ -4715,6 +4891,23 @@ def test_treekle_over_a_payload_bound_to_a_name_is_reported(
 ) -> None:
     body = f"state = torch.load(path, weights_only=True)\nmodel = {read}\n"
     assert [f.line for f in _findings(tmp_path, TreekleTorchLoadRule(), body)] == [2]
+
+
+def test_treekle_over_an_annotated_payload_binding_is_reported(tmp_path: Path) -> None:
+    body = (
+        "state: object = torch.load(path)\n"
+        "model = from_plain(state, dict[str, Tensor])\n"
+    )
+    assert [f.line for f in _findings(tmp_path, TreekleTorchLoadRule(), body)] == [2]
+
+
+@pytest.mark.parametrize("keyword", ["allow_imports=False", "default=True"])
+def test_treekle_payload_read_requires_explicit_import_permission(
+    tmp_path: Path,
+    keyword: str,
+) -> None:
+    body = f"model = from_plain(torch.load(path), Model, {keyword})\n"
+    assert [f.line for f in _findings(tmp_path, TreekleTorchLoadRule(), body)] == [1]
 
 
 def test_a_to_plain_field_of_a_payload_is_not_reported(tmp_path: Path) -> None:
@@ -5145,6 +5338,28 @@ def test_digits_groups_a_notebook_code_cell(tmp_path: Path) -> None:
 
     assert fixed is not None
     assert json.loads(fixed)["cells"][0]["source"] == ["x = 12_345\n"]
+
+
+def test_digits_groups_code_after_a_markdown_cell(tmp_path: Path) -> None:
+    notebook = (
+        '{"cells": ['
+        '{"cell_type": "markdown", "source": ["Intro\\n"]}, '
+        '{"cell_type": "code", "source": ["x = 12345\\n"]}'
+        "]}"
+    )
+    rule = DigitsRule()
+    assert [f.line for f in _findings(tmp_path, rule, notebook, name="n.ipynb")] == [1]
+
+    fixed = _fixed(tmp_path, rule, notebook, name="n.ipynb")
+
+    assert fixed is not None
+    assert json_loads(fixed) == {
+        "cells": [
+            {"cell_type": "markdown", "source": ["Intro\n"]},
+            {"cell_type": "code", "source": ["x = 12_345\n"]},
+        ],
+    }
+    assert _fixed(tmp_path, rule, fixed, name="n.ipynb") is None
 
 
 def test_digits_rewrites_a_notebook_as_nbformat_writes_it(tmp_path: Path) -> None:
@@ -8368,10 +8583,10 @@ def test_single_call_ignores_other_names_before_requested_name() -> None:
     assert ast.unparse(call) == "_second()"
 
 
-def test_single_use_helper_prefilter_needs_definition_marker() -> None:
+def test_single_use_helper_without_a_definition_is_clean() -> None:
     unit = Unit(
         path=Path("mod.py"),
-        source="def  _helper(x):\n    return x + 1\ndef run():\n    return _helper(2)\n",
+        source="value = 2\n",
         kind="python",
     )
     assert houselint_rules._single_use_helpers(unit) == []

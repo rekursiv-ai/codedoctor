@@ -860,6 +860,22 @@ def _sidecars(changed: list[str]) -> list[Path]:
             )
             if candidate.is_file()
         )
+        if source.stem != stem:
+            continue
+        owners = [
+            module.stem
+            for module in source.parent.glob(f"{stem}_*.py")
+            if module.is_file() and not module.stem.endswith("_test")
+        ]
+        for directory in (source.parent, source.parent / "tests"):
+            for pattern in (f"{stem}_*_test.py", f"test_{stem}_*.py"):
+                for candidate in directory.glob(pattern):
+                    name = candidate.stem.removeprefix("test_")
+                    if candidate.is_file() and not any(
+                        name == owner or name.startswith(f"{owner}_")
+                        for owner in owners
+                    ):
+                        paired.append(candidate)
     return paired
 
 
