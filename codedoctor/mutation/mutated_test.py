@@ -2660,6 +2660,7 @@ def test_argument_defaults_and_test_file_classification() -> None:
     assert mutated._is_test("conftest.py")
     assert mutated._is_test("test_mod.py")
     assert mutated._is_test("mod_test.py")
+    assert mutated._is_test("ops/git/sync/mod_parity.py")
     assert not mutated._is_test("module.py")
 
 
