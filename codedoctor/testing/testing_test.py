@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast, override
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import argparse
 import importlib
@@ -18,7 +19,7 @@ import pytest
 
 from codedoctor.gate import fakes, gate, spool
 from codedoctor.lib.testing.checks import assert_help_without_docstring
-from codedoctor.testing import coverage_summary, listing, testing
+from codedoctor.testing import coverage_summary, listing, outcomes, testing
 from codedoctor.testing.tiers import TIERS, Tier
 from codedoctor.typecheck import typecheck
 
@@ -29,6 +30,50 @@ if TYPE_CHECKING:
 
 
 pytest_plugins = ("pytester",)
+
+
+@pytest.mark.parametrize("worker", [False, True])
+def test_only_the_controller_registers_the_recorder(
+    tmp_path: Path,
+    worker: bool,
+) -> None:
+    registered: list[tuple[object, str]] = []
+
+    def register(plugin: object, name: str) -> None:
+        registered.append((plugin, name))
+
+    config = Mock(
+        spec=pytest.Config,
+        getoption=Mock(return_value=tmp_path / "events"),
+        pluginmanager=SimpleNamespace(register=register),
+    )
+    if worker:
+        config.workerinput = dict[str, object]()
+    testing.pytest_configure(config)
+    assert len(registered) == int(not worker)
+    if not worker:
+        recorder, name = registered[0]
+        assert name == "gate-outcomes"
+        assert isinstance(recorder, outcomes.Outcomes)
+        assert recorder.destination == tmp_path / "events"
+
+
+def test_no_recorder_without_the_gate_option() -> None:
+    register = Mock()
+    config = Mock(
+        spec=pytest.Config,
+        getoption=Mock(return_value=None),
+        pluginmanager=SimpleNamespace(register=register),
+    )
+    testing.pytest_configure(config)
+    register.assert_not_called()
+
+
+def test_option_registers_a_path() -> None:
+    addoption = Mock()
+    parser = Mock(addoption=addoption)
+    testing.pytest_addoption(parser)
+    assert addoption.call_args == call("--gate-outcomes", type=Path, default=None)
 
 
 def test_runner_registers_as_a_pytest_plugin() -> None:
@@ -153,19 +198,27 @@ def _pytest(
     return testing.pytest(context, dependents=dependents)
 
 
+@pytest.mark.parametrize("skip", ["", "coverage-floor-spool", "not-coverage-floor"])
 def test_pytest_runs_each_changed_files_pairs_with_its_directory_measured(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    skip: str,
 ) -> None:
     tools = fakes.Recorder()
+    installed = Mock(wraps=tools.has)
+    monkeypatch.setattr(tools, "has", installed)
 
     _pytest(
         tmp_path,
         tools,
         ["pkg/a.py", "pkg/b_test.py", "top.py"],
         existing=["pkg/a_test.py", "pkg/tests/test_a.py", "pkg/b.py"],
+        SKIP=skip,
     )
 
     [test] = tools.calls
+    assert "--no-cov" not in test
+    installed.assert_any_call("xdist")
     assert test[2:7] == [
         "COVERAGE_CORE=ctrace",
         sys.executable,
@@ -178,7 +231,6 @@ def test_pytest_runs_each_changed_files_pairs_with_its_directory_measured(
             "--cov=.",
             "--cov=pkg",
             "--cov-context=test",
-            "--no-cov-on-fail",
             "--cov-fail-under=0",
             "--cov-report=",
             "pkg/a_test.py",
@@ -248,6 +300,52 @@ def test_export_overlays_are_never_collected_as_monorepo_tests(
         assert tools.argfiles == [[".exported/ok_test.py", "kept_test.py"]]
 
 
+@pytest.mark.parametrize("mode", ["exact", "sidecar", "affected:1"])
+def test_manual_suites_and_conftests_are_not_automated_test_targets(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    tools = fakes.Recorder(
+        output="pkg/x_parity.py::test_manual\nextra_test.py::test_extra\n",
+        installed=False,
+    )
+    _pytest(
+        tmp_path,
+        tools,
+        ["pkg/x_parity.py", "pkg/conftest.py", "kept_test.py"],
+        existing=["pkg/x_parity_test.py"],
+        dependents="pkg.affected",
+        PRECOMMIT_SCOPE=mode,
+    )
+
+    expected = ["kept_test.py"]
+    if mode != "exact":
+        expected.append("pkg/x_parity_test.py")
+    if mode == "affected:1":
+        assert tools.argfiles[-2:] == [expected, ["extra_test.py"]]
+    else:
+        assert tools.argfiles == [expected]
+
+
+def test_automated_test_targets_follow_the_projects_filename_patterns(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\npython_files = ["*_spec.py"]\n',
+    )
+    tools = fakes.Recorder(installed=False)
+    _pytest(
+        tmp_path,
+        tools,
+        ["kept_spec.py", "excluded_test.py"],
+        PRECOMMIT_SCOPE="exact",
+    )
+
+    assert tools.argfiles == [["kept_spec.py"]]
+
+
 def test_exact_source_alone_never_collects_an_adjacent_test(tmp_path: Path) -> None:
     tools = fakes.Recorder()
     assert (
@@ -273,6 +371,49 @@ def test_pytest_without_pytest_cov_measures_nothing(tmp_path: Path) -> None:
     assert tools.argfiles == [["a_test.py"]]
     assert (tmp_path / "spool" / "coverage.9").read_text() == (
         "pytest passed but recorded no coverage: pytest-cov is not installed\n"
+    )
+
+
+@pytest.mark.parametrize("skip", ["coverage-floor", "ruff-check, coverage-floor"])
+@pytest.mark.parametrize("status", [0, 1, 2, 5])
+def test_skipping_the_floor_disables_coverage_but_keeps_pytest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    skip: str,
+    status: int,
+) -> None:
+    tools = fakes.Recorder(status=status)
+    installed = Mock(wraps=tools.has)
+    monkeypatch.setattr(tools, "has", installed)
+    summary = Mock(side_effect=AssertionError("Skipped coverage must not be analyzed"))
+    saved = Mock(side_effect=AssertionError("Skipped coverage needs no outcomes"))
+    monkeypatch.setattr(coverage_summary, "shortfall", summary)
+    monkeypatch.setattr(outcomes, "save", saved)
+
+    assert _pytest(
+        tmp_path,
+        tools,
+        ["a.py"],
+        existing=["a_test.py"],
+        SKIP=skip,
+        PRECOMMIT_COVERAGE_DETAIL="1",
+    ) == (0 if status == 5 else status)
+    [run] = tools.calls
+    assert "--no-cov" in run
+    assert "COVERAGE_CORE=ctrace" not in run
+    assert not any(arg.startswith("--gate-outcomes=") for arg in run)
+    assert tools.argfiles == [["a_test.py"]]
+    assert installed.call_args_list == [
+        call("pytest_cov"),
+        call("xdist"),
+        call("pytest_cov"),
+    ]
+    summary.assert_not_called()
+    saved.assert_not_called()
+    assert (tmp_path / "spool" / "coverage.9").read_text() == (
+        f"pytest exited {status}\n"
+        if status in {1, 2}
+        else "pytest passed but recorded no coverage: coverage-floor is skipped\n"
     )
 
 
@@ -324,12 +465,21 @@ class _Measured(fakes.Recorder):
 
     @override
     def run(self, argv: Sequence[str]) -> int:
-        data = coverage.CoverageData(
-            basename=argv[1].removeprefix("COVERAGE_FILE="),
-        )
-        data.add_lines({str(self.root / "a.py"): list(range(1, self.executed + 1))})
-        data.write()
-        return super().run(argv)
+        status = super().run(argv)
+        event = next((arg for arg in argv if arg.startswith("--gate-outcomes=")), "")
+        if event:
+            data = coverage.CoverageData(
+                basename=argv[1].removeprefix("COVERAGE_FILE="),
+            )
+            data.add_lines({str(self.root / "a.py"): list(range(1, self.executed + 1))})
+            data.write()
+            data.close()
+            Path(event.removeprefix("--gate-outcomes=")).write_text(
+                "selected\nselected\ta_test.py::test_a\n"
+                "finished\ta_test.py::test_a\n"
+                + ("failed\ta_test.py::test_a\n" if status == 1 else ""),
+            )
+        return status
 
 
 @pytest.mark.parametrize(("executed", "expected"), [(2, 1), (4, 0)])
@@ -351,25 +501,39 @@ def test_pytest_fails_changed_sources_below_the_floor(
     assert ("below fail_under=100" in capsys.readouterr().err) is bool(expected)
 
 
+@pytest.mark.parametrize("status", [0, 1, 2])
 def test_pytest_leaves_its_coverage_for_the_floor_and_clears_a_stale_one(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    status: int,
 ) -> None:
     root = tmp_path / "repo"
     root.mkdir()
     (root / "a.py").write_text("x = 1\n")
     (root / "a_test.py").touch()
+    (root / "b_test.py").touch()
     monkeypatch.chdir(root)
-    context = fakes.context(tmp_path, _Measured(root, executed=1))
-    spool.append(context.directory, gate="pytest", key=9, paths=["a.py", "a_test.py"])
+    tools = _Measured(root, executed=1)
+    tools.status = status
+    context = fakes.context(tmp_path, tools)
+    spool.append(
+        context.directory,
+        gate="pytest",
+        key=9,
+        paths=["a.py", "a_test.py", "b_test.py"],
+    )
     left = testing.handoff(context)
     left.write_text("an earlier run's")
 
-    assert testing.pytest(context, dependents=None) == 0
+    assert testing.pytest(context, dependents=None) == status
 
     measured = coverage.CoverageData(basename=str(left))
     measured.read()
     assert measured.lines(str(root / "a.py")) == [1]
+    measured.close()
+    assert outcomes.invalid_tests(left) == (
+        {"a_test.py"} if status == 1 else {"b_test.py"} if status == 2 else set()
+    )
 
 
 @pytest.mark.parametrize(
@@ -396,6 +560,37 @@ def test_a_run_that_measured_nothing_says_why_in_its_hand_off(
     assert testing.handoff(context).read_text() == f"{reason}\n"
 
 
+def test_a_graph_failure_preserves_the_successful_own_measurement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "a.py").write_text("x = 1\n")
+    monkeypatch.chdir(root)
+    tools = _Measured(root, executed=1)
+    tools.output = "b_test.py::test_b\n"
+    tools.statuses = [0, 1]
+
+    assert (
+        _pytest(
+            tmp_path,
+            tools,
+            ["a.py"],
+            existing=["a_test.py"],
+            dependents="pkg.affected",
+            PRECOMMIT_SCOPE_PYTEST="affected:1",
+        )
+        == 1
+    )
+    data = coverage.CoverageData(basename=str(tmp_path / "spool" / "coverage.9"))
+    data.read()
+    assert data.lines(str(root / "a.py")) == [1]
+    data.close()
+    assert outcomes.invalid_tests(tmp_path / "spool" / "coverage.9") == set()
+    assert len(tools.argfiles) == 3
+
+
 def test_the_floor_reads_pytests_run_and_clears_it(tmp_path: Path) -> None:
     tools = fakes.Recorder()
     context = fakes.context(tmp_path, tools)
@@ -407,7 +602,14 @@ def test_the_floor_reads_pytests_run_and_clears_it(tmp_path: Path) -> None:
     assert testing.floor(context) == 0
 
     [run] = tools.calls
-    assert run[1:5] == ["-m", "codedoctor.coverage_floor", "--data", str(data)]
+    assert run[:-1] == [
+        sys.executable,
+        "-m",
+        "codedoctor.coverage_floor",
+        "--data",
+        str(data),
+        "--",
+    ]
     assert tools.argfiles == [["a.py"]]
     assert not data.exists()
 
@@ -615,12 +817,12 @@ def test_own_and_graph_tests_keep_default_selection_but_only_own_are_measured(
     assert own[-1].startswith("@")
     assert own[own.index("-p") + 1] == testing.__name__
     assert "COVERAGE_CORE=ctrace" not in graph
+    assert "--no-cov" in graph
     assert graph[graph.index("--tb=short") + 1] == "-p"
     assert tools.argfiles[1:] == [
         [
             "--cov=.",
             "--cov-context=test",
-            "--no-cov-on-fail",
             "--cov-fail-under=0",
             "--cov-report=",
             "a_test.py",

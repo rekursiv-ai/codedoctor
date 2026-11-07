@@ -20,7 +20,7 @@ import threading
 import pytest
 
 from codedoctor.affected import affected, backbone
-from codedoctor.affected.affected import _collection_patterns, harvest
+from codedoctor.affected.affected import collection_patterns, harvest
 from codedoctor.gate.gate import output_argv
 
 
@@ -1826,7 +1826,7 @@ def test_a_blank_collection_setting_falls_back_to_the_default(tmp_path: Path) ->
         "[pytest]\npython_files =\npython_functions =   \n",
         encoding="utf-8",
     )
-    functions, _, files = _collection_patterns(tmp_path)
+    functions, _, files = collection_patterns(tmp_path)
     assert files == ["test_*.py", "*_test.py"]
     assert functions == ["test*"]
 
@@ -1996,7 +1996,7 @@ def test_collection_patterns_read_pyproject_lists(tmp_path: Path) -> None:
         '[tool.pytest.ini_options]\npython_functions = ["check*"]\n'
         'python_classes = ["Suite"]\npython_files = ["*_spec.py"]\n',
     )
-    assert _collection_patterns(tmp_path) == (["check*"], ["Suite"], ["*_spec.py"])
+    assert collection_patterns(tmp_path) == (["check*"], ["Suite"], ["*_spec.py"])
 
 
 @pytest.mark.parametrize(
@@ -2008,7 +2008,7 @@ def test_a_non_table_pytest_setting_keeps_the_defaults(
     body: str,
 ) -> None:
     (tmp_path / "pyproject.toml").write_text(body)
-    assert _collection_patterns(tmp_path) == (
+    assert collection_patterns(tmp_path) == (
         ["test*"],
         ["Test*"],
         ["test_*.py", "*_test.py"],
@@ -2380,7 +2380,7 @@ def test_pytest_ini_settings_win_over_pyproject(tmp_path: Path) -> None:
         "[pytest]\npython_functions = check* verify*\n",
     )
 
-    assert _collection_patterns(tmp_path)[0] == ["check*", "verify*"]
+    assert collection_patterns(tmp_path)[0] == ["check*", "verify*"]
 
 
 def test_a_pytest_ini_without_the_section_defers_to_pyproject(tmp_path: Path) -> None:
@@ -2389,13 +2389,13 @@ def test_a_pytest_ini_without_the_section_defers_to_pyproject(tmp_path: Path) ->
     )
     (tmp_path / "pytest.ini").write_text("[other]\npython_functions = check*\n")
 
-    assert _collection_patterns(tmp_path)[0] == ["from_toml*"]
+    assert collection_patterns(tmp_path)[0] == ["from_toml*"]
 
 
 def test_a_pyproject_without_pytest_settings_keeps_the_defaults(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\n')
 
-    assert _collection_patterns(tmp_path) == (
+    assert collection_patterns(tmp_path) == (
         ["test*"],
         ["Test*"],
         ["test_*.py", "*_test.py"],
