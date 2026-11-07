@@ -7,11 +7,17 @@ so a package-level conftest alone would leave those tests' resource markers
 with no timeout, no CI skip policy, and no error to say so.
 """
 
+from typing import Final
+
 from codedoctor.lib.testing.resources import (
     isolate_user_dirs,
     pytest_collection_modifyitems,
     pytest_configure,
 )
 
+
+# Honored only in the rootdir conftest: each invocation claims its own basetemp,
+# so concurrent sessions never clean up one another's directories.
+pytest_plugins: Final = ("codedoctor.lib.testing.basetemp",)
 
 __all__ = ["isolate_user_dirs", "pytest_collection_modifyitems", "pytest_configure"]
