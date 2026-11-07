@@ -194,6 +194,13 @@ class _ProjectDefaults(TypedDict):
 def _test_exclusions() -> list[str]:
     """Read portable test exemptions from the package's canonical policy."""
     template = _THIS.with_name("install_defaults.toml")
+    # Only the wheel holds the copy; a checkout, monorepo or export, reads its own.
+    if not template.is_file():
+        template = next(
+            folder / "pyproject.toml"
+            for folder in _THIS.parents
+            if (folder / "pyproject.toml").is_file()
+        )
     config = from_plain(tomllib.loads(template.read_text()), _ProjectDefaults)
     return [
         spec.replace("*_test.py", "*_test.py test_*.py")

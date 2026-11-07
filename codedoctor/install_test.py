@@ -370,6 +370,31 @@ def test_packaged_defaults_preserve_test_semantics(
     }
 
 
+def test_a_checkout_without_the_packaged_defaults_reads_its_nearest_pyproject(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the wheel carries ``install_defaults.toml``; a source tree has none."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.houselint]\nexclude = ["conftest.py = module-side-effects"]\n',
+    )
+    (tmp_path / "pkg" / "sub").mkdir(parents=True)
+    # A test pattern named only after the ``=`` is a rule's argument, not its files.
+    (tmp_path / "pkg" / "pyproject.toml").write_text(
+        "[tool.houselint]\nexclude = ["
+        '"*_test.py = assert", "**/tests/test*.py = globals", '
+        '"private.py = conftest.py = globals"]\n',
+    )
+    monkeypatch.setattr(install, "_THIS", tmp_path / "pkg" / "sub" / "install.py")
+
+    configured = tomllib.loads(install.project_config("", name="demo"))
+
+    assert configured["tool"]["houselint"]["exclude"] == [
+        "*_test.py test_*.py = assert",
+        "**/tests/test*.py = globals",
+    ]
+
+
 if __name__ == "__main__":
     from codedoctor.lib.testing.runner import test_main
 
