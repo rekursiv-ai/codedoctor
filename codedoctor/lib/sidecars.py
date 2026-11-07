@@ -79,6 +79,51 @@ def paired(path: str | Path, *, root: Path | None = None) -> list[Path]:
     return found
 
 
+def related(path: str | Path, *, root: Path) -> list[Path]:
+    """Return ``path``, its source when it is a test, and that source's tests.
+
+    Args:
+      path: A repo-relative source or test file.
+      root: The repository root.
+
+    Returns:
+      files: Sorted, existing source and test paths; an unpaired path stays selected.
+
+    """
+    named = Path(path)
+    source = named
+    if is_test(root / named):
+        stem = named.stem.removesuffix("_test").removeprefix("test_")
+        folders = [named.parent]
+        if named.parent.name == "tests":
+            folders.append(named.parent.parent)
+        if named.parts[0] == "tests":
+            folders.extend(
+                package / Path(*named.parts[1:-1])
+                for package in root.iterdir()
+                if package.is_dir() and not package.name.startswith(".")
+            )
+        stems = [stem.rsplit("_", count)[0] for count in range(stem.count("_") + 1)]
+        owners = (
+            folder / f"{candidate}.py" for candidate in stems for folder in folders
+        )
+        source = next(
+            (
+                owner.relative_to(root) if owner.is_absolute() else owner
+                for owner in owners
+                if (root / owner).is_file()
+                and not is_test(root / owner)
+                and named
+                in paired(
+                    owner.relative_to(root) if owner.is_absolute() else owner,
+                    root=root,
+                )
+            ),
+            named,
+        )
+    return sorted({named, source, *paired(source, root=root)})
+
+
 def is_test(path: str | Path) -> bool:
     """Return whether ``path`` is a test module rather than a source one.
 

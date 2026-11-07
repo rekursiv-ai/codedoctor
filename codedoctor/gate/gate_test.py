@@ -630,6 +630,79 @@ def test_threaded_fills_in_the_gate_worker_count(tmp_path: Path) -> None:
     assert tools.calls == [["pyrefly", "check", "--threads=2"]]
 
 
+@pytest.mark.parametrize(
+    ("value", "depth"),
+    [("exact", -1), ("sidecar", 0), ("affected:1", 1), ("affected:3", 3)],
+)
+def test_global_scope_overrides_each_hooks_setting(value: str, depth: int) -> None:
+    assert (
+        gate.scope(
+            "pytest",
+            environ={
+                "PRECOMMIT_SCOPE": value,
+                "PRECOMMIT_SCOPE_PYTEST": "invalid",
+            },
+        )
+        == depth
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "depth"),
+    [
+        ("ty-check", 3),
+        ("pyrefly-check", 3),
+        ("basedpyright", 3),
+        ("pytest", 0),
+        ("mutation", 0),
+        ("ruff-check", -1),
+    ],
+)
+def test_granular_preserves_each_hooks_default(name: str, depth: int) -> None:
+    assert gate.scope(name, environ={}) == depth
+    assert gate.scope(name, environ={"PRECOMMIT_SCOPE": "granular"}) == depth
+
+
+@pytest.mark.parametrize("global_scope", [None, "granular"])
+def test_granular_uses_the_named_hooks_override(global_scope: str | None) -> None:
+    environ = {"PRECOMMIT_SCOPE_TY_CHECK": "affected:2"}
+    if global_scope is not None:
+        environ["PRECOMMIT_SCOPE"] = global_scope
+    assert gate.scope("ty-check", environ=environ) == 2
+    assert gate.scope("pytest", environ=environ) == 0
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "EXACT", "typo", "-1", "0", "affected:0", "affected:-1", "affected:01"],
+)
+def test_unknown_scope_fails_instead_of_widening(value: str) -> None:
+    with pytest.raises(ValueError, match="PRECOMMIT_SCOPE"):
+        gate.scope("pytest", environ={"PRECOMMIT_SCOPE": value})
+
+
+def test_per_hook_scope_cannot_be_granular() -> None:
+    with pytest.raises(ValueError, match="PRECOMMIT_SCOPE_PYTEST"):
+        gate.scope("pytest", environ={"PRECOMMIT_SCOPE_PYTEST": "granular"})
+
+
+@pytest.mark.parametrize("mode", ["exact", "sidecar"])
+def test_narrow_scopes_never_walk_dependencies(tmp_path: Path, mode: str) -> None:
+    tools = fakes.Recorder(output="b.py\n")
+    assert (
+        gate.walk(
+            fakes.context(tmp_path, tools, PRECOMMIT_SCOPE=mode),
+            files=["a.py"],
+            dependents="pkg.deps",
+            hops=gate.scope("pytest", environ={"PRECOMMIT_SCOPE": mode}),
+            emit="files",
+            workers=1,
+        )
+        == []
+    )
+    assert tools.calls == []
+
+
 def test_skip_reads_one_name_out_of_precommits_list() -> None:
     environ = {"SKIP": "ruff-check, harvest-affected ,pytest"}
     assert gate.skipped(environ, "harvest-affected")

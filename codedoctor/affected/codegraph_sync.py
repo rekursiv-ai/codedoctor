@@ -5,9 +5,9 @@
 exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
 Keep the shared CodeGraph backbone and this worktree's overlay current.
 
-Hook mode runs only when PRECOMMIT_CODEGRAPH_PYTEST or PRECOMMIT_CODEGRAPH_TYPECHECK
-holds a positive integer. It restores a missing CLI link to an existing cached
-index, installs the CLI if missing, starts building the backbone in the background
+Hook mode runs when an enabled hook's resolved PRECOMMIT_SCOPE needs the graph.
+It restores a missing CLI link to an existing cached index, installs the CLI
+if missing, starts building the backbone in the background
 when none exists, and indexes this worktree's changes into its overlay. It never
 fails a commit: a problem is printed, and `affected` refuses a stale overlay.
 
@@ -41,7 +41,7 @@ import sys
 
 from codedoctor.affected import backbone
 from codedoctor.affected.affected import ensure_derived
-from codedoctor.gate.gate import output_argv, positive, run_argv
+from codedoctor.gate.gate import output_argv, run_argv, scope, skipped
 
 
 if TYPE_CHECKING:
@@ -94,10 +94,21 @@ def main() -> int:
 
 
 def opted_in(environ: Mapping[str, str]) -> bool:
-    """Report whether either graph-walking gate is on."""
-    return any(
-        positive(environ.get(name))
-        for name in ("PRECOMMIT_CODEGRAPH_PYTEST", "PRECOMMIT_CODEGRAPH_TYPECHECK")
+    """Report whether an enabled hook's resolved scope needs the graph.
+
+    Args:
+      environ: Scope overrides and pre-commit's SKIP list.
+
+    Returns:
+      needed: Whether any unskipped hook has a positive dependency depth.
+
+    """
+    depths = {
+        name: scope(name, environ=environ)
+        for name in ("ty-check", "pyrefly-check", "basedpyright", "pytest", "mutation")
+    }
+    return not skipped(environ, "harvest-affected") and any(
+        depth > 0 and not skipped(environ, name) for name, depth in depths.items()
     )
 
 
@@ -243,8 +254,8 @@ def link_cli_index(root: Path, *, caches: Path) -> str:
     seeded = home / "codegraph.db"
     if not seeded.is_file() and not database.is_file():
         return (
-            "No CodeGraph backbone to seed from; run --refresh, or commit once "
-            "with PRECOMMIT_CODEGRAPH_PYTEST set."
+            "No CodeGraph backbone to seed from; run --refresh, or run hooks "
+            "with PRECOMMIT_SCOPE=affected:1."
         )
     try:
         home.mkdir(parents=True, exist_ok=True)

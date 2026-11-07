@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 
 import argparse
+import importlib
 import os
+import stat
 import subprocess
 import sys
 
@@ -28,6 +30,51 @@ if TYPE_CHECKING:
 pytest_plugins = ("pytester",)
 
 
+def test_runner_registers_as_a_pytest_plugin() -> None:
+    manager = pytest.PytestPluginManager()
+    plugin = importlib.reload(testing)
+    manager.register(plugin)
+    assert manager.get_plugin(testing.__name__) is plugin
+    assert manager.hook.pytest_report_teststatus.get_hookimpls()[0].wrapper
+
+
+def test_an_interrupted_selection_leaves_a_private_unfinished_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = fakes.Recorder()
+    context = fakes.context(tmp_path, tools)
+    spool.append(context.directory, gate="pytest", key=9, paths=["a.py"])
+    left = tmp_path / "nested" / "private" / "coverage"
+
+    def handoff(context: gate.Context) -> Path:
+        del context
+        return left
+
+    monkeypatch.setattr(testing, "handoff", handoff)
+
+    def interrupted(*_args: object, **_kwargs: object) -> tuple[list[str], list[str]]:
+        assert left.read_text() == "the pytest hook did not finish\n"
+        raise RuntimeError("interrupted selection")
+
+    monkeypatch.setattr(testing, "_selected", interrupted)
+    with pytest.raises(RuntimeError, match="interrupted selection"):
+        testing.pytest(context, dependents=None)
+    assert stat.S_IMODE(left.parent.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize(
+    "category",
+    ["passed", "failed", "error", "skipped", "xfailed", "xpassed", ""],
+)
+def test_status_keeps_counts_without_progress(category: str) -> None:
+    hook = testing.pytest_report_teststatus()
+    next(hook)
+    with pytest.raises(StopIteration) as finished:
+        hook.send((category, ".", "PASSED"))
+    assert cast(tuple[str, str, str], finished.value.value) == (category, "", "")
+
+
 @pytest.fixture
 def processes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> fakes.Processes:
     """Record what ``main`` runs, under no gate's settings."""
@@ -45,8 +92,15 @@ def test_every_gate_imports_without_coverage_installed(
     """
     blocker = tmp_path / "coverage.py"
     blocker.write_text("raise ModuleNotFoundError(\"No module named 'coverage'\")\n")
+    deferred = (
+        "; import sys; "
+        "assert 'codedoctor.gate.gate' not in sys.modules; "
+        "assert 'codedoctor.lib.sidecars' not in sys.modules"
+        if module is testing
+        else ""
+    )
     done = subprocess.run(  # noqa: S603 -- this interpreter; fixed argv.
-        [sys.executable, "-c", f"import {module.__name__}"],
+        [sys.executable, "-c", f"import {module.__name__}{deferred}"],
         env={**os.environ, "PYTHONPATH": os.pathsep.join([str(tmp_path), *sys.path])},
         capture_output=True,
         text=True,
@@ -63,7 +117,12 @@ def test_one_gates_depth_never_widens_the_other(tmp_path: Path) -> None:
     checker = fakes.Recorder(output="b.py\n")
     typecheck.typecheck(
         "ty-check",
-        context=fakes.context(tmp_path, checker, PRECOMMIT_CODEGRAPH_PYTEST="3"),
+        context=fakes.context(
+            tmp_path,
+            checker,
+            PRECOMMIT_SCOPE_TY_CHECK="sidecar",
+            PRECOMMIT_SCOPE_PYTEST="affected:3",
+        ),
         dependents="pkg.affected",
         fixer=None,
     )
@@ -74,7 +133,7 @@ def test_one_gates_depth_never_widens_the_other(tmp_path: Path) -> None:
         ["a.py"],
         existing=["a_test.py"],
         dependents="pkg.affected",
-        PRECOMMIT_CODEGRAPH_TYPECHECK="3",
+        PRECOMMIT_SCOPE_TY_CHECK="affected:3",
     )
 
     assert [call[-1] for call in checker.calls] == ["a.py"]
@@ -133,6 +192,44 @@ def test_pytest_runs_each_changed_files_pairs_with_its_directory_measured(
     ]
 
 
+@pytest.mark.parametrize("mode", ["exact", "sidecar", "affected:1"])
+def test_scope_controls_pairing_and_dependency_expansion(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    tools = fakes.Recorder(output="b_test.py::test_b\n", installed=False)
+    _pytest(
+        tmp_path,
+        tools,
+        ["a.py", "test_a.py"],
+        existing=["a_test.py"],
+        dependents="pkg.affected",
+        PRECOMMIT_SCOPE=mode,
+    )
+    if mode == "exact":
+        assert tools.argfiles == [["test_a.py"]]
+    elif mode == "sidecar":
+        assert tools.argfiles == [["a_test.py", "test_a.py"]]
+    else:
+        assert tools.argfiles[-2:] == [["a_test.py", "test_a.py"], ["b_test.py"]]
+        assert tools.listings == [["b_test.py::test_b"]]
+
+
+def test_exact_source_alone_never_collects_an_adjacent_test(tmp_path: Path) -> None:
+    tools = fakes.Recorder()
+    assert (
+        _pytest(
+            tmp_path,
+            tools,
+            ["a.py"],
+            existing=["a_test.py"],
+            PRECOMMIT_SCOPE="exact",
+        )
+        == 0
+    )
+    assert tools.calls == []
+
+
 def test_pytest_without_pytest_cov_measures_nothing(tmp_path: Path) -> None:
     tools = fakes.Recorder(installed=False)
 
@@ -141,6 +238,9 @@ def test_pytest_without_pytest_cov_measures_nothing(tmp_path: Path) -> None:
     # Nothing measured, so no slower coverage core either.
     assert [call[3:5] for call in tools.calls] == [["-m", "pytest"]]
     assert tools.argfiles == [["a_test.py"]]
+    assert (tmp_path / "spool" / "coverage.9").read_text() == (
+        "pytest passed but recorded no coverage: pytest-cov is not installed\n"
+    )
 
 
 def test_pytest_without_a_pair_runs_nothing(tmp_path: Path) -> None:
@@ -148,6 +248,9 @@ def test_pytest_without_a_pair_runs_nothing(tmp_path: Path) -> None:
 
     assert _pytest(tmp_path, tools, ["a.py"]) == 0
     assert tools.calls == []
+    assert (tmp_path / "spool" / "coverage.9").read_text() == (
+        "the pytest hook found no tests\n"
+    )
 
 
 @pytest.mark.parametrize(("status", "expected"), [(1, 1), (5, 0), (2, 2)])
@@ -341,7 +444,7 @@ def test_a_junk_xdist_threshold_keeps_the_default(
         tools,
         ["a.py"],
         dependents="pkg.affected",
-        PRECOMMIT_CODEGRAPH_PYTEST="1",
+        PRECOMMIT_SCOPE_PYTEST="affected:1",
         SIDECAR_XDIST_MIN=threshold,
     )
 
@@ -356,7 +459,7 @@ def test_the_xdist_threshold_can_be_lowered(tmp_path: Path) -> None:
         tools,
         ["a.py"],
         dependents="pkg.affected",
-        PRECOMMIT_CODEGRAPH_PYTEST="1",
+        PRECOMMIT_SCOPE_PYTEST="affected:1",
         SIDECAR_XDIST_MIN="2",
     )
 
@@ -379,7 +482,7 @@ def test_pytest_spreads_only_across_enough_test_files(
         tools,
         ["a.py"],
         dependents="pkg.affected",
-        PRECOMMIT_CODEGRAPH_PYTEST="1",
+        PRECOMMIT_SCOPE_PYTEST="affected:1",
     )
 
     assert ("-n" in tools.calls[-1]) is spread
@@ -396,12 +499,13 @@ def test_pytest_reads_its_selection_from_an_argfile(tmp_path: Path) -> None:
         tools,
         ["a.py"],
         dependents="pkg.affected",
-        PRECOMMIT_CODEGRAPH_PYTEST="1",
+        PRECOMMIT_SCOPE_PYTEST="affected:1",
     )
 
     *head, test_files, argfile = tools.calls[-1]
     assert head[3:] == [
         *("-m", "pytest", "-n", "3", "-q", "--tb=short"),
+        *("-p", testing.__name__),
         *("-p", listing.__name__),
     ]
     selection = Path(test_files.removeprefix("--test-files="))
@@ -445,7 +549,7 @@ def test_the_gate_sizes_the_walk_and_pytest_from_its_own_workers(
         tools,
         ["a.py"],
         dependents="pkg.affected",
-        PRECOMMIT_CODEGRAPH_PYTEST="1",
+        PRECOMMIT_SCOPE_PYTEST="affected:1",
         WORKERS_PYTEST="5",
     )
 
@@ -467,7 +571,7 @@ def test_own_and_graph_tests_keep_default_selection_but_only_own_are_measured(
         ["a.py"],
         existing=["a_test.py"],
         dependents="pkg.affected",
-        PRECOMMIT_CODEGRAPH_PYTEST="1",
+        PRECOMMIT_SCOPE_PYTEST="affected:1",
     )
 
     walk, own, graph = tools.calls
@@ -475,8 +579,8 @@ def test_own_and_graph_tests_keep_default_selection_but_only_own_are_measured(
     assert own[2] == "COVERAGE_CORE=ctrace"
     # Only the interpreter's -m: overriding pytest's marker widens default tiers.
     assert own.count("-m") == graph.count("-m") == 1
-    assert own[own.index("--tb=short") + 1].startswith("@")
-    assert "-p" not in own
+    assert own[-1].startswith("@")
+    assert own[own.index("-p") + 1] == testing.__name__
     assert "COVERAGE_CORE=ctrace" not in graph
     assert graph[graph.index("--tb=short") + 1] == "-p"
     assert tools.argfiles[1:] == [
@@ -507,7 +611,7 @@ def test_pytest_falls_back_to_the_pairs_when_the_graph_names_nothing(
         ["a.py"],
         existing=["a_test.py"],
         dependents="pkg.affected",
-        PRECOMMIT_CODEGRAPH_PYTEST="1",
+        PRECOMMIT_SCOPE_PYTEST="affected:1",
     )
 
     # The walk's own argfile, then pytest's.
@@ -586,7 +690,7 @@ def test_a_module_skipped_test_does_not_drop_the_rest_of_the_walk(
         tools,
         ["a.py"],
         dependents="pkg.affected",
-        PRECOMMIT_CODEGRAPH_PYTEST="1",
+        PRECOMMIT_SCOPE_PYTEST="affected:1",
     )
 
     assert sorted(path.name for path in root.glob("ran_*")) == ["ran_b", "ran_c"]
@@ -611,7 +715,7 @@ def test_a_walk_reaching_only_a_skipped_module_passes(
         tools,
         ["a.py"],
         dependents="pkg.affected",
-        PRECOMMIT_CODEGRAPH_PYTEST="1",
+        PRECOMMIT_SCOPE_PYTEST="affected:1",
     )
 
     assert tools.returned == [5]
@@ -1057,7 +1161,7 @@ def test_the_cli_walks_the_graph_with_its_dependents_module(
     tmp_path: Path,
 ) -> None:
     (tmp_path / "a.py").write_text("")
-    monkeypatch.setenv("PRECOMMIT_CODEGRAPH_PYTEST", "1")
+    monkeypatch.setenv("PRECOMMIT_SCOPE_PYTEST", "affected:1")
     monkeypatch.setattr(sys, "argv", ["gate", "spool", "pytest", "a.py"])
     gate.main()
     monkeypatch.setattr(sys, "argv", ["testing", "pytest", "--dependents", "pkg.deps"])
@@ -1089,6 +1193,8 @@ def test_a_tier_s_full_run_and_collection_are_exact(tmp_path: Path) -> None:
             "--t",
             "-q",
             "--tb=short",
+            "-p",
+            testing.__name__,
             "--durations=20",
             "--p",
             "-m",
@@ -1122,7 +1228,9 @@ def test_a_full_run_without_testmon_or_progress_args_adds_none(
     assert tools.calls == [
         [
             *(*head, sys.executable, "-m", "pytest", "-n=3"),
-            *("--no-cov", "-q", "--tb=short", "--durations=20", "-m", "ci_smoke"),
+            *("--no-cov", "-q", "--tb=short"),
+            *("-p", testing.__name__),
+            *("--durations=20", "-m", "ci_smoke"),
         ],
     ]
 

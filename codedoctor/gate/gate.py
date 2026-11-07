@@ -219,6 +219,46 @@ def workers(name: str, *, environ: Mapping[str, str]) -> int:
     return default_workers(environ=environ)
 
 
+def scope(name: str, *, environ: Mapping[str, str]) -> int:
+    """Resolve a hook's scope: exact is -1, sidecar is 0, affected is positive.
+
+    A non-granular ``PRECOMMIT_SCOPE`` overrides every individual setting.
+    Otherwise ``PRECOMMIT_SCOPE_<HOOK_ID>`` overrides the hook's default.
+
+    Args:
+      name: Hook ID, with hyphens normalized to underscores in its variable.
+      environ: Environment holding the scope overrides.
+
+    Returns:
+      depth: -1 for exact, 0 for sidecar, or the positive dependency depth.
+
+    Raises:
+      ValueError: A selected setting is not exact, sidecar, or affected:N.
+
+    """
+    variable = "PRECOMMIT_SCOPE"
+    value = environ.get(variable, "granular")
+    if value == "granular":
+        variable = f"PRECOMMIT_SCOPE_{name.replace('-', '_').upper()}"
+        default = (
+            "affected:3"
+            if name in {"ty-check", "pyrefly-check", "basedpyright"}
+            else "sidecar"
+            if name in {"pytest", "mutation"}
+            else "exact"
+        )
+        value = environ.get(variable, default)
+    if value == "exact":
+        return -1
+    if value == "sidecar":
+        return 0
+    if value.startswith("affected:") and (depth := positive(value[9:])):
+        return depth
+    raise ValueError(
+        f"{variable}: invalid scope {value!r}; use exact, sidecar, affected:N",
+    )
+
+
 def positive(value: str | None) -> int:
     """Return ``value`` as a positive integer, or 0 for anything else.
 
@@ -315,25 +355,36 @@ def walk(
       found: One path or nodeid per entry.
 
     """
-    if not files or not hops or dependents is None:
+    if not files or hops <= 0 or skipped(context.environ, "harvest-affected"):
+        return []
+    if dependents is None:
+        sys.stderr.write("scope: dependency graph unavailable; using sidecars\n")
         return []
     with argfile(files) as named:
-        found = context.output(
-            [
-                sys.executable,
-                "-m",
-                dependents,
-                "--emit",
-                emit,
-                "--depth",
-                str(hops),
-                "--workers",
-                str(workers),
-                "--",
-                named,
-            ],
+        found = (
+            context.output(
+                [
+                    sys.executable,
+                    "-m",
+                    dependents,
+                    "--emit",
+                    emit,
+                    "--depth",
+                    str(hops),
+                    "--workers",
+                    str(workers),
+                    "--",
+                    named,
+                ],
+            )
+            or ""
         )
-    return [] if found is None else found.splitlines()
+    if not found:
+        sys.stderr.write(
+            "scope: dependency graph returned no selection; using sidecars\n",
+        )
+        return []
+    return found.splitlines()
 
 
 def add_dependents(parser: argparse.ArgumentParser) -> None:

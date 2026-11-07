@@ -583,8 +583,8 @@ def test_a_cli_index_without_a_backbone_is_refused(tmp_path: Path) -> None:
     problem = codegraph_sync.link_cli_index(root, caches=tmp_path / "caches")
 
     assert problem == (
-        "No CodeGraph backbone to seed from; run --refresh, or commit once "
-        "with PRECOMMIT_CODEGRAPH_PYTEST set."
+        "No CodeGraph backbone to seed from; run --refresh, or run hooks "
+        "with PRECOMMIT_SCOPE=affected:1."
     )
     assert not (root / ".codegraph").exists()
     overlay = backbone.overlay_database(tmp_path / "caches", root=root)
@@ -632,28 +632,47 @@ def test_an_installed_cli_is_not_reinstalled(tmp_path: Path) -> None:
     assert tools.ran("npm") == []
 
 
-@pytest.mark.parametrize("value", ["0", "00", "", "false", "01", "-1", " 1 "])
-def test_a_disabled_opt_in_is_off(value: str) -> None:
-    """``PRECOMMIT_CODEGRAPH=0`` once re-synced a 417 MB index every commit."""
-    assert not codegraph_sync.opted_in(
-        {"PRECOMMIT_CODEGRAPH_PYTEST": value, "PRECOMMIT_CODEGRAPH_TYPECHECK": value},
-    )
+@pytest.mark.parametrize("value", ["exact", "sidecar"])
+def test_narrow_global_scopes_need_no_sync(value: str) -> None:
+    assert not codegraph_sync.opted_in({"PRECOMMIT_SCOPE": value})
+
+
+def test_default_type_scopes_need_sync() -> None:
+    assert codegraph_sync.opted_in({})
 
 
 @pytest.mark.parametrize(
-    "variable",
-    ["PRECOMMIT_CODEGRAPH_PYTEST", "PRECOMMIT_CODEGRAPH_TYPECHECK"],
+    "name",
+    ["TY_CHECK", "PYREFLY_CHECK", "BASEDPYRIGHT", "PYTEST", "MUTATION"],
 )
-def test_either_gate_opting_in_is_on(variable: str) -> None:
-    """A gate reading a never-synced index silently falls back to its floor."""
-    assert codegraph_sync.opted_in({variable: "1"})
+def test_each_affected_hook_needs_sync(name: str) -> None:
+    environ = {
+        f"PRECOMMIT_SCOPE_{hook}": "sidecar"
+        for hook in (
+            "TY_CHECK",
+            "PYREFLY_CHECK",
+            "BASEDPYRIGHT",
+            "PYTEST",
+            "MUTATION",
+        )
+    }
+    environ[f"PRECOMMIT_SCOPE_{name}"] = "affected:2"
+    assert codegraph_sync.opted_in(environ)
+
+
+@pytest.mark.parametrize(
+    "skip",
+    ["harvest-affected", "ty-check,pyrefly-check,basedpyright"],
+)
+def test_skipped_graph_consumers_need_no_sync(skip: str) -> None:
+    assert not codegraph_sync.opted_in({"SKIP": skip})
 
 
 def _main(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     *argv: str,
-    opt_in: str = "1",
+    opt_in: str = "affected:1",
 ) -> list[str]:
     """Run ``main`` in ``tmp_path``; return each entry point's call, as it saw it."""
     called: list[str] = []
@@ -690,8 +709,8 @@ def _main(
     monkeypatch.setattr(os, "umask", umask)
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("PRECOMMIT_CODEGRAPH_PYTEST", opt_in)
-    monkeypatch.delenv("PRECOMMIT_CODEGRAPH_TYPECHECK", raising=False)
+    monkeypatch.setenv("PRECOMMIT_SCOPE", opt_in)
+    monkeypatch.delenv("SKIP", raising=False)
     monkeypatch.setattr(codegraph_sync, "sync", sync)
     monkeypatch.setattr(codegraph_sync, "refresh", refresh)
     monkeypatch.setattr(codegraph_sync, "link_cli_index", link_cli_index)
@@ -703,7 +722,10 @@ def _main(
     return called
 
 
-@pytest.mark.parametrize(("opt_in", "synced"), [("1", True), ("0", False)])
+@pytest.mark.parametrize(
+    ("opt_in", "synced"),
+    [("affected:1", True), ("sidecar", False)],
+)
 def test_the_hook_reports_a_problem_and_still_passes(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

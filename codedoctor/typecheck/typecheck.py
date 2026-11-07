@@ -1,13 +1,13 @@
 """Run one type checker once over the files pre-commit hands its spool.
 
-``ty-check`` hands the files it checked to ``pyrefly-check``, so the graph walk
-runs once; ``pyrefly-check`` widens on its own only when ``ty-check`` was
-skipped. Every checker drops what ``[tool.pyrefly] project-excludes`` names.
+Each checker resolves its own scope independently, so per-hook overrides
+never inherit another checker's selection. Every checker drops what
+``[tool.pyrefly] project-excludes`` names.
 
 Checkers:
   ty-check       ty over the spooled files, minus the project's excludes.
-  pyrefly-check  pyrefly over the files ty-check checked, or its own spool.
-  basedpyright   basedpyright over its spool, widened as ty-check widens.
+  pyrefly-check  pyrefly over its spool at its resolved scope.
+  basedpyright   basedpyright over its spool at its resolved scope.
 
 Examples:
   python -m codedoctor.gate spool ty-check a.py b.py
@@ -24,7 +24,8 @@ import argparse
 import shutil
 import sys
 
-from codedoctor.gate import gate, spool
+from codedoctor.gate import gate
+from codedoctor.lib import sidecars
 from codedoctor.typecheck import scope
 
 
@@ -53,19 +54,16 @@ def typecheck(
     context: gate.Context,
     dependents: str | None,
     fixer: str | None,
-    when: str | None = None,
 ) -> int:
     """Run type checker ``name`` once over its spool.
 
     Args:
       name: ``ty-check``, ``pyrefly-check`` or ``basedpyright``.
       context: What the gate reads and runs.
-      dependents: Module whose CLI widens files to their dependents
-        ``PRECOMMIT_CODEGRAPH_TYPECHECK`` hops away; None checks only the
-        spooled files.
+      dependents: Module whose CLI widens files under affected:N scope;
+        None retains sidecars without a graph.
       fixer: Module that runs the checker and deletes each unnecessary
         ``assert isinstance``; None runs the checker alone.
-      when: Variable that must hold a positive integer; None always runs.
 
     Returns:
       exit_code: The checker's; 0 when skipped or nothing to check; 1 when its
@@ -73,28 +71,16 @@ def typecheck(
 
     """
     spooled = gate.drained(name, context=context)
-    if when is not None and not gate.positive(context.environ.get(when)):
-        return 0
     if spooled is None:
         return gate.unspooled(name)
     count = gate.workers(name, environ=context.environ)
-    handed = (
-        gate.drained("typecheck-checked", context=context)
-        if name == "pyrefly-check"
-        else None
+    files = _typechecked(
+        context,
+        files=spooled,
+        dependents=dependents,
+        workers=count,
+        depth=gate.scope(name, environ=context.environ),
     )
-    files = (
-        _typechecked(context, files=spooled, dependents=dependents, workers=count)
-        if handed is None
-        else handed
-    )
-    if name == "ty-check":
-        spool.write(
-            context.directory,
-            gate="typecheck-checked",
-            key=context.key,
-            paths=files,
-        )
     if not files:
         return 0
     if fixer is not None:
@@ -112,10 +98,9 @@ def typecheck(
                     "--typechecker",
                     "pyrefly",
                     *(
-                        ["basedpyright"]
-                        if name == "basedpyright"
-                        or gate.positive(context.environ.get("PRECOMMIT_BASEDPYRIGHT"))
-                        else []
+                        []
+                        if gate.skipped(context.environ, "basedpyright")
+                        else ["basedpyright"]
                     ),
                     "--",
                     named,
@@ -138,7 +123,6 @@ class Flags(Protocol):
     command: str
     dependents: str | None
     fixer: str | None
-    when: str | None
 
 
 def _parse_args(
@@ -151,11 +135,6 @@ def _parse_args(
         checker = commands.add_parser(name, help=f"Run {name} over its spool.")
         checker.set_defaults(handler=_check, fixer=None)
         gate.add_dependents(checker)
-        checker.add_argument(
-            "--when",
-            metavar="VARIABLE",
-            help="Run only when this variable holds a positive integer.",
-        )
         if name != "ty-check":
             checker.add_argument(
                 "--fixer",
@@ -171,7 +150,6 @@ def _check(flags: Flags, context: gate.Context) -> int:
         context=context,
         dependents=flags.dependents,
         fixer=flags.fixer,
-        when=flags.when,
     )
 
 
@@ -181,17 +159,29 @@ def _typechecked(
     files: Sequence[str],
     dependents: str | None,
     workers: int,
+    depth: int,
 ) -> list[str]:
-    """Return the type checkers' files: ``files`` widened, minus excludes."""
+    """Return the checker's resolved scope, minus project excludes."""
+    own = (
+        list(files)
+        if depth < 0
+        else sorted(
+            {
+                p.as_posix()
+                for f in files
+                for p in sidecars.related(f, root=context.root)
+            },
+        )
+    )
     widened = gate.walk(
         context,
         files=files,
         dependents=dependents,
-        hops=gate.positive(context.environ.get("PRECOMMIT_CODEGRAPH_TYPECHECK")),
+        hops=depth,
         emit="files",
         workers=workers,
     )
-    return scope.kept(widened or files, excludes=scope.excludes(context.root))
+    return scope.kept([*own, *widened], excludes=scope.excludes(context.root))
 
 
 def _tool(name: str) -> str:

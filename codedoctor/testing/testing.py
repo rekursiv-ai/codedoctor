@@ -26,14 +26,36 @@ import sys
 import tempfile
 import time
 
-from codedoctor.gate import gate
-from codedoctor.lib import sidecars
-from codedoctor.testing import coverage_summary, listing
-from codedoctor.testing.tiers import TIERS, Tier
+from _pytest.config import hookimpl
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Generator, Sequence
+
+    from codedoctor.gate import gate
+    from codedoctor.lib import sidecars
+    from codedoctor.testing import coverage_summary, listing, tiers
+    from codedoctor.testing.tiers import Tier
+else:
+    from wrapt import lazy_import
+
+    # Pytest loads this plugin before coverage starts; defer the gate's imports.
+    gate = lazy_import("codedoctor.gate.gate")
+    sidecars = lazy_import("codedoctor.lib.sidecars")
+    coverage_summary = lazy_import("codedoctor.testing.coverage_summary")
+    listing = lazy_import("codedoctor.testing.listing")
+    tiers = lazy_import("codedoctor.testing.tiers")
+
+
+@hookimpl(wrapper=True)
+def pytest_report_teststatus() -> Generator[
+    None,
+    tuple[str, str, str | tuple[str, dict[str, bool]]],
+    tuple[str, str, str],
+]:
+    """Keep outcome counts without per-test progress characters or words."""
+    category, _, _ = yield
+    return category, "", ""
 
 
 def main() -> int:
@@ -59,9 +81,9 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
 
     Args:
       context: What the gate reads and runs.
-      dependents: Module whose CLI names the tests reaching the spooled files
-        ``PRECOMMIT_CODEGRAPH_PYTEST`` hops away. They run in a second pytest,
-        unmeasured; the pairs run first, measured per test for ``coverage-floor``.
+      dependents: Module whose CLI names tests within the resolved affected:N
+        scope. They run in a second pytest, unmeasured; the selected own tests
+        run first, measured per test for ``coverage-floor``.
         Both runs keep the project's default marker selection.
 
     Returns:
@@ -275,6 +297,8 @@ def tier(spec: Tier, *, context: gate.Context, plugin: str | None) -> int:
             *shlex.split(environ.get("PYTEST_TESTMON_ARGS", "")),
             "-q",
             "--tb=short",
+            "-p",
+            __name__,
             *spec.extra,
             *shlex.split(environ.get("PYTEST_PROGRESS_ARGS", "")),
             *marker,
@@ -310,7 +334,7 @@ def _parse_args(
     floored.set_defaults(handler=_floor)
     suite = commands.add_parser("tier", help="Run one whole-suite pytest tier.")
     suite.set_defaults(handler=_run_tier)
-    suite.add_argument("tier", choices=sorted(TIERS), help="The tier.")
+    suite.add_argument("tier", choices=sorted(tiers.TIERS), help="The tier.")
     suite.add_argument(
         "--plugin",
         metavar="MODULE",
@@ -329,7 +353,7 @@ def _floor(flags: Flags, context: gate.Context) -> int:
 
 
 def _run_tier(flags: Flags, context: gate.Context) -> int:
-    return tier(TIERS[flags.tier], context=context, plugin=flags.plugin)
+    return tier(tiers.TIERS[flags.tier], context=context, plugin=flags.plugin)
 
 
 # The own tests are what ``coverage-floor`` floors a file by, so the graph may widen the
@@ -342,18 +366,22 @@ def _selected(
     workers: int,
 ) -> tuple[list[str], list[str]]:
     """Return each file's own tests, then the graph's tests in no own file."""
+    depth = gate.scope("pytest", environ=context.environ)
+    selected = (
+        {Path(path) for path in files}
+        if depth < 0
+        else {
+            file for path in files for file in sidecars.related(path, root=context.root)
+        }
+    )
     own = sorted(
-        {
-            test.as_posix()
-            for path in files
-            for test in sidecars.paired(path, root=context.root)
-        },
+        path.as_posix() for path in selected if sidecars.is_test(context.root / path)
     )
     walked = gate.walk(
         context,
         files=files,
         dependents=dependents,
-        hops=gate.positive(context.environ.get("PRECOMMIT_CODEGRAPH_PYTEST")),
+        hops=depth,
         emit="nodeids",
         workers=workers,
     )
@@ -407,6 +435,8 @@ def _run_pytest(
                 *(["-n", str(count)] if spread else serial),
                 "-q",
                 "--tb=short",
+                "-p",
+                __name__,
                 *marker,
                 *narrowed,
                 named,
