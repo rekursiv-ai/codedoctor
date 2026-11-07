@@ -101,7 +101,7 @@ import tomlkit
 
 from codedoctor.affected.affected import harvest
 from codedoctor.gate.gate import positive
-from codedoctor.lib import pyproject_flags
+from codedoctor.lib import pyproject_flags, sidecars
 from codedoctor.lib.files import tempclaim, walk
 from codedoctor.lib.kernel_pins import kernel_pins
 from codedoctor.lib.worker_count import capped_workers, default_workers, worker_count
@@ -1891,7 +1891,7 @@ def _mutable_paths(
         path
         for path in dict.fromkeys(Path(named).as_posix() for named in files)
         if path.endswith(".py")
-        and not _is_test(path)
+        and not sidecars.is_test(root / path)
         and not any(
             part in {"third_party", "typings", ".export"} for part in Path(path).parts
         )
@@ -2006,18 +2006,6 @@ def _skip_unselected(path: Path, *, name: str, filters: tuple[str, ...]) -> None
                 f"{text}{joiner}# pragma: no mutate block{lines[index][len(text) :]}"
             )
     path.write_bytes("\n".join(lines).encode())
-
-
-def _is_test(path: str) -> bool:
-    """Return whether ``path`` is a test module rather than a source one."""
-    name = Path(path).name
-    # A hand-run ``*_parity.py`` script is a test no other test pairs, so the shard
-    # that mutated one failed with "no paired tests found".
-    return (
-        name == "conftest.py"
-        or name.endswith(("_test.py", "_parity.py"))
-        or name.startswith("test_")
-    )
 
 
 # Mutmut names only top-level functions and direct methods. Closures belong

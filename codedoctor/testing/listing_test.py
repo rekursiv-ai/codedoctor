@@ -571,6 +571,17 @@ def test_a_files_only_listing_deselects_nothing(tmp_path: Path) -> None:
     assert config.hook.deselected == []
 
 
+def test_no_listing_keeps_every_test_of_a_split_file(tmp_path: Path) -> None:
+    """Without ``--test-files`` the filter is inert, whatever the nodeids say."""
+    config = _ItemConfig(tmp_path, test_files=None)
+    items = [_Item("s_test.py::a"), _Item("s_test.py::b[1]")]
+
+    listing.pytest_collection_modifyitems(config, items)
+
+    assert [item.nodeid for item in items] == ["s_test.py::a", "s_test.py::b[1]"]
+    assert config.hook.deselected == []
+
+
 @pytest.mark.cli_python_subprocess
 def test_the_shards_of_a_split_file_run_each_of_its_tests_once(tmp_path: Path) -> None:
     (tmp_path / "split_test.py").write_text(

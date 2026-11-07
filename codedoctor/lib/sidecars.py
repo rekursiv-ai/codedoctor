@@ -1,0 +1,117 @@
+"""Where a module's tests live: the one pairing every gate selects tests by.
+
+A source ``pkg/sub/mod.py`` pairs with ``mod_test.py`` or ``test_mod.py`` beside
+it, in a ``tests/`` beside it, or in a root ``tests/`` mirroring its path below
+the top-level package (``tests/sub/mod_test.py``), the layout a published
+package keeps its tests in. A test file pairs with the same set, so its
+siblings under another spelling run with it.
+
+A source's split tests -- ``mod_<part>_test.py`` or ``test_mod_<part>.py``,
+beside it or in its ``tests/`` -- are its tests too, unless a longer module
+(``mod_<part>.py``) owns that name.
+
+A test module is named as pytest collects one -- ``conftest.py``, ``*_test.py``,
+``test_*.py`` -- or a hand-run ``*_parity.py`` check against a real system, or is
+another suite run by hand, told by the tests it defines.
+Neither is a source a test must cover.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import ast
+
+
+def candidates(path: str | Path) -> tuple[Path, ...]:
+    """Return every repo-relative path a test paired with ``path`` may have.
+
+    Args:
+      path: A repo-relative source or test module.
+
+    Returns:
+      candidates: The paths to probe, nearest first; none need exist.
+
+    """
+    source = Path(path)
+    stem = source.stem.removesuffix("_test").removeprefix("test_")
+    names = (f"{stem}_test.py", f"test_{stem}.py")
+    folders = [source.parent, source.parent / "tests"]
+    if len(source.parts) > 1 and source.parts[0] != "tests":
+        folders.append(Path("tests", *source.parts[1:-1]))
+    return tuple(folder / name for folder in folders for name in names)
+
+
+def paired(path: str | Path, *, root: Path | None = None) -> list[Path]:
+    """Return the tests of ``path`` that exist: its sidecars, then a source's splits.
+
+    Args:
+      path: A repo-relative source or test module.
+      root: The directory ``path`` is relative to; the cwd when None.
+
+    Returns:
+      tests: Existing repo-relative test files, in probe order. A test pairs
+        with its sidecars alone; a changed test reruns itself, never its
+        module's splits.
+
+    """
+    base = root or Path()
+    source = Path(path)
+    found = [
+        candidate for candidate in candidates(source) if (base / candidate).is_file()
+    ]
+    stem = source.stem
+    if stem.endswith("_test") or stem.startswith("test_"):
+        return found
+    owners = [
+        module.stem
+        for module in (base / source.parent).glob(f"{stem}_*.py")
+        if module.is_file() and not module.stem.endswith("_test")
+    ]
+    for directory in (source.parent, source.parent / "tests"):
+        for pattern in (f"{stem}_*_test.py", f"test_{stem}_*.py"):
+            for match in sorted((base / directory).glob(pattern)):
+                name = match.stem.removeprefix("test_")
+                if match.is_file() and not any(
+                    name == owner or name.startswith(f"{owner}_") for owner in owners
+                ):
+                    found.append(directory / match.name)
+    return found
+
+
+def is_test(path: str | Path) -> bool:
+    """Return whether ``path`` is a test module rather than a source one.
+
+    Args:
+      path: A module on disk, or a name; a name that is not a file is judged by
+        its name alone.
+
+    Returns:
+      test: Whether it is named as a test module, or defines a top-level
+        ``test_*`` function or ``Test*`` class.
+
+    """
+    module = Path(path)
+    name = module.name
+    # A hand-run ``*_parity.py`` script is a test no other test pairs, whether or not
+    # it defines a pytest test.
+    if (
+        name == "conftest.py"
+        or name.endswith(("_test.py", "_parity.py"))
+        or name.startswith("test_")
+    ):
+        return True
+    if not module.is_file():
+        return False
+    try:
+        tree = ast.parse(module.read_bytes())
+    except SyntaxError:
+        return False
+    return any(
+        (
+            isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+            and node.name.startswith("test_")
+        )
+        or (isinstance(node, ast.ClassDef) and node.name.startswith("Test"))
+        for node in tree.body
+    )

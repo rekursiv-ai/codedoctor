@@ -14,14 +14,39 @@ generated fresh, exactly as in a session of their own.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Protocol
+
 import pytest
+
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 
 _SEEN = pytest.StashKey[set[int]]()
 
 
+class _Config(Protocol):
+    @property
+    def stash(self) -> pytest.Stash: ...
+
+
+class _Definition(Protocol):
+    def iter_markers(self, name: str) -> Iterable[pytest.Mark]: ...
+
+
+class _Metafunc(Protocol):
+    """The part of ``pytest.Metafunc`` the hook reads."""
+
+    @property
+    def config(self) -> _Config: ...
+
+    @property
+    def definition(self) -> _Definition: ...
+
+
 @pytest.hookimpl(tryfirst=True)
-def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+def pytest_generate_tests(metafunc: _Metafunc) -> None:
     """Forget ids an earlier session generated, once per mark per session.
 
     Args:

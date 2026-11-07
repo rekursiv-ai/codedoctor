@@ -141,6 +141,22 @@ def test_every_new_rule_is_registered_and_satisfies_the_protocol() -> None:
     assert "fmt-directive" in names
 
 
+@pytest.mark.parametrize("source", ["", "def broken(:\n"], ids=["empty", "unparsed"])
+@pytest.mark.parametrize(
+    "rule",
+    houselint.default_rules(),
+    ids=[rule.name for rule in houselint.default_rules()],
+)
+def test_every_rule_passes_and_leaves_a_file_with_no_code(
+    tmp_path: Path,
+    rule: Rule,
+    source: str,
+) -> None:
+    """A file that does not parse is ruff's to report; no rule guesses at it."""
+    assert _findings(tmp_path, rule, source) == ()
+    assert _fixed(tmp_path, rule, source) is None
+
+
 @pytest.mark.parametrize(
     ("rule", "source", "line"),
     [
@@ -10449,6 +10465,216 @@ def test_tensor_guard_continues_past_nonvalidation_if(tmp_path: Path) -> None:
             ),
         ),
     ]
+
+
+# -- sidecar coverage of branches only the dispatcher tests reached -----------
+
+
+def test_forwarder_helper_defers_a_forwarder_whose_call_another_def_holds(
+    tmp_path: Path,
+) -> None:
+    """Deleting ``_outer`` would cut ``_inner``'s rewritten call; one waits a run."""
+    source = (
+        "def run(a: int) -> int:\n    return _outer(a)\n\n\n"
+        "def _inner(x: int):\n    return abs(x)\n\n\n"
+        "def _outer(y: int):\n    return _inner(y)\n"
+    )
+    fixed = _fixed(tmp_path, ForwarderHelperRule(), source)
+    assert fixed is not None
+    assert fixed.count("def _") == 1
+
+
+def test_forwarder_helper_leaves_a_call_from_a_coroutine(tmp_path: Path) -> None:
+    source = (
+        "async def run(a: int) -> int:\n    return _abs(a)\n\n\n"
+        "def _abs(x: int):\n    return abs(x)\n"
+    )
+    assert not _findings(tmp_path, ForwarderHelperRule(), source)
+
+
+def test_forwarder_helper_leaves_a_def_with_more_than_a_return(tmp_path: Path) -> None:
+    source = (
+        "def run(a: int) -> int:\n    return _abs(a)\n\n\n"
+        "def _abs(x: int):\n    y = x\n    return abs(y)\n"
+    )
+    assert not _findings(tmp_path, ForwarderHelperRule(), source)
+
+
+def test_forwarder_helper_reads_an_unparseable_string_argument_as_text(
+    tmp_path: Path,
+) -> None:
+    """``"("`` is no annotation, so it cannot state the declared return type."""
+    source = (
+        "def run(a: int) -> Foo:\n    return _make(a)\n\n\n"
+        'def _make(x: int) -> Foo:\n    return build(x, "(")\n'
+    )
+    assert not _findings(tmp_path, ForwarderHelperRule(), source)
+
+
+def test_forwarder_helper_scans_past_importers_of_another_module(
+    tmp_path: Path,
+) -> None:
+    """``other.py`` names the stem ``mod`` but imports nothing of ``pkg.mod``."""
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+    (tmp_path / "other.py").write_text("import mod_tools\n\n\nx = _abs\n")
+    (tmp_path / "latin1.py").write_bytes(b"x = '\xff'\n")
+    source = (
+        "def run(a: int, b: int) -> int:\n    return _abs(a) + _abs(b)\n\n\n"
+        "def _abs(x: int):\n    return abs(x)\n"
+    )
+    findings = _findings(tmp_path, ForwarderHelperRule(), source, name="pkg/mod.py")
+    assert [f.line for f in findings] == [5]
+
+
+def test_single_use_helper_leaves_a_wrapped_f_string(tmp_path: Path) -> None:
+    """``ast.unparse`` would re-quote the f-string to reflow it onto one line."""
+    source = (
+        "def run(a: int) -> str:\n    return _label(a)\n\n\n"
+        'def _label(x: int) -> str:\n    return " ".join(\n        [f"{x}", "y"],\n    )\n'
+    )
+    assert not _findings(tmp_path, SingleUseHelperRule(), source)
+
+
+def test_annotation_import_counts_a_cast_keyword_as_a_runtime_use(
+    tmp_path: Path,
+) -> None:
+    source = (
+        "from typing import cast\n\nfrom torch import Tensor\n\n\n"
+        'def f(x: object) -> object:\n    return cast("Tensor", val=Tensor)\n'
+    )
+    assert not _findings(tmp_path, AnnotationImportRule(), source)
+
+
+def test_annotation_import_skips_an_unparseable_string_annotation(
+    tmp_path: Path,
+) -> None:
+    source = (
+        "from __future__ import annotations\n\nfrom torch import Tensor\n\n\n"
+        "def f(x: Tensor, y: '(') -> None:\n    del x, y\n"
+    )
+    assert [f.line for f in _findings(tmp_path, AnnotationImportRule(), source)] == [3]
+
+
+@pytest.mark.parametrize(
+    ("expr", "literal"),
+    [("-7", True), ("-x", False), ("{1: 2}", True), ("{1: x}", False)],
+)
+def test_literal_value_reads_negation_and_dicts(expr: str, *, literal: bool) -> None:
+    assert _is_literal_value(ast.parse(expr, mode="eval").body) is literal
+
+
+@pytest.mark.parametrize(
+    ("value", "declarative"),
+    [
+        ("-B", True),
+        ("-f()", False),
+        ("B + 1", True),
+        ("B + f()", False),
+        ("B or C", True),
+        ("B or f()", False),
+        ("B if C else D", True),
+        ("B if f() else D", False),
+        ("B < C", False),
+    ],
+)
+def test_module_side_effects_judges_compound_values_by_their_parts(
+    tmp_path: Path,
+    value: str,
+    *,
+    declarative: bool,
+) -> None:
+    findings = _messages(tmp_path, ModuleSideEffectsRule(), f"X = {value}\n")
+    assert (findings == []) is declarative
+
+
+def test_staticmethod_fix_finds_the_paren_below_a_continued_def(
+    tmp_path: Path,
+) -> None:
+    source = "class A:\n    @staticmethod\n    def f \\\n(*args):\n        return 1\n"
+
+    assert StaticMethodRule().fix(_unit(tmp_path, source)) == (
+        "class A:\n    @classmethod\n    def f \\\n(cls, *args):\n        return 1\n"
+    )
+
+
+def test_cli_fix_of_a_polyglot_never_written_to_disk(tmp_path: Path) -> None:
+    """The mode is a side effect on disk; a unit with no file has none to set."""
+    body = _HEAD + _PINNED + _EXEC + "\n'''\nx = 1\n"
+    unit = Unit(path=tmp_path / "absent.py", source=body, kind="python")
+
+    fixed = CliShapeRule().fix(unit)
+
+    assert fixed is not None
+    assert fixed.endswith("# vim: ft=python\n")
+    assert not unit.path.exists()
+
+
+def test_cli_fix_leaves_a_wrapped_description(tmp_path: Path) -> None:
+    body = (
+        "import argparse\n\n"
+        "def main() -> int:\n"
+        "    argparse.ArgumentParser(\n"
+        "        description=__doc__.strip(\n"
+        '            " ",\n'
+        "        ),\n"
+        "    )\n"
+        "    return 0\n"
+    )
+    findings, fixed = _cli(tmp_path, body)
+    assert any("description=" in message for _, message in findings)
+    assert fixed is None
+
+
+def test_nested_try_does_not_look_inside_a_def_in_a_try(tmp_path: Path) -> None:
+    """The inner def's ``try`` runs when it is called, outside the outer handler."""
+    source = (
+        "try:\n"
+        "    def f():\n"
+        "        try:\n            pass\n        except A:\n            pass\n"
+        "    class C:\n"
+        "        try:\n            pass\n        except A:\n            pass\n"
+        "except B:\n    pass\n"
+    )
+    assert not _findings(tmp_path, NestedTryRule(), source)
+
+
+def test_dotted_import_ignores_chains_rooted_in_a_call(tmp_path: Path) -> None:
+    """``f().a.b`` names no module, nor does ``setattr(f().os, "path", v)``."""
+    plain = "import os.path\n\nx = os.path.join('a')\n"
+    rooted = (
+        plain + "y = f().attr\nz = f().a.b\n"
+        'setattr(f().os, "path", 1)\nsetattr(f().a.os, "path", 1)\n'
+    )
+    plain_fixed = _fixed(tmp_path, DottedImportRule(), plain)
+    assert plain_fixed is not None
+    assert _fixed(tmp_path, DottedImportRule(), rooted) == (
+        plain_fixed + rooted.removeprefix(plain)
+    )
+
+
+def test_dotted_import_beside_another_binder_rewrites_reads_it_precedes(
+    tmp_path: Path,
+) -> None:
+    """A lazy annotation never runs; a later comprehension runs after the import."""
+    source = (
+        "from __future__ import annotations\nimport a\nimport a.b\n"
+        "v: a.b.Y = 1\nw = [a.b.Z for x in y]\nprint(a)\n"
+    )
+    assert _fixed(tmp_path, DottedImportRule(), source) == (
+        "from __future__ import annotations\nimport a\nfrom a import b\n"
+        "v: b.Y = 1\nw = [b.Z for x in y]\nprint(a)\n"
+    )
+
+
+def test_a_node_outside_every_statement_is_not_an_annotation() -> None:
+    tree = ast.parse("x: int = 1\n")
+    assert not houselint_rules._in_annotation(tree, parents={})
+
+
+def test_the_module_itself_is_not_at_module_scope() -> None:
+    """Only a node the module holds is at its scope; the module has no parent."""
+    tree = ast.parse("x = 1\n")
+    assert not houselint_rules._is_module_scope(tree, {})
 
 
 if __name__ == "__main__":

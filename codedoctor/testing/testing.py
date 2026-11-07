@@ -1,12 +1,14 @@
 """Run the tests a change reaches, or one whole-suite pytest tier.
 
 Commands:
-  pytest     The tests paired with the spooled files, then their coverage.
-  tier NAME  One whole-suite pytest tier from ``TIERS``.
+  pytest          The tests paired with the spooled files, then their coverage.
+  coverage-floor  Floor each spooled file by its own tests, from ``pytest``'s run.
+  tier NAME       One whole-suite pytest tier from ``TIERS``.
 
 Examples:
   python -m codedoctor.gate spool pytest a.py b.py
   python -m codedoctor.testing pytest
+  python -m codedoctor.testing coverage-floor
   python -m codedoctor.testing tier pytest-global
 
 """
@@ -14,16 +16,20 @@ Examples:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Final, Protocol, cast
 
 import argparse
+import contextlib
 import shlex
+import shutil
 import sys
 import tempfile
+import time
 
 from codedoctor.gate import gate
+from codedoctor.lib import sidecars
 from codedoctor.testing import coverage_summary, listing
-from codedoctor.testing.tiers import TIERS, Tier
+from codedoctor.testing.tiers import RUNNABLE, TIERS, Tier
 
 
 if TYPE_CHECKING:
@@ -54,8 +60,9 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
     Args:
       context: What the gate reads and runs.
       dependents: Module whose CLI names the tests reaching the spooled files
-        ``PRECOMMIT_CODEGRAPH_PYTEST`` hops away; the pairs remain the fallback
-        when it names none.
+        ``PRECOMMIT_CODEGRAPH_PYTEST`` hops away. They run in a second pytest at
+        the project's default tiers, unmeasured; the pairs always run first,
+        every runnable tier, measured per test for ``coverage-floor``.
 
     Returns:
       exit_code: pytest's, 0 for an empty collection, or the coverage summary's;
@@ -66,21 +73,26 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
     files = gate.drained(name, context=context)
     if files is None:
         return gate.unspooled(name)
+    # Until this run's coverage replaces it, the hand-off says why there is none,
+    # for ``coverage-floor`` to print. Absent means ``pytest`` never ran, as under
+    # ``SKIP``; an earlier run's data never survives into this one.
+    left = handoff(context)
+    left.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _drop_stale_handoffs(left.parent, now=time.time())
+    left.write_text("the pytest hook did not finish\n")
     count = gate.workers(name, environ=context.environ)
-    tests = _selected(context, files=files, dependents=dependents, workers=count)
-    if not tests:
+    own, extra = _selected(context, files=files, dependents=dependents, workers=count)
+    if not own and not extra:
+        left.write_text("the pytest hook found no tests\n")
         return 0
-    # Files, not nodeids: the threshold was measured in files, and dozens of
-    # nodeids from one file paid xdist's ~5s startup for nothing.
-    spread = len({test.partition("::")[0] for test in tests}) >= (
-        gate.positive(context.environ.get("SIDECAR_XDIST_MIN")) or 16
-    )
-    sources = [path for path in files if not _is_test(path)]
+    sources = [path for path in files if not sidecars.is_test(context.root / path)]
     directories = sorted({Path(path).parent.as_posix() for path in sources})
     measured = context.installed("pytest_cov")
     cov: list[str] = (
         [
             *(f"--cov={directory}" for directory in directories),
+            # Which test ran each line: ``coverage-floor`` counts a file's own.
+            "--cov-context=test",
             "--no-cov-on-fail",
             "--cov-fail-under=0",
             "--cov-report=term-missing:skip-covered"
@@ -96,36 +108,84 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
         # pragma: no mutate start -- any name in a private dir.
         data = Path(temp) / ".coverage"
         # pragma: no mutate end
-        # Files as arguments and the nodeids as a listing: once one nodeid
-        # argument points into a module that skips at module level, pytest
-        # drops every other argument and the gate passes on "1 skipped".
-        selection = Path(temp) / "selected.txt"
-        selection.write_text("".join(f"{test}\n" for test in tests))
-        files_run = sorted({test.partition("::")[0] for test in tests})
-        with gate.argfile([*cov, *files_run]) as named:
-            status = context.run(
-                [
-                    "env",
-                    f"COVERAGE_FILE={data}",
-                    sys.executable,
-                    "-m",
-                    "pytest",
-                    *(["-n", str(count)] if spread else []),
-                    "-q",
-                    "--tb=short",
-                    "-p",
-                    listing.__name__,
-                    f"--test-files={selection}",
-                    named,
-                ],
+        # The own tests run every runnable tier, database and slow included, and
+        # are measured: ``coverage-floor`` floors a file by them. The graph's
+        # further tests keep the project's default tiers, unmeasured: their
+        # import-time lines would land in the context the floor counts as own.
+        passes: list[tuple[list[str], list[str], list[str]]] = [
+            (own, ["-m", RUNNABLE], cov),
+            (extra, [], []),
+        ]
+        for index, (tests, marker, measuring) in enumerate(passes):
+            if not tests:
+                continue
+            status = _run_pytest(
+                context,
+                tests=tests,
+                marker=marker,
+                cov=measuring,
+                data=data,
+                listing_file=Path(temp) / f"selected-{index}.txt",
+                count=count,
             )
-        if status not in {0, 5}:
-            return status
+            if status not in {0, 5}:
+                left.write_text(f"pytest exited {status}\n")
+                return status
         if not cov or not data.is_file():
+            left.write_text(
+                "pytest passed but recorded no coverage"
+                + ("" if cov else ": pytest-cov is not installed")
+                + "\n",
+            )
             return 0
         below = coverage_summary.shortfall(sources, data=data)
+        shutil.move(data, left)
     sys.stderr.writelines(f"{line}\n" for line in below)
     return int(bool(below))
+
+
+def floor(context: gate.Context) -> int:
+    """Floor the ``coverage-floor`` spool's files from the ``pytest`` gate's run.
+
+    The tests run once, in ``pytest``; this reads the data it left, so skipping
+    ``pytest`` measures nothing here either.
+
+    Args:
+      context: What the gate reads and runs.
+
+    Returns:
+      exit_code: The floor's; 1 when the spool was never written.
+
+    """
+    name = "coverage-floor"
+    files = gate.drained(name, context=context)
+    if files is None:
+        return gate.unspooled(name)
+    data = handoff(context)
+    try:
+        if not files:
+            return 0
+        with gate.argfile(files) as named:
+            return context.run(
+                [sys.executable, "-m", _FLOOR, "--data", str(data), "--", named],
+            )
+    finally:
+        data.unlink(missing_ok=True)
+
+
+def handoff(context: gate.Context) -> Path:
+    """Return where this run's ``pytest`` gate leaves its coverage data."""
+    return context.directory / f"coverage.{context.key}"
+
+
+# A run whose ``coverage-floor`` never drains its hand-off -- ``SKIP=coverage-floor``
+# -- would leave one data file per run. Age, not key: a concurrent run's is live.
+_STALE_SEC: Final = 24 * 60 * 60
+
+
+# The floor imports coverage, which an export without pytest-cov lacks; named, not
+# imported, so this module still loads there.
+_FLOOR: Final = f"{__name__.rsplit('.', 2)[0]}.coverage_floor"
 
 
 def tier(spec: Tier, *, context: gate.Context, plugin: str | None) -> int:
@@ -245,6 +305,11 @@ def _parse_args(
     tests = commands.add_parser("pytest", help="Run the tests paired with the spool.")
     tests.set_defaults(handler=_test)
     gate.add_dependents(tests)
+    floored = commands.add_parser(
+        "coverage-floor",
+        help="Floor each spooled file by its own tests, from pytest's run.",
+    )
+    floored.set_defaults(handler=_floor)
     suite = commands.add_parser("tier", help="Run one whole-suite pytest tier.")
     suite.set_defaults(handler=_run_tier)
     suite.add_argument("tier", choices=sorted(TIERS), help="The tier.")
@@ -260,18 +325,32 @@ def _test(flags: Flags, context: gate.Context) -> int:
     return pytest(context, dependents=flags.dependents)
 
 
+def _floor(flags: Flags, context: gate.Context) -> int:
+    del flags
+    return floor(context)
+
+
 def _run_tier(flags: Flags, context: gate.Context) -> int:
     return tier(TIERS[flags.tier], context=context, plugin=flags.plugin)
 
 
+# The own tests are what ``coverage-floor`` floors a file by, so the graph may widen the
+# run but never replace them.
 def _selected(
     context: gate.Context,
     *,
     files: Sequence[str],
     dependents: str | None,
     workers: int,
-) -> list[str]:
-    """Return the tests for ``files``: the graph's, else each file's pairs."""
+) -> tuple[list[str], list[str]]:
+    """Return each file's own tests, then the graph's tests in no own file."""
+    own = sorted(
+        {
+            test.as_posix()
+            for path in files
+            for test in sidecars.paired(path, root=context.root)
+        },
+    )
     walked = gate.walk(
         context,
         files=files,
@@ -280,22 +359,66 @@ def _selected(
         emit="nodeids",
         workers=workers,
     )
-    if walked:
-        return walked
-    paired: set[str] = set()
-    for path in map(Path, files):
-        stem = path.stem.removesuffix("_test").removeprefix("test_")
-        paired.update(
-            candidate.as_posix()
-            for folder in (path.parent, path.parent / "tests")
-            for candidate in (folder / f"{stem}_test.py", folder / f"test_{stem}.py")
-            if (context.root / candidate).is_file()
-        )
-    return sorted(paired)
-
-
-def _is_test(path: str) -> bool:
-    name = Path(path).name
-    return (
-        name == "conftest.py" or name.endswith("_test.py") or name.startswith("test_")
+    owned = set(own)
+    return own, sorted(
+        {test for test in walked if test.partition("::")[0] not in owned},
     )
+
+
+def _run_pytest(
+    context: gate.Context,
+    *,
+    tests: Sequence[str],
+    marker: Sequence[str],
+    cov: Sequence[str],
+    data: Path,
+    listing_file: Path,
+    count: int,
+) -> int:
+    """Run one pytest over ``tests``, into ``data`` when ``cov``; return its status."""
+    # Files, not nodeids: the threshold was measured in files, and dozens of
+    # nodeids from one file paid xdist's ~5s startup for nothing.
+    spread = len({test.partition("::")[0] for test in tests}) >= (
+        gate.positive(context.environ.get("SIDECAR_XDIST_MIN")) or 16
+    )
+    # Serial needs ``--dist=no`` where xdist is installed: a ``--dist`` in addopts
+    # makes pytest-cov its xdist master, which records no per-test contexts.
+    serial = ["--dist=no"] if context.installed("xdist") else []
+    # Files as arguments and the nodeids as a listing: once one nodeid argument
+    # points into a module that skips at module level, pytest drops every other
+    # argument and the gate passes on "1 skipped". Whole files need no listing,
+    # and none is loaded then: a ``-p`` plugin imports before coverage starts, so
+    # every line it imports would read as never run.
+    files_run = sorted({test.partition("::")[0] for test in tests})
+    narrowed: list[str] = []
+    if any("::" in test for test in tests):
+        listing_file.write_text("".join(f"{test}\n" for test in tests))
+        narrowed = ["-p", listing.__name__, f"--test-files={listing_file}"]
+    with gate.argfile([*cov, *files_run]) as named:
+        return context.run(
+            [
+                "env",
+                f"COVERAGE_FILE={data}",
+                # Per-test contexts need it: sysmon stops reporting a line once
+                # seen, so a line first run at import has no test. Slower, so
+                # only where something is measured.
+                *(["COVERAGE_CORE=ctrace"] if cov else []),
+                sys.executable,
+                "-m",
+                "pytest",
+                *(["-n", str(count)] if spread else serial),
+                "-q",
+                "--tb=short",
+                *marker,
+                *narrowed,
+                named,
+            ],
+        )
+
+
+def _drop_stale_handoffs(directory: Path, *, now: float) -> None:
+    """Remove hand-offs in ``directory`` last written over a day before ``now``."""
+    for stale in directory.glob("coverage.*"):
+        with contextlib.suppress(FileNotFoundError):
+            if now - stale.stat().st_mtime > _STALE_SEC:
+                stale.unlink()

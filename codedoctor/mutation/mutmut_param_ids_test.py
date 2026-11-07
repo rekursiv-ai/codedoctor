@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import os
@@ -10,8 +11,11 @@ import sys
 
 import pytest
 
+from codedoctor.mutation import mutmut_param_ids
+
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 
@@ -82,6 +86,55 @@ def test_ids_from_one_session_select_tests_in_the_next(
     assert [
         line for line in completed.stdout.splitlines() if line.startswith("exit")
     ] == exits, completed.stdout + completed.stderr
+
+
+def test_each_session_forgets_cached_ids_once_per_mark() -> None:
+    """In-process twin of the subprocess test, which the unit tier never runs."""
+    source = pytest.mark.parametrize("v", [b"\x00"], ids=repr).mark
+    # How pytest stores a mark whose ids came from another: a class's mark
+    # reaches each method combined with the method's own.
+    combined = pytest.mark.parametrize.mark.combined_with(source)
+    bare = pytest.mark.parametrize("w", [1]).mark
+    marks = [combined, combined, bare]
+
+    for session in ("first", "second"):
+        config = _Config()
+        object.__setattr__(source, "_param_ids_generated", [f"{session}-cached"])
+        _generate(config, marks=marks)
+        assert source._param_ids_generated is None, session
+        # Pytest refills the cache; the same session must keep what it generated.
+        object.__setattr__(source, "_param_ids_generated", [f"{session}-fresh"])
+        _generate(config, marks=marks)
+        assert source._param_ids_generated == [f"{session}-fresh"]
+
+
+@dataclass(slots=True, kw_only=True)
+class _Config:
+    """The part of ``pytest.Config`` the plugin reads: one stash per session."""
+
+    stash: pytest.Stash = field(default_factory=pytest.Stash)
+
+
+@dataclass(slots=True, kw_only=True)
+class _Definition:
+    marks: list[pytest.Mark]
+
+    def iter_markers(self, name: str) -> Iterator[pytest.Mark]:
+        return (mark for mark in self.marks if mark.name == name)
+
+
+@dataclass(slots=True, kw_only=True)
+class _Metafunc:
+    """The part of ``pytest.Metafunc`` the plugin reads."""
+
+    config: _Config
+    definition: _Definition
+
+
+def _generate(config: _Config, *, marks: list[pytest.Mark]) -> None:
+    mutmut_param_ids.pytest_generate_tests(
+        _Metafunc(config=config, definition=_Definition(marks=marks)),
+    )
 
 
 if __name__ == "__main__":
