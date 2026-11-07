@@ -9,13 +9,48 @@
 Pre-commit gates that run each heavy check once per commit, sized to the
 machine and below interactive priority.
 
-## Quick Start
+# Quickstart
+
+```bash
+cd /path/to/your/repo
+uvx codedoctor install
+uv add --group pre-commit rekursiv-ai-typings
+uv run --group pre-commit pre-commit run --all-files
+```
+
+## Repository setup
+
+`codedoctor install` adds a locked `pre-commit` dependency group and installs
+pre-commit and pre-push Git hooks. It creates missing configuration and preserves
+existing hooks, comments, lint rules, and the project's Python support range.
+Running it again does not duplicate hooks.
+
+Setup uses the same hook configuration as this repository, without its
+package-export and Rust-only checks. Commits autofix whitespace, spelling,
+notebooks, house lint, and Ruff formatting; check types with ty, pyrefly, and
+basedpyright; and run paired tests, coverage checks, and sampled mutation tests.
+Pushes run repository-wide type checks and the fast, slow, smoke, and integration
+test tiers. Dependency-graph setup precedes affected-file checks.
+
+Tests may use either `test_*.py` or `*_test.py`; existing discovery settings and
+coverage thresholds are preserved. Hooks that rewrite files abort that attempt;
+review and stage the changes, then retry.
+
+`rekursiv-ai-typings` is optional, not a Codedoctor dependency. The Quickstart
+adds it explicitly to the development-tools group. This also works for projects
+supporting Python below 3.12; those targeting 3.12+ can use `uv add --dev`
+instead.
+
+Alternatively, install Codedoctor in the project's environment first:
 
 ```bash
 uv add --dev codedoctor
+uv run codedoctor install
 ```
 
-See [Install](#install) for additional details.
+Codedoctor requires Python 3.12 or newer. For projects supporting older Python,
+use the `uvx` route: its tools live in a Python 3.12+ dependency group without
+raising the application's runtime floor. Git and uv must already be installed.
 
 pre-commit calls a hook once per chunk of file names, so `--all-files` starts a
 type checker or pytest several times over. Each heavy gate here is two hooks: a
