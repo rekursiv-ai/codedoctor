@@ -395,7 +395,7 @@ def select_functions(
     check = partial(function_filters, root, sources=sources, workers=workers)
     if most is None:
         found = check(files=files)
-        size = sample_size(len(found), rate=rate, most=most)
+        size = sample_size(len(found), rate=rate, most=None)
         return sample(found, seed=seed, size=size, preferred=preferred), len(found)
     by_file = _declared_by_file(root, files=files, sources=sources, workers=workers)
     owner = {name: path for path, names in by_file.items() for name in names}
@@ -416,7 +416,8 @@ def select_functions(
             kept.append(name)
         if len(kept) >= most and len(mutable) >= enough:
             return tuple(sorted(kept[:most])), len(ranked)
-    size = sample_size(len(mutable), rate=rate, most=most)
+    # Exhausting the ranking means the rate cannot fill the cap.
+    size = sample_size(len(mutable), rate=rate, most=None)
     return tuple(sorted(kept[:size])), len(mutable)
 
 
