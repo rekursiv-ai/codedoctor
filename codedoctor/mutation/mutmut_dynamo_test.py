@@ -106,6 +106,17 @@ def test_the_stats_phase_is_kept_from_a_child_process(
     assert trampoline.get_mutant_under_test() == "stats"
 
 
+def test_compiling_is_false_without_importing_torch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mutmut_dynamo, "_is_compiling", [])
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+
+    assert mutmut_dynamo._compiling() is False
+    assert mutmut_dynamo._is_compiling == []
+    assert "torch" not in sys.modules
+
+
 @pytest.mark.parametrize("name", ["", "fail", "loop.mod.x_f__mutmut_1"])
 def test_a_child_still_runs_the_mutant_or_failure_under_test(
     monkeypatch: pytest.MonkeyPatch,

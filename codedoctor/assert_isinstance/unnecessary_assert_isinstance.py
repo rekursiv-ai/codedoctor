@@ -89,108 +89,11 @@ def main() -> int:
     # pragma: no mutate end
     _add_arguments(parser)
     flags = cast(Flags, parser.parse_args())
-    checker = flags.checker
-    threads = flags.threads or default_workers()
-    root = project_root(Path.cwd(), tool=checker)
-    paths = [p.resolve() for p in flags.paths] or [root / "loop"]
-    sources = walk.expand(paths, suffixes={".py"})
-    targets = [
-        *(p for p in paths if p.is_dir()),
-        *cover([p for p in paths if not p.is_dir()], root=root),
-    ]
-    options = (
-        [
-            "check",
-            f"--threads={threads}",
-            "--output-format=json",
-            # Info, so the probe's ``reveal-type`` verdict is reported.
-            "--min-severity=info",
-            "--summary=none",
-        ]
-        if checker == "pyrefly"
-        else [f"--threads={threads}", "--outputjson"]
-    )
-    with probed(root, files=sources, checker=checker) as overlay:
-        result = subprocess.run(  # noqa: S603 -- no shell; fixed argv.
-            [
-                Path(sys.executable).parent / checker,
-                *options,
-                # Relative, so the checker resolves them inside the overlay.
-                *(path.relative_to(root) for path in targets),
-            ],
-            cwd=overlay,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        sys.stderr.write(result.stderr)
-        # 0 clean, 1 diagnostics; anything else is a crash with no JSON report, as
-        # is pyrefly's exit 1 on a missing path, which prints no report at all.
-        if result.returncode > 1 or (
-            checker == "pyrefly" and result.returncode and not result.stdout
-        ):
-            sys.stdout.write(result.stdout)
-            return result.returncode
-        parse = pyrefly_diagnostics if checker == "pyrefly" else diagnostics
-        # Above one thread, basedpyright prints no report at all, not an empty one,
-        # when it analyzes no file: every target excluded or under a hidden
-        # directory. Parsed while the overlay exists: its copies locate the probes.
-        found = (
-            parse(result.stdout, overlay=overlay, root=root)
-            if result.stdout or result.returncode
-            else []
-        )
-    rule = "unnecessary-assert-isinstance"
     try:
-        needed = still_needed(
-            {(d.path, d.line) for d in found if d.redundant},
-            root=root,
-            checkers=[
-                Path(sys.executable).parent / name
-                for name in ("ty", *flags.typechecker)
-                if name != checker
-            ],
-        )
-    except CheckerCrashError as crash:
-        sys.stderr.write(crash.stderr)
-        return crash.returncode
-    candidates = [
-        Finding(
-            path=d.path,
-            line=d.line,
-            rule=rule,
-            message="unnecessary assert isinstance",
-        )
-        for d in found
-        if d.redundant and (d.path, d.line) not in needed
-    ]
-    findings = _honor_house_ignore(candidates, sources=sources, rule=rule)
-    hits: dict[Path, list[int]] = {}
-    for finding in findings:
-        if finding.rule == rule:
-            hits.setdefault(finding.path, []).append(finding.line)
-    # Repo-relative, as houselint prints a finding.
-    sys.stdout.writelines(
-        f"{dataclasses.replace(f, path=f.path.absolute().relative_to(root))}\n"
-        for f in findings
-    )
-    if flags.fix:
-        for path, lines in hits.items():
-            delete_lines(path, lines)
-    count = len(findings)
-    if hits and flags.fix:
-        sys.stderr.write(
-            f"Deleted {sum(map(len, hits.values()))} unnecessary assert(s).\n",
-        )
-    rest = [d for d in found if not d.redundant]
-    counts = Counter(d.severity for d in rest)
-    sys.stdout.writelines(map(str, rest))
-    sys.stdout.write(
-        f"{counts['error']} errors, {counts['warning']} warnings, "
-        f"{counts['information']} notes\n",
-    )
-    # A deletion fails the run like any auto-fix, so the fixed file is reviewed.
-    return int(count > 0 or counts["error"] + counts["warning"] > 0)
+        return _check(flags)
+    except SourceChangedError as error:
+        sys.stderr.write(f"{error}\n")
+        return 1
 
 
 class Flags(Protocol):
@@ -201,6 +104,10 @@ class Flags(Protocol):
     checker: str
     typechecker: list[str]
     paths: list[Path]
+
+
+class SourceChangedError(RuntimeError):
+    """A source changed after being read, invalidating the checker verdict."""
 
 
 class CheckerCrashError(RuntimeError):
@@ -335,13 +242,20 @@ def probe(text: str, *, checker: str) -> str:
 
 
 @contextlib.contextmanager
-def probed(root: Path, *, files: Sequence[Path], checker: str) -> Generator[Path]:
+def probed(
+    root: Path,
+    *,
+    files: Sequence[Path],
+    checker: str,
+    snapshots: dict[Path, str] | None = None,
+) -> Generator[Path]:
     """Yield a symlink mirror of ``root`` whose ``files`` carry probes.
 
     Args:
       root: Directory to mirror; the checker reads its configuration from here.
       files: Files to probe, relative to the working directory or absolute.
       checker: ``basedpyright`` or ``pyrefly``; picks the probe's form.
+      snapshots: When supplied, records the original text read for each file.
 
     Yields:
       overlay: Temporary directory; every entry links into ``root`` except the
@@ -355,6 +269,8 @@ def probed(root: Path, *, files: Sequence[Path], checker: str) -> Generator[Path
         _link_children(root, into=overlay)
         for path in files:
             text = path.read_text()
+            if snapshots is not None:
+                snapshots[path] = text
             probes = probe(text, checker=checker)
             if probes == text:
                 continue
@@ -399,7 +315,12 @@ def diagnostics(report: str, *, overlay: Path, root: Path) -> list[Diagnostic]:
         line = from_plain(start.get("line"), int, default=0) + 1
         column = from_plain(start.get("character"), int, default=0)
         rule = from_plain(item.get("rule"), str, default="")
-        probed_at = _probe_span(checked, line=line, checker="basedpyright")
+        probed_at = _probe_span(
+            checked,
+            line=line,
+            checker="basedpyright",
+            overlay=overlay,
+        )
         redundant = column in probed_at
         if redundant and rule != "reportUnnecessaryIsInstance":
             continue
@@ -453,7 +374,12 @@ def pyrefly_diagnostics(report: str, *, overlay: Path, root: Path) -> list[Diagn
         column = from_plain(item.get("column"), int) - 1
         rule = from_plain(item.get("name"), str)
         message = from_plain(item.get("description"), str)
-        probed_at = _probe_span(checked, line=line, checker="pyrefly")
+        probed_at = _probe_span(
+            checked,
+            line=line,
+            checker="pyrefly",
+            overlay=overlay,
+        )
         redundant = column in probed_at
         if redundant and (rule, message) != ("reveal-type", "revealed type: Never"):
             continue
@@ -476,6 +402,7 @@ def still_needed(
     *,
     root: Path,
     checkers: Sequence[Path],
+    snapshots: dict[Path, str] | None = None,
 ) -> set[tuple[Path, int]]:
     """Return the ``sites`` whose assert some of ``checkers`` may still need.
 
@@ -487,6 +414,7 @@ def still_needed(
       sites: ``(file, 1-based line)`` asserts the probing checker calls redundant.
       root: Directory the checkers read their configuration from.
       checkers: The ``ty``, ``basedpyright`` or ``pyrefly`` executables to ask.
+      snapshots: Original probed source; otherwise read once before checking.
 
     Returns:
       needed: The subset any checker reports a new diagnostic for once removed.
@@ -498,23 +426,32 @@ def still_needed(
     if not sites:
         return set()
     files = sorted({path for path, _ in sites})
+    if snapshots is None:
+        snapshots = {path: path.read_text() for path in files}
+    _unchanged(snapshots)
     before = {c: _checker_lines(c, root, files=files) for c in checkers}
-    with tempfile.TemporaryDirectory(prefix="unnecessary-assert-typecheck-") as temp:
+    _unchanged(snapshots)
+    with tempfile.TemporaryDirectory(
+        prefix="unnecessary-assert-typecheck-",  # pragma: no mutate -- Any name serves.
+    ) as temp:
         # Real, as basedpyright reports it (macOS's ``/var`` is ``/private/var``).
         overlay = Path(temp).resolve()
         _link_children(root, into=overlay)
         for path in files:
             target = _unlink_to(overlay, path.absolute().relative_to(root))
-            source = path.read_text().split("\n")
+            source = snapshots[path].split("\n")
             for site_path, line in sites:
                 if site_path == path:
                     match = _ASSERT.fullmatch(source[line - 1])
                     if match is None:
-                        raise ValueError("Expected match is not None.")
+                        raise ValueError(
+                            "Expected match is not None.",  # pragma: no mutate
+                        )
                     source[line - 1] = f"{match['indent']}pass"
             target.write_text("\n".join(source))
         copies = [overlay / p.absolute().relative_to(root) for p in files]
         after = {c: _checker_lines(c, overlay, files=copies) for c in checkers}
+    _unchanged(snapshots)
     # Which assert a new diagnostic needed is not recoverable from its line
     # (two asserts can narrow one return), so a file with any keeps them all.
     # Whole diagnostics are compared, not lines: removing an assert can change
@@ -529,15 +466,24 @@ def still_needed(
     return {site for site in sites if site[0] in changed}
 
 
-def delete_lines(path: Path, lines: Sequence[int]) -> None:
+def delete_lines(
+    path: Path,
+    lines: Sequence[int],
+    *,
+    expected: str | None = None,
+) -> None:
     """Delete asserts from ``path`` in place.
 
     Args:
       path: File to edit.
       lines: 1-based line numbers, each holding a single-line isinstance assert.
+      expected: Original text; reject edits since this snapshot when supplied.
 
     """
-    source = path.read_text().split("\n")
+    original = path.read_text()
+    if expected is not None:
+        _unchanged({path: expected})
+    source = original.split("\n")
     for line in sorted(set(lines), reverse=True):
         if not _ASSERT.fullmatch(source[line - 1]):
             raise ValueError(
@@ -550,7 +496,19 @@ def delete_lines(path: Path, lines: Sequence[int]) -> None:
             ast.parse("\n".join(source))
             continue
         source.insert(line - 1, f"{indent}pass")
+    _unchanged({path: original})
     path.write_text("\n".join(source))
+
+
+def _unchanged(snapshots: dict[Path, str]) -> None:
+    """Reject stale checker verdicts before using their line numbers or writing."""
+    for path, expected in snapshots.items():
+        try:
+            current = path.read_text()
+        except FileNotFoundError:
+            current = None
+        if current != expected:
+            raise SourceChangedError(f"{path} changed during type checking; rerun.")
 
 
 # Read through houselint's own loader, so the excludes mean here what they mean
@@ -609,14 +567,15 @@ def _probe(match: re.Match[str], *, checker: str) -> str:
     return f"isinstance({match['args']}); "
 
 
-# Read from the overlay copy the checker saw: the checkout may change while it runs,
-# moving its asserts off the lines the report names.
-def _probe_span(checked: Path, *, line: int, checker: str) -> range:
-    """Return the 0-based columns a probe occupies on ``checked``'s 1-based ``line``."""
+def _probe_span(checked: Path, *, line: int, checker: str, overlay: Path) -> range:
+    """Return a probe's columns, inspecting only private overlay copies."""
+    # Symlinked and external files have no probes and can change during the check.
+    if not checked.resolve().is_relative_to(overlay):
+        return range(0)
     text = checked.read_text().split("\n")[line - 1]
     start = len(text) - len(text.lstrip())
-    end = text.find("; assert ", start) + len("; ")
-    match = _ASSERT.fullmatch(text[:start] + text[end:]) if end > start else None
+    end = text.find("; assert ") + len("; ")
+    match = _ASSERT.fullmatch(text[:start] + text[end:])
     if match is None or text[start:end] != _probe(match, checker=checker):
         return range(0)
     return range(start, end)
@@ -776,3 +735,114 @@ def _holds_source(directory: Path) -> bool:
         ):
             return True
     return False
+
+
+def _check(flags: Flags) -> int:
+    """Check one source snapshot and reject concurrent edits before fixing."""
+    checker = flags.checker
+    threads = flags.threads or default_workers()
+    root = project_root(Path.cwd(), tool=checker)
+    paths = [p.resolve() for p in flags.paths] or [root / "loop"]
+    sources = walk.expand(paths, suffixes={".py"})
+    targets = [
+        *(p for p in paths if p.is_dir()),
+        *cover([p for p in paths if not p.is_dir()], root=root),
+    ]
+    options = (
+        [
+            "check",
+            f"--threads={threads}",
+            "--output-format=json",
+            # Info, so the probe's ``reveal-type`` verdict is reported.
+            "--min-severity=info",
+            "--summary=none",
+        ]
+        if checker == "pyrefly"
+        else [f"--threads={threads}", "--outputjson"]
+    )
+    snapshots: dict[Path, str] = {}
+    with probed(root, files=sources, checker=checker, snapshots=snapshots) as overlay:
+        result = subprocess.run(  # noqa: S603 -- no shell; fixed argv.
+            [
+                Path(sys.executable).parent / checker,
+                *options,
+                # Relative, so the checker resolves them inside the overlay.
+                *(path.relative_to(root) for path in targets),
+            ],
+            cwd=overlay,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        sys.stderr.write(result.stderr)
+        # 0 clean, 1 diagnostics; anything else is a crash with no JSON report, as
+        # is pyrefly's exit 1 on a missing path, which prints no report at all.
+        if result.returncode > 1 or (
+            checker == "pyrefly" and result.returncode and not result.stdout
+        ):
+            sys.stdout.write(result.stdout)
+            return result.returncode
+        parse = pyrefly_diagnostics if checker == "pyrefly" else diagnostics
+        # Above one thread, basedpyright prints no report at all, not an empty one,
+        # when it analyzes no file: every target excluded or under a hidden
+        # directory. Parsed while the overlay exists: its copies locate the probes.
+        found = (
+            parse(result.stdout, overlay=overlay, root=root)
+            if result.stdout or result.returncode
+            else []
+        )
+    _unchanged(snapshots)
+    rule = "unnecessary-assert-isinstance"
+    try:
+        needed = still_needed(
+            {(d.path, d.line) for d in found if d.redundant},
+            root=root,
+            snapshots=snapshots,
+            checkers=[
+                Path(sys.executable).parent / name
+                for name in ("ty", *flags.typechecker)
+                if name != checker
+            ],
+        )
+    except CheckerCrashError as crash:
+        sys.stderr.write(crash.stderr)
+        return crash.returncode
+    candidates = [
+        Finding(
+            path=d.path,
+            line=d.line,
+            rule=rule,
+            message="unnecessary assert isinstance",
+        )
+        for d in found
+        if d.redundant and (d.path, d.line) not in needed
+    ]
+    _unchanged(snapshots)
+    findings = _honor_house_ignore(candidates, sources=sources, rule=rule)
+    hits: dict[Path, list[int]] = {}
+    for finding in findings:
+        if finding.rule == rule:
+            hits.setdefault(finding.path, []).append(finding.line)
+    # Repo-relative, as houselint prints a finding.
+    sys.stdout.writelines(
+        f"{dataclasses.replace(f, path=f.path.absolute().relative_to(root))}\n"
+        for f in findings
+    )
+    if flags.fix:
+        _unchanged(snapshots)
+        for path, lines in hits.items():
+            delete_lines(path, lines, expected=snapshots[path])
+    count = len(findings)
+    if hits and flags.fix:
+        sys.stderr.write(
+            f"Deleted {sum(map(len, hits.values()))} unnecessary assert(s).\n",
+        )
+    rest = [d for d in found if not d.redundant]
+    counts = Counter(d.severity for d in rest)
+    sys.stdout.writelines(map(str, rest))
+    sys.stdout.write(
+        f"{counts['error']} errors, {counts['warning']} warnings, "
+        f"{counts['information']} notes\n",
+    )
+    # A deletion fails the run like any auto-fix, so the fixed file is reviewed.
+    return int(count > 0 or counts["error"] + counts["warning"] > 0)
