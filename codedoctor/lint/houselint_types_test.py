@@ -7,7 +7,7 @@ from pathlib import Path
 import ast
 import warnings
 
-from codedoctor.lint.houselint_types import Unit
+from codedoctor.lint.houselint_types import Finding, Unit
 
 
 def _unit(source: str, kind: str = "python") -> Unit:
@@ -79,6 +79,19 @@ def test_tokens_stop_quietly_where_tokenizing_fails() -> None:
 
     assert [token.string for token in tokens][:3] == ["x", "=", "1"]
     assert all(token.start[0] <= 2 for token in tokens)
+
+
+def test_lines_split_the_source_once() -> None:
+    unit = _unit("a = 1\n# noqa\n")
+
+    assert unit.lines == ("a = 1", "# noqa")
+    assert unit.lines is unit.lines
+
+
+def test_a_finding_renders_as_path_line_rule_message() -> None:
+    finding = Finding(path=Path("pkg/m.py"), line=3, rule="no-any", message="Use T.")
+
+    assert str(finding) == "pkg/m.py:3: [no-any] Use T."
 
 
 if __name__ == "__main__":
