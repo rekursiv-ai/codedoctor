@@ -11,6 +11,7 @@ import tomllib
 from treekle import from_plain
 
 import pytest
+import rignore
 import yaml
 
 from codedoctor import install
@@ -203,13 +204,22 @@ def test_hook_config_rejects_conflicting_hook_before_writing() -> None:
         install.hook_config(original)
 
 
+@pytest.mark.parametrize("found_executables", [True, False])
 def test_install_locks_dependencies_then_installs_both_git_hooks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    found_executables: bool,
 ) -> None:
     calls: list[list[str]] = []
+    uv = "/tools/uv" if found_executables else "uv"
+    git = "/tools/git" if found_executables else "git"
     hook_dir = tmp_path / ".git" / "hooks"
     hook_dir.mkdir(parents=True)
+    ignored = tmp_path / ".gitignore"
+    original_ignore = "# Keep existing rules.\ncustom/"
+    ignored.write_text(original_ignore)
+    original_input = '[project]\nname = "existing"\nversion = "2.0.0"\n'
+    (tmp_path / "pyproject.toml").write_text(original_input)
 
     def run(
         argv: Sequence[str],
@@ -222,8 +232,8 @@ def test_install_locks_dependencies_then_installs_both_git_hooks(
         assert cwd == tmp_path
         assert check
         calls.append(list(argv))
-        if argv[0] == "git":
-            assert list(argv) == ["git", "rev-parse", "--git-common-dir"]
+        if "rev-parse" in argv:
+            assert list(argv) == [git, "rev-parse", "--git-common-dir"]
             assert capture_output
             assert text
         elif "install" in argv:
@@ -235,23 +245,31 @@ def test_install_locks_dependencies_then_installs_both_git_hooks(
                 path.chmod(0o755)
         return subprocess.CompletedProcess(argv, 0, stdout=str(tmp_path / ".git"))
 
+    def which(name: str) -> str | None:
+        return f"/tools/{name}" if found_executables else None
+
     monkeypatch.setattr(subprocess, "run", run)
-    monkeypatch.setattr(shutil, "which", str)
+    monkeypatch.setattr(shutil, "which", which)
     install.install(tmp_path)
+    assert ignored.is_file()
+    configured_ignore = ignored.read_text()
+    assert configured_ignore.startswith(original_ignore)
+    assert configured_ignore != original_ignore
     original_project = (tmp_path / "pyproject.toml").read_text()
+    assert original_project.startswith(original_input)
+    assert tomllib.loads(original_project)["tool"]["houselint"]["select"] == "ALL"
     original_hooks = (tmp_path / ".pre-commit-config.yaml").read_text()
     install.install(tmp_path)
     assert (tmp_path / "pyproject.toml").read_text() == original_project
     assert (tmp_path / ".pre-commit-config.yaml").read_text() == original_hooks
-    assert calls[0][:6] == [
-        "uv",
+    assert ignored.read_text() == configured_ignore
+    assert calls[0] == [
+        uv,
         "add",
         "--group",
         "pre-commit",
         "--no-sync",
         "codedoctor[coverage,mutation,notebook]",
-    ]
-    assert {
         "pre-commit",
         "ruff",
         "codespell",
@@ -264,10 +282,9 @@ def test_install_locks_dependencies_then_installs_both_git_hooks(
         "pytest-testmon",
         "pytest-xdist",
         "wrapt",
-    } <= set(calls[0])
-    assert "rekursiv-ai-typings" not in calls[0]
+    ]
     assert calls[1] == [
-        "uv",
+        uv,
         "run",
         "--locked",
         "--group",
@@ -290,6 +307,97 @@ def test_install_locks_dependencies_then_installs_both_git_hooks(
             '--hook-dir="$(dirname "$0")" -- "$@"\n'
         )
         assert path.stat().st_mode & 0o111
+
+
+@pytest.mark.parametrize(
+    "backend",
+    ["rignore", pytest.param("git", marks=pytest.mark.cli_git)],
+)
+@pytest.mark.parametrize(
+    ("original_ignore", "custom_ignored"),
+    [
+        (None, False),
+        ("", False),
+        ("# Keep existing rules.\ncustom/", True),
+        ("# Existing coverage rule.\r\n.coverage\r\n", False),
+    ],
+)
+def test_git_ignores_generated_state_without_hiding_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    original_ignore: str | None,
+    custom_ignored: bool,
+    backend: str,
+) -> None:
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    ignored = tmp_path / ".gitignore"
+    if original_ignore is not None:
+        ignored.write_bytes(original_ignore.encode())
+    install._update_gitignore(tmp_path)
+    configured = ignored.read_bytes()
+    original = (original_ignore or "").encode()
+    assert configured.startswith(original)
+    appended = configured[len(original) :]
+    if original and not original.endswith(b"\n"):
+        assert appended.startswith(b"\n")
+        appended = appended[1:]
+    assert appended.endswith(b"\n")
+    assert all(appended.splitlines())
+    assert len(configured.splitlines()) == len(set(configured.splitlines()))
+    generated = {
+        ".testmondata",
+        ".testmondata-wal",
+        ".codegraph/index.db",
+        ".coverage",
+        ".coverage.worker.123",
+        ".coverage-journal",
+    }
+    paths = [
+        *sorted(generated),
+        ".coveragerc",
+        ".codegraph.py",
+        "app.py",
+        "custom/file.txt",
+    ]
+    for name in paths:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    if backend == "git":
+        git = shutil.which("git")
+        assert git is not None
+        subprocess.run(  # noqa: S603 -- Git resolved from PATH; fixed arguments.
+            [git, "init", "--quiet"],
+            cwd=tmp_path,
+            check=True,
+        )
+        result = subprocess.run(  # noqa: S603 -- Git resolved from PATH; fixture paths on stdin.
+            [git, "check-ignore", "--no-index", "--stdin"],
+            cwd=tmp_path,
+            input="\n".join(paths) + "\n",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        excluded = set(result.stdout.splitlines())
+    else:
+        visible = set(
+            rignore.walk(
+                tmp_path,
+                ignore_hidden=False,
+                require_git=False,
+                read_parents_ignores=False,
+                read_global_git_ignore=False,
+                read_git_exclude=False,
+                read_ignore_files=False,
+            ),
+        )
+        excluded = {name for name in paths if tmp_path / name not in visible}
+    assert excluded == generated | ({"custom/file.txt"} if custom_ignored else set())
+    install._update_gitignore(tmp_path)
+    assert ignored.read_bytes() == configured
 
 
 def test_invalid_config_prevents_partial_setup(tmp_path: Path) -> None:

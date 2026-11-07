@@ -88,6 +88,7 @@ def install(root: Path) -> None:
         check=True,
     )
     _bootstrap_hooks(root)
+    _update_gitignore(root)
 
 
 def project_config(text: str, *, name: str) -> str:
@@ -338,3 +339,26 @@ def _bootstrap_hooks(root: Path) -> None:
             + f"--config=.pre-commit-config.yaml --hook-type={name} "
             + '--hook-dir="$(dirname "$0")" -- "$@"\n',
         )
+
+
+def _update_gitignore(root: Path) -> None:
+    """Append missing generated-state rules without rewriting existing entries."""
+    path = root / ".gitignore"
+    text = path.read_text() if path.exists() else ""
+    existing = set(text.splitlines())
+    missing = [
+        pattern
+        for pattern in (
+            ".testmondata*",
+            ".codegraph/",
+            ".coverage",
+            ".coverage.*",
+            ".coverage-*",
+        )
+        if pattern not in existing
+    ]
+    if missing:
+        with path.open("ab") as stream:
+            if text and not text.endswith("\n"):
+                stream.write(b"\n")
+            stream.write(("\n".join(missing) + "\n").encode())
