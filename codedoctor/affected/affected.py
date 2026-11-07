@@ -1,9 +1,8 @@
 """Print the reverse-dependency closure of the changed files, per CodeGraph.
 
-Reads the shared backbone with this worktree's overlay laid over it, both
-read-only; `codegraph_sync` writes them. A stale or missing overlay is reported
-on stderr and the selection falls back to the paired tests. A file's symbols
-are all seeds unless --diff names its changed lines.
+Syncs the current worktree's CodeGraph index before reading it read-only.
+An indexing failure is reported on stderr and selection falls back to the paired
+tests. A file's symbols are all seeds unless --diff names its changed lines.
 
 Examples:
   python -m codedoctor.affected lib.py
@@ -37,7 +36,7 @@ import tomllib
 from treekle import ReadError, from_plain
 
 from codedoctor.affected import backbone
-from codedoctor.gate.gate import output_argv, skipped
+from codedoctor.gate.gate import skipped
 from codedoctor.lib import sidecars
 from codedoctor.lib.files import walk
 from codedoctor.lib.worker_count import worker_count
@@ -78,42 +77,24 @@ def main() -> int:
     flags = _parse_args(parser)
     depth = 0 if skipped(os.environ, flags.skip_token) else flags.depth
     database = Path(flags.database) if flags.database else None
-    overlay: Path | None = None
     saturated = not flags.no_universe and _covers_universe(
         flags.files,
         suffixes={Path(path).suffix for path in flags.files} & {".py", ".pyi"},
     )
     if database is None:
-        database = backbone.backbone_database(Path(flags.caches))
-        # Saturated, the answer needs no graph, so none is read or rebuilt.
+        database = Path.cwd() / ".codegraph" / "codegraph.db"
         if depth > 0 and not saturated:
-            problem, overlay = backbone.overlay_problem(
-                Path(flags.caches),
-                root=Path.cwd(),
-                output=output_argv,
-            )
-            # The overlay goes stale whenever any changed file moves -- in a
-            # shared worktree, another process's edit between the sync hook and
-            # this one. Rebuilding costs seconds; walking without it, coverage.
-            if problem and not backbone.build_overlay(
+            problem = backbone.sync_worktree(
                 Path.cwd(),
                 caches=Path(flags.caches),
-                output=output_argv,
-                index=partial(backbone.index_tree, run=_quietly),
-            ):
-                problem, overlay = backbone.overlay_problem(
-                    Path(flags.caches),
-                    root=Path.cwd(),
-                    output=output_argv,
-                )
+                run=_quietly,
+            )
             if problem:
-                # Depth 0 is the floor `SKIP` already selects: each changed file's
-                # paired tests, or the changed files themselves.
                 depth = 0
                 sys.stderr.write(f"affected: {problem} Selecting without the graph.\n")
     lines = harvest(
         database,
-        overlay=overlay,
+        overlay=None,
         changed=flags.files,
         depth=depth,
         emit=flags.emit,
