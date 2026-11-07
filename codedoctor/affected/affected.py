@@ -37,7 +37,7 @@ import tomllib
 from treekle import ReadError, from_plain
 
 from codedoctor.affected import backbone
-from codedoctor.gate.gate import output_argv
+from codedoctor.gate.gate import output_argv, skipped
 from codedoctor.lib import sidecars
 from codedoctor.lib.files import walk
 from codedoctor.lib.worker_count import worker_count
@@ -76,7 +76,7 @@ def main() -> int:
         fromfile_prefix_chars="@",  # pragma: no mutate -- holds "@" either way.
     )
     flags = _parse_args(parser)
-    depth = 0 if _skipped(flags.skip_token) else flags.depth
+    depth = 0 if skipped(os.environ, flags.skip_token) else flags.depth
     database = Path(flags.database) if flags.database else None
     overlay: Path | None = None
     saturated = not flags.no_universe and _covers_universe(
@@ -830,16 +830,6 @@ def _parse_diff(diff: Path) -> dict[str, list[tuple[int, int]]]:
                 (first, first + max(int(length or 1), 1) - 1),
             )
     return spans
-
-
-# A hook cannot ask pre-commit whether a sibling ran, but `SKIP` reaches every hook's
-# environment. Reading it is what lets one token disable the index for the whole tier:
-# skip the writer and the readers stop reading, rather than silently serving a stale
-# graph.
-def _skipped(token: str) -> bool:
-    """Report whether pre-commit's ``SKIP`` names ``token``."""
-    skip = os.environ.get("SKIP")
-    return skip is not None and token in {name.strip() for name in skip.split(",")}
 
 
 def _sidecars(changed: list[str]) -> list[Path]:

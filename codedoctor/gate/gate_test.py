@@ -630,6 +630,23 @@ def test_threaded_fills_in_the_gate_worker_count(tmp_path: Path) -> None:
     assert tools.calls == [["pyrefly", "check", "--threads=2"]]
 
 
+def test_skip_reads_one_name_out_of_precommits_list() -> None:
+    environ = {"SKIP": "ruff-check, harvest-affected ,pytest"}
+    assert gate.skipped(environ, "harvest-affected")
+    assert not gate.skipped(environ, "codegraph-sync")
+
+
+def test_skip_splits_on_commas_alone() -> None:
+    environ = {"SKIP": "ruff-check,harvest-affected"}
+    assert gate.skipped(environ, "harvest-affected")
+    assert not gate.skipped(environ, "ruff-check,harvest-affected")
+
+
+@pytest.mark.parametrize("token", ["", "harvest-affected"])
+def test_an_absent_skip_names_no_token(token: str) -> None:
+    assert not gate.skipped({}, token)
+
+
 if __name__ == "__main__":
     from codedoctor.lib.testing.runner import test_main
 

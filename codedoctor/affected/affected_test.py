@@ -20,7 +20,7 @@ import threading
 import pytest
 
 from codedoctor.affected import affected, backbone
-from codedoctor.affected.affected import _collection_patterns, _skipped, harvest
+from codedoctor.affected.affected import _collection_patterns, harvest
 from codedoctor.gate.gate import output_argv
 
 
@@ -1679,19 +1679,6 @@ def test_every_py_file_covers_a_tree_for_a_hook_handed_only_python(
     assert not affected._covers_universe(["a.py"], suffixes={".py"})
 
 
-def test_skip_reads_one_name_out_of_precommits_list(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("SKIP", "ruff-check, harvest-affected ,pytest")
-    assert _skipped("harvest-affected")
-    assert not _skipped("codegraph-sync")
-
-
-def test_skip_is_absent_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("SKIP", raising=False)
-    assert not _skipped("harvest-affected")
-
-
 def test_depth_zero_ignores_the_index(tmp_path: Path) -> None:
     """What the `harvest-affected` skip token resolves to: seeds and floors only."""
     database = _index(tmp_path)
@@ -2090,23 +2077,6 @@ def test_selector_method_without_class_owner_uses_file_selector(
         )
     finally:
         connection.close()
-
-
-def test_skip_splits_on_commas_alone(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SKIP", "ruff-check,harvest-affected")
-
-    assert _skipped("harvest-affected")
-    assert not _skipped("ruff-check,harvest-affected")
-
-
-@pytest.mark.parametrize("token", ["", "harvest-affected"])
-def test_an_absent_skip_names_no_token(
-    monkeypatch: pytest.MonkeyPatch,
-    token: str,
-) -> None:
-    monkeypatch.delenv("SKIP", raising=False)
-
-    assert not _skipped(token)
 
 
 def _recorded_harvest(

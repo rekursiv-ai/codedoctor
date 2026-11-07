@@ -238,6 +238,15 @@ def positive(value: str | None) -> int:
     return int(value)
 
 
+# A hook cannot ask pre-commit whether a sibling ran, but `SKIP` reaches every hook's
+# environment, so one token can tell its readers too: the index's readers stop
+# reading, and `coverage-floor` stops waiting for the `pytest` run it rides.
+def skipped(environ: Mapping[str, str], token: str) -> bool:
+    """Return whether pre-commit's ``SKIP`` in ``environ`` names ``token``."""
+    skip = environ.get("SKIP")
+    return skip is not None and token in {name.strip() for name in skip.split(",")}
+
+
 def flagged(environ: Mapping[str, str], name: str) -> bool:
     """Return whether variable ``name`` is set to anything but the empty string.
 
