@@ -389,7 +389,14 @@ def _installed(module: str) -> bool:
 def _process(pid: int) -> tuple[int, str] | None:
     """Return ``pid``'s parent and command line, from ``ps``."""
     done = subprocess.run(  # noqa: S603 -- fixed command, numeric pid.
-        ["ps", "-o", "ppid=,command=", "-p", str(pid)],  # noqa: S607 -- system ps.
+        [  # noqa: S607 -- system ps.
+            "ps",
+            "-o",
+            "ppid=,command=",
+            # Linux's quick mode avoids scanning every unrelated process.
+            "-q" if sys.platform == "linux" else "-p",
+            str(pid),
+        ],
         capture_output=True,
         text=True,
         check=False,  # pragma: no mutate -- the default, stated for ruff.

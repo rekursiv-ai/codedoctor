@@ -506,11 +506,19 @@ def test_a_process_that_is_gone_is_none() -> None:
     assert gate._process(2**22 + 1) is None
 
 
-def test_a_process_is_read_from_ps(processes: fakes.Processes) -> None:
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_a_process_is_read_from_ps(
+    processes: fakes.Processes,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+) -> None:
     processes.stdout = "1 x\n"
+    monkeypatch.setattr(sys, "platform", platform)
     gate._process(5)
 
-    assert processes.calls == [["ps", "-o", "ppid=,command=", "-p", "5"]]
+    assert processes.calls == [
+        ["ps", "-o", "ppid=,command=", "-q" if platform == "linux" else "-p", "5"],
+    ]
 
 
 def test_a_failing_command_reports_its_own_status() -> None:
