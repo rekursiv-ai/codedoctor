@@ -133,7 +133,8 @@ def is_test(path: str | Path) -> bool:
 
     Returns:
       test: Whether it is named as a test module, or defines a top-level
-        ``test_*`` function or ``Test*`` class.
+        ``test_*`` function or ``Test*`` class without opting out through
+        ``__test__ = False``.
 
     """
     module = Path(path)
@@ -152,6 +153,20 @@ def is_test(path: str | Path) -> bool:
         tree = ast.parse(module.read_bytes())
     except SyntaxError:
         return False
+    for node in tree.body:
+        match node:
+            case ast.Assign(targets=targets, value=ast.Constant(value=False)) if any(
+                isinstance(target, ast.Name) and target.id == "__test__"
+                for target in targets
+            ):
+                return False
+            case ast.AnnAssign(
+                target=ast.Name(id="__test__"),
+                value=ast.Constant(value=False),
+            ):
+                return False
+            case _:
+                pass
     return any(
         (
             isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)

@@ -2817,6 +2817,26 @@ def test_a_zero_size_samples_nothing() -> None:
     assert sample(("first",), seed="seed", size=0) == ()
 
 
+@pytest.mark.parametrize("output", [None, ""])
+def test_failed_mutation_graph_retains_sidecars_and_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    output: str | None,
+) -> None:
+    root = _repo(tmp_path, body=_TWO_FUNCTIONS)
+    (root / "pkg/mod_test.py").touch()
+    monkeypatch.setenv("PRECOMMIT_SCOPE_MUTATION", "affected:2")
+    reader = Mock(return_value=output)
+    monkeypatch.setattr(mutated, "output_argv", reader)
+
+    assert mutated._paired_tests(root, sources=("pkg/mod.py",)) == ("pkg/mod_test.py",)
+    assert reader.call_count == 1
+    assert capsys.readouterr().err == (
+        "mutation: dependency graph unavailable; using sidecars\n"
+    )
+
+
 @pytest.mark.parametrize("mode", ["exact", "sidecar", "affected:2"])
 def test_mutation_scope_selects_sources_and_tests(
     tmp_path: Path,
