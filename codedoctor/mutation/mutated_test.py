@@ -2514,6 +2514,7 @@ def test_parallel_selection_forks_one_process_per_file_up_to_the_cap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Two files are the minimum that distinguishes serial, per-file, and capped pools.
     root = _repo(tmp_path, body="def first():\n    return 1\n")
     (root / "pkg/other.py").write_text("def second():\n    return 2\n")
     pool = Mock(wraps=ProcessPoolExecutor)
@@ -4196,7 +4197,11 @@ def test_parallel_shard_count_is_an_integer_below_the_file_count(
     assert isinstance(run.call_args.kwargs["parallel"], int)
 
 
-def test_parallel_file_mapping_keeps_large_batches_runnable() -> None:
+def test_parallel_file_mapping_keeps_large_batches_runnable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Real forks belong to the cap test; both executors accept keyword chunksize.
+    monkeypatch.setattr(mutated, "ProcessPoolExecutor", _selection_thread_pool)
     # Two workers need 32 paths before chunksize exceeds one.
     paths = [str(n) for n in range(2 * 8 * 2)]
     assert mutated._map_files(str, paths, workers=2) == paths

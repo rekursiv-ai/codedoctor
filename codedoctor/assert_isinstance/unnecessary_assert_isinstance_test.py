@@ -971,7 +971,7 @@ class _Flags(Protocol):
 
 
 def f() -> int:
-    flags = argparse.ArgumentParser().parse_args([])
+    flags = argparse.Namespace()
     assert isinstance(flags, _Flags)
     return flags.seed
 """

@@ -966,9 +966,8 @@ def test_a_query_failure_mid_read_falls_back(
     # Measured: `_reachable` issues 3 `edges` reads for this fixture, then
     # `_selector` issues its class-owner lookups. Denying at 3 lands in the
     # selector phase; denying earlier trips the walk's own guard instead.
-    monkeypatch.setattr(
-        sqlite3,
-        "connect",
+    _patch_connect(
+        monkeypatch,
         _connect_double(
             [],
             lambda connection: connection.set_authorizer(_deny_edges_after(3)),
@@ -977,6 +976,15 @@ def test_a_query_failure_mid_read_falls_back(
     assert harvest(database, changed=["lib.py"], depth=1, emit="nodeids") == [
         "lib_test.py",
     ]
+    with closing(sqlite3.connect(":memory:")) as unrelated:
+        unrelated.execute("CREATE TABLE edges (value INTEGER)")
+        for query in (
+            "SELECT COUNT(*) FROM edges",
+            "SELECT COUNT(value) FROM edges",
+            "SELECT COUNT(*) FROM edges WHERE value = 0",
+            "SELECT COUNT(*) FROM edges WHERE value = 1",
+        ):
+            assert unrelated.execute(query).fetchone() == (0,)
 
 
 def test_nodeids_name_the_class_owning_a_test_method(tmp_path: Path) -> None:
