@@ -16,7 +16,7 @@ import pytest
 from codedoctor.gate import fakes, gate, spool
 from codedoctor.lib.testing.checks import assert_help_without_docstring
 from codedoctor.testing import coverage_summary, listing, testing
-from codedoctor.testing.tiers import RUNNABLE, TIERS, Tier
+from codedoctor.testing.tiers import TIERS, Tier
 from codedoctor.typecheck import typecheck
 
 
@@ -455,13 +455,10 @@ def test_the_gate_sizes_the_walk_and_pytest_from_its_own_workers(
     assert test[test.index("-n") + 1] == "5"
 
 
-def test_own_tests_run_every_tier_measured_and_the_graphs_the_default(
+def test_own_and_graph_tests_keep_default_selection_but_only_own_are_measured(
     tmp_path: Path,
 ) -> None:
-    """Only the own tests ``coverage-floor`` reads pay for slow and database tiers.
-
-    A graph test inside an own file runs once, with the own file.
-    """
+    """Keep the project's marker filter; run an own file only once."""
     tools = fakes.Recorder(output="b_test.py::t\na_test.py::u\n")
 
     _pytest(
@@ -476,8 +473,9 @@ def test_own_tests_run_every_tier_measured_and_the_graphs_the_default(
     walk, own, graph = tools.calls
     assert walk[3:8] == ["--emit", "nodeids", "--depth", "1", "--workers"]
     assert own[2] == "COVERAGE_CORE=ctrace"
-    # Whole files: no listing plugin, whose import would precede coverage.
-    assert own[own.index("--tb=short") + 1 :][:2] == ["-m", RUNNABLE]
+    # Only the interpreter's -m: overriding pytest's marker widens default tiers.
+    assert own.count("-m") == graph.count("-m") == 1
+    assert own[own.index("--tb=short") + 1].startswith("@")
     assert "-p" not in own
     assert "COVERAGE_CORE=ctrace" not in graph
     assert graph[graph.index("--tb=short") + 1] == "-p"

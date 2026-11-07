@@ -29,7 +29,7 @@ import time
 from codedoctor.gate import gate
 from codedoctor.lib import sidecars
 from codedoctor.testing import coverage_summary, listing
-from codedoctor.testing.tiers import RUNNABLE, TIERS, Tier
+from codedoctor.testing.tiers import TIERS, Tier
 
 
 if TYPE_CHECKING:
@@ -60,9 +60,9 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
     Args:
       context: What the gate reads and runs.
       dependents: Module whose CLI names the tests reaching the spooled files
-        ``PRECOMMIT_CODEGRAPH_PYTEST`` hops away. They run in a second pytest at
-        the project's default tiers, unmeasured; the pairs always run first,
-        every runnable tier, measured per test for ``coverage-floor``.
+        ``PRECOMMIT_CODEGRAPH_PYTEST`` hops away. They run in a second pytest,
+        unmeasured; the pairs run first, measured per test for ``coverage-floor``.
+        Both runs keep the project's default marker selection.
 
     Returns:
       exit_code: pytest's, 0 for an empty collection, or the coverage summary's;
@@ -108,12 +108,10 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
         # pragma: no mutate start -- any name in a private dir.
         data = Path(temp) / ".coverage"
         # pragma: no mutate end
-        # The own tests run every runnable tier, database and slow included, and
-        # are measured: ``coverage-floor`` floors a file by them. The graph's
-        # further tests keep the project's default tiers, unmeasured: their
-        # import-time lines would land in the context the floor counts as own.
+        # Measure only own tests: graph imports would otherwise count as own.
+        # Keep pytest's default marker selection in both passes.
         passes: list[tuple[list[str], list[str], list[str]]] = [
-            (own, ["-m", RUNNABLE], cov),
+            (own, [], cov),
             (extra, [], []),
         ]
         for index, (tests, marker, measuring) in enumerate(passes):
