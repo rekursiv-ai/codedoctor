@@ -6,8 +6,10 @@ from contextlib import closing
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import fcntl
 import hashlib
 import os
+import shutil
 import sqlite3
 import subprocess
 
@@ -88,17 +90,30 @@ def _indexer(calls: list[Path]) -> Callable[[Path], int]:
     def index(tree: Path) -> int:
         calls.append(tree)
         files = sorted(path.relative_to(tree).as_posix() for path in tree.rglob("*.py"))
-        _codegraph(tree / ".codegraph" / "codegraph.db", files=files)
+        database = tree / ".codegraph" / "codegraph.db"
+        if database.exists():
+            with closing(sqlite3.connect(database)) as connection, connection:
+                connection.execute("DELETE FROM nodes")
+                connection.executemany(
+                    "INSERT INTO nodes VALUES (?, 'function', 'f', 'f', ?, 1, 2)",
+                    [(f"n:{path}", path) for path in files],
+                )
+        else:
+            _codegraph(database, files=files)
         return 0
 
     return index
 
 
 @pytest.mark.parametrize("status", [0, 3])
-def test_a_tree_is_indexed_from_scratch_by_the_codegraph_cli(
+@pytest.mark.parametrize("initialized", [False, True])
+def test_a_tree_syncs_its_existing_index_or_initializes_once(
     tmp_path: Path,
     status: int,
+    initialized: bool,
 ) -> None:
+    if initialized:
+        _codegraph(tmp_path / ".codegraph" / "codegraph.db")
     seen: list[list[str]] = []
 
     def run(argv: Sequence[str]) -> int:
@@ -106,7 +121,11 @@ def test_a_tree_is_indexed_from_scratch_by_the_codegraph_cli(
         return status
 
     assert backbone.index_tree(tmp_path, run=run) == status
-    assert seen == [["codegraph", "init", "--yes", str(tmp_path)]]
+    assert seen == [
+        ["codegraph", "sync", "--quiet", str(tmp_path)]
+        if initialized
+        else ["codegraph", "init", "--yes", str(tmp_path)],
+    ]
 
 
 def test_every_worktree_reads_the_one_backbone(tmp_path: Path) -> None:
@@ -278,7 +297,206 @@ def test_an_overlay_indexes_only_the_changed_files(tmp_path: Path) -> None:
             "SELECT file_path FROM nodes ORDER BY file_path",
         ).fetchall() == [("pkg/a.py",), ("pkg/c.py",)]
     assert overlay.stat().st_mode & 0o777 == 0o664
-    assert [path.name for path in overlay.parent.iterdir()] == ["codegraph.db"]
+    assert sorted(path.name for path in overlay.parent.iterdir()) == [
+        "codegraph.db",
+        "lock",
+    ]
+
+
+def test_updates_seed_the_prior_index_and_preserve_source_metadata(
+    tmp_path: Path,
+) -> None:
+    caches, root, overlay = _fresh(tmp_path)
+    before = backbone.stamped(overlay)
+    with closing(sqlite3.connect(overlay)) as connection, connection:
+        connection.execute("CREATE TABLE retained (value TEXT)")
+        connection.execute("INSERT INTO retained VALUES ('unchanged state')")
+    (root / "a.py").write_text("changed")
+    (root / "b.py").write_text("new")
+    source_stat = (root / "a.py").stat()
+    calls: list[Path] = []
+
+    def index(tree: Path) -> int:
+        database = tree / ".codegraph" / "codegraph.db"
+        assert backbone.stamped(database) == before
+        with closing(sqlite3.connect(database)) as connection:
+            assert connection.execute("SELECT value FROM retained").fetchall() == [
+                ("unchanged state",),
+            ]
+        assert (tree / "a.py").stat().st_mtime_ns == source_stat.st_mtime_ns
+        return _indexer(calls)(tree)
+
+    assert (
+        backbone.build_overlay(
+            root,
+            caches=caches,
+            output=_git(diff="a.py\0b.py\0"),
+            index=index,
+        )
+        == ""
+    )
+    assert len(calls) == 1
+    assert backbone.overlay_problem(
+        caches,
+        root=root,
+        output=_git(diff="a.py\0b.py\0"),
+    ) == ("", overlay)
+
+
+def test_the_stamp_describes_the_copied_content_not_an_earlier_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caches, root, overlay = _fresh(tmp_path)
+    (root / "a.py").write_text("before copy")
+    copy2 = shutil.copy2
+
+    def copy(source: Path, target: Path) -> Path:
+        source.write_text("during copy")
+        copy2(source, target)
+        return target
+
+    monkeypatch.setattr(shutil, "copy2", copy)
+    assert (
+        backbone.build_overlay(
+            root,
+            caches=caches,
+            output=_git(diff="a.py\0"),
+            index=_indexer([]),
+        )
+        == ""
+    )
+    assert backbone.overlay_problem(
+        caches,
+        root=root,
+        output=_git(diff="a.py\0"),
+    ) == ("", overlay)
+
+
+def test_existing_readers_keep_the_old_index_after_publication(tmp_path: Path) -> None:
+    caches, root, overlay = _fresh(tmp_path)
+    (root / "b.py").write_text("new")
+    with closing(sqlite3.connect(overlay)) as reader:
+        before = reader.execute("SELECT file_path FROM nodes").fetchall()
+        assert (
+            backbone.build_overlay(
+                root,
+                caches=caches,
+                output=_git(diff="a.py\0b.py\0"),
+                index=_indexer([]),
+            )
+            == ""
+        )
+        assert reader.execute("SELECT file_path FROM nodes").fetchall() == before
+    with closing(sqlite3.connect(overlay)) as reader:
+        assert reader.execute(
+            "SELECT file_path FROM nodes ORDER BY file_path",
+        ).fetchall() == [
+            ("a.py",),
+            ("b.py",),
+        ]
+
+
+def test_an_empty_overlay_initializes_when_source_arrives(tmp_path: Path) -> None:
+    caches, root, overlay = _fresh(tmp_path, diff="")
+    calls: list[Path] = []
+
+    assert (
+        backbone.build_overlay(
+            root,
+            caches=caches,
+            output=_git(diff="a.py\0"),
+            index=_indexer(calls),
+        )
+        == ""
+    )
+    assert len(calls) == 1
+    with closing(sqlite3.connect(overlay)) as connection:
+        assert connection.execute("SELECT file_path FROM nodes").fetchall() == [
+            ("a.py",),
+        ]
+
+
+def test_removals_sync_the_previous_index_even_when_no_source_remains(
+    tmp_path: Path,
+) -> None:
+    caches, root, overlay = _fresh(tmp_path)
+    (root / "a.py").unlink()
+    calls: list[Path] = []
+
+    assert (
+        backbone.build_overlay(
+            root,
+            caches=caches,
+            output=_git(diff="a.py\0"),
+            index=_indexer(calls),
+        )
+        == ""
+    )
+    assert len(calls) == 1
+    with closing(sqlite3.connect(overlay)) as connection:
+        assert connection.execute("SELECT file_path FROM nodes").fetchall() == []
+    assert backbone.stamped(overlay) == backbone.Stamp(
+        sha=_SHA,
+        fingerprint=backbone.fingerprint(root, sha=_SHA, paths=["a.py"]),
+        paths=("a.py",),
+    )
+
+
+def test_a_failed_update_preserves_the_published_index_and_cleans_scratch(
+    tmp_path: Path,
+) -> None:
+    caches, root, overlay = _fresh(tmp_path)
+    before = overlay.read_bytes()
+    (root / "a.py").write_text("changed")
+
+    def fail(tree: Path) -> int:
+        (tree / ".codegraph" / "codegraph.db").write_bytes(b"partial")
+        return 3
+
+    assert "exit 3" in backbone.build_overlay(
+        root,
+        caches=caches,
+        output=_git(diff="a.py\0"),
+        index=fail,
+    )
+    assert overlay.read_bytes() == before
+    assert sorted(path.name for path in overlay.parent.iterdir()) == [
+        "codegraph.db",
+        "lock",
+    ]
+
+
+def test_the_publisher_holds_a_lock_and_releases_it_after_an_exception(
+    tmp_path: Path,
+) -> None:
+    caches, root, overlay = _fresh(tmp_path)
+    before = overlay.read_bytes()
+    (root / "a.py").write_text("changed")
+
+    def fail(tree: Path) -> int:
+        assert tree.is_dir()
+        with (
+            (overlay.parent / "lock").open("a") as lock,
+            pytest.raises(BlockingIOError),
+        ):
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        raise RuntimeError("index interrupted")
+
+    with pytest.raises(RuntimeError, match="index interrupted"):
+        backbone.build_overlay(
+            root,
+            caches=caches,
+            output=_git(diff="a.py\0"),
+            index=fail,
+        )
+    with (overlay.parent / "lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    assert overlay.read_bytes() == before
+    assert sorted(path.name for path in overlay.parent.iterdir()) == [
+        "codegraph.db",
+        "lock",
+    ]
 
 
 def test_an_unchanged_worktree_reuses_its_overlay(tmp_path: Path) -> None:
@@ -377,7 +595,10 @@ def test_a_failed_index_publishes_nothing(tmp_path: Path) -> None:
 
     assert "exit 3" in problem
     assert not backbone.overlay_database(caches, root=root).exists()
-    assert list(backbone.overlay_database(caches, root=root).parent.iterdir()) == []
+    assert [
+        path.name
+        for path in backbone.overlay_database(caches, root=root).parent.iterdir()
+    ] == ["lock"]
 
 
 def _fresh(tmp_path: Path, *, diff: str = "a.py\0") -> tuple[Path, Path, Path]:

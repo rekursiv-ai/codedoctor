@@ -15,6 +15,7 @@ import sys
 import tempfile
 
 from treekle import json_dumps, json_loads
+from treekle.types import ReadError
 
 import pytest
 
@@ -204,8 +205,24 @@ def test_probed_mirrors_the_root_and_rewrites_only_probed_files(
     assert not overlay.exists()
 
 
-def test_diagnostics_map_the_overlay_back_onto_the_checkout(tmp_path: Path) -> None:
+def test_diagnostics_map_the_overlay_back_onto_the_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Probe verdicts land on the assert; other findings shift left past the probe."""
+    probe_span = unnecessary_assert_isinstance._probe_span
+
+    def basedpyright_span(
+        checked: Path,
+        *,
+        line: int,
+        checker: str,
+        overlay: Path,
+    ) -> range:
+        assert checker == "basedpyright"
+        return probe_span(checked, line=line, checker=checker, overlay=overlay)
+
+    monkeypatch.setattr(unnecessary_assert_isinstance, "_probe_span", basedpyright_span)
     root = tmp_path / "root"
     overlay = tmp_path / "overlay"
     root.mkdir()
@@ -264,6 +281,65 @@ def test_diagnostics_map_the_overlay_back_onto_the_checkout(tmp_path: Path) -> N
         f"  {root / 'm.py'}:2:5 - warning: m (reportUnnecessaryIsInstance)\n"
     )
     assert str(found[2]) == f"  {root / 'm.py'}:8:12 - warning: m\n"
+
+
+@pytest.mark.parametrize("checker", ["basedpyright", "pyrefly"])
+def test_checker_reports_require_a_mapping(tmp_path: Path, checker: str) -> None:
+    parse = (
+        unnecessary_assert_isinstance.diagnostics
+        if checker == "basedpyright"
+        else unnecessary_assert_isinstance.pyrefly_diagnostics
+    )
+
+    with pytest.raises(ReadError):
+        parse("[]", overlay=tmp_path / "overlay", root=tmp_path)
+
+
+@pytest.mark.parametrize("checker", ["basedpyright", "pyrefly"])
+@pytest.mark.parametrize("shape", ["file-link", "directory-link", "outside"])
+@pytest.mark.parametrize("truncated", [False, True], ids=["probe-like", "truncated"])
+def test_live_files_are_never_read_as_overlay_probes(
+    tmp_path: Path,
+    checker: str,
+    shape: str,
+    *,
+    truncated: bool,
+) -> None:
+    root = tmp_path / "root"
+    overlay = tmp_path / "overlay"
+    (root / "pkg").mkdir(parents=True)
+    overlay.mkdir()
+    live = root / "pkg" / "m.py"
+    live.write_text(
+        ""
+        if truncated
+        else unnecessary_assert_isinstance.probe(_NEEDED, checker=checker),
+    )
+    checked = overlay / "pkg" / "m.py"
+    if shape == "file-link":
+        checked.parent.mkdir()
+        checked.symlink_to(live)
+    elif shape == "directory-link":
+        checked.parent.symlink_to(live.parent)
+    else:
+        checked = live
+    finding = replace(_redundancy(checker), path=str(checked))
+    report = _checker_report(checker, cwd=overlay, findings=[finding])
+    parse = (
+        unnecessary_assert_isinstance.diagnostics
+        if checker == "basedpyright"
+        else unnecessary_assert_isinstance.pyrefly_diagnostics
+    )
+
+    found = parse(report, overlay=overlay, root=root)
+
+    assert len(found) == 1
+    assert (found[0].path, found[0].line, found[0].column, found[0].redundant) == (
+        live,
+        2,
+        5,
+        False,
+    )
 
 
 def test_a_diagnostic_without_a_range_sits_at_the_file_start(tmp_path: Path) -> None:
@@ -512,17 +588,187 @@ def test_a_crashed_checker_raises_instead_of_clearing_every_candidate(
     assert (raised.value.returncode, raised.value.stderr) == (status, "panic\n")
 
 
+@pytest.mark.parametrize("phase", ["probe", "baseline", "removed-copy"])
+@pytest.mark.parametrize(
+    "replacement",
+    [None, "", "x = 1\n", _SOURCE.replace("x: int", "x: object")],
+    ids=["deleted-file", "deleted-lines", "moved-assert", "same-assert-new-types"],
+)
+def test_concurrent_edits_fail_without_overwriting_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    phase: str,
+    replacement: str | None,
+) -> None:
+    _project(tmp_path, monkeypatch=monkeypatch)
+    replay = _MainReplay(root=tmp_path)
+    calls = 0
+
+    def edit_during_check(
+        argv: Sequence[Path | str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        text: bool,
+        check: bool,
+    ) -> CompletedProcess[str]:
+        nonlocal calls
+        result = replay(
+            argv,
+            cwd=cwd,
+            capture_output=capture_output,
+            text=text,
+            check=check,
+        )
+        calls += 1
+        if calls == {"probe": 1, "baseline": 3, "removed-copy": 4}[phase]:
+            if replacement is None:
+                (tmp_path / "m.py").unlink()
+            else:
+                (tmp_path / "m.py").write_text(replacement)
+        return result
+
+    monkeypatch.setattr(subprocess, "run", edit_during_check)
+
+    assert _main(monkeypatch, "--fix", "m.py") == 1
+    if replacement is None:
+        assert not (tmp_path / "m.py").exists()
+    else:
+        assert (tmp_path / "m.py").read_text() == replacement
+    assert "changed during type checking; rerun" in capsys.readouterr().err
+
+
+def test_delete_lines_rejects_changed_context_even_when_the_assert_matches(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "m.py"
+    changed = _SOURCE.replace("x: int", "x: object")
+    path.write_text(changed)
+
+    with pytest.raises(unnecessary_assert_isinstance.SourceChangedError):
+        unnecessary_assert_isinstance.delete_lines(path, [2], expected=_SOURCE)
+
+    assert path.read_text() == changed
+
+
+def test_main_preserves_the_probe_snapshot_at_the_cross_check_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _project(tmp_path, monkeypatch=monkeypatch)
+    monkeypatch.setattr(subprocess, "run", _MainReplay(root=tmp_path))
+    still_needed = unnecessary_assert_isinstance.still_needed
+
+    def changed_before_validation(
+        sites: set[tuple[Path, int]],
+        *,
+        root: Path,
+        checkers: Sequence[Path],
+        snapshots: dict[Path, str] | None = None,
+    ) -> set[tuple[Path, int]]:
+        assert snapshots == {tmp_path / "m.py": _SOURCE}
+        (tmp_path / "m.py").write_text("")
+        return still_needed(sites, root=root, checkers=checkers, snapshots=snapshots)
+
+    monkeypatch.setattr(
+        unnecessary_assert_isinstance,
+        "still_needed",
+        changed_before_validation,
+    )
+
+    assert _main(monkeypatch, "--fix", "m.py") == 1
+    assert (tmp_path / "m.py").read_text() == ""
+    assert "changed during type checking; rerun" in capsys.readouterr().err
+
+
+def test_main_preserves_the_probe_snapshot_at_the_deletion_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _project(tmp_path, monkeypatch=monkeypatch)
+    monkeypatch.setattr(subprocess, "run", _MainReplay(root=tmp_path))
+    delete_lines = unnecessary_assert_isinstance.delete_lines
+    changed = _SOURCE.replace("x: int", "x: object")
+
+    def changed_before_deletion(
+        path: Path,
+        lines: Sequence[int],
+        *,
+        expected: str | None = None,
+    ) -> None:
+        assert expected == _SOURCE
+        path.write_text(changed)
+        delete_lines(path, lines, expected=expected)
+
+    monkeypatch.setattr(
+        unnecessary_assert_isinstance,
+        "delete_lines",
+        changed_before_deletion,
+    )
+
+    assert _main(monkeypatch, "--fix", "m.py") == 1
+    assert (tmp_path / "m.py").read_text() == changed
+    assert "changed during type checking; rerun" in capsys.readouterr().err
+
+
+def test_cross_check_rejects_source_changed_since_the_probe(tmp_path: Path) -> None:
+    path = tmp_path / "m.py"
+    path.write_text("")
+
+    with pytest.raises(unnecessary_assert_isinstance.SourceChangedError):
+        unnecessary_assert_isinstance.still_needed(
+            {(path, 2)},
+            root=tmp_path,
+            checkers=[],
+            snapshots={path: _SOURCE},
+        )
+
+    assert path.read_text() == ""
+
+
 def test_a_site_that_is_not_an_assert_is_rejected(tmp_path: Path) -> None:
-    """The file changed since the probe flagged it; blanking the line would corrupt it."""
+    """Invalid caller sites are rejected without blanking unrelated source."""
     (tmp_path / "m.py").write_text("x = 1\ny = 2\n")
 
-    with pytest.raises(ValueError, match="Expected match is not None"):
+    with pytest.raises(ValueError, match=r"^Expected match is not None\.$"):
         unnecessary_assert_isinstance.still_needed(
             {(tmp_path / "m.py", 2)},
             root=tmp_path,
             checkers=[],
         )
     assert (tmp_path / "m.py").read_text() == "x = 1\ny = 2\n"
+
+
+def test_cross_check_overlay_is_named_and_cleaned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "m.py"
+    path.write_text(_SOURCE)
+    link_children = unnecessary_assert_isinstance._link_children
+    overlays: list[Path] = []
+
+    def record_overlay(directory: Path, *, into: Path) -> None:
+        assert into.name.startswith("unnecessary-assert-typecheck-")
+        overlays.append(into)
+        link_children(directory, into=into)
+
+    monkeypatch.setattr(unnecessary_assert_isinstance, "_link_children", record_overlay)
+
+    assert (
+        unnecessary_assert_isinstance.still_needed(
+            {(path, 2)},
+            root=tmp_path,
+            checkers=[],
+        )
+        == set()
+    )
+    assert len(overlays) == 1
+    assert not overlays[0].exists()
+    assert path.read_text() == _SOURCE
 
 
 def test_a_crashed_ty_fails_the_run_and_deletes_nothing(

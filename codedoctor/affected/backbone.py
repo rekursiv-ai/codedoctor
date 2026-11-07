@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
 from urllib.request import pathname2url
 
+import fcntl
 import hashlib
 import os
 import shutil
@@ -246,7 +247,7 @@ def fingerprint(root: Path, *, sha: str, paths: Sequence[str]) -> str:
 
 
 def index_tree(tree: Path, *, run: Callable[[Sequence[str]], int]) -> int:
-    """Index ``tree`` from scratch into its ``.codegraph/codegraph.db``.
+    """Sync ``tree``'s existing index, or initialize it on the first build.
 
     Args:
       tree: The directory to index.
@@ -256,7 +257,11 @@ def index_tree(tree: Path, *, run: Callable[[Sequence[str]], int]) -> int:
       status: The CLI's exit code.
 
     """
-    return run(["codegraph", "init", "--yes", str(tree)])
+    return run(
+        ["codegraph", "sync", "--quiet", str(tree)]
+        if (tree / ".codegraph" / "codegraph.db").is_file()
+        else ["codegraph", "init", "--yes", str(tree)],
+    )
 
 
 def build_overlay(
@@ -268,11 +273,11 @@ def build_overlay(
 ) -> str:
     """Index worktree ``root``'s changes from the backbone into its overlay.
 
-    The changed files are mirrored at their repository-relative paths into a
-    private directory beside the overlay and indexed there, so the overlay's
-    ``file_path`` values name the same files the backbone's do. The result is
-    stamped and renamed into place only once complete; a failure publishes
-    nothing, and the old overlay's stale stamp then keeps readers off it.
+    The changed files are mirrored into a private directory beside the overlay.
+    Its prior index is copied there so CodeGraph syncs only additions, edits,
+    and removals since the last build. Publishers serialize through one lock;
+    readers retain the old index until the completed update replaces it.
+    Temporary files are removed on success and failure.
 
     Args:
       root: The worktree.
@@ -285,34 +290,11 @@ def build_overlay(
       problem: Why no current overlay exists; empty when one does.
 
     """
-    base = stamped(backbone_database(caches))
-    if base is None:
-        return _absent(backbone_database(caches))
-    paths = changed(root, sha=base.sha, output=output)
-    if paths is None:
-        return _unfetched(base.sha)
     overlay = overlay_database(caches, root=root)
-    key = fingerprint(root, sha=base.sha, paths=paths)
-    current = stamped(overlay)
-    if current is not None and (current.sha, current.fingerprint) == (base.sha, key):
-        return ""
     overlay.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="backbone-", dir=overlay.parent) as scratch:
-        tree = Path(scratch) / "tree"
-        present = [path for path in paths if (root / path).is_file()]
-        for path in present:
-            (tree / path).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(root / path, tree / path)
-        built = tree / ".codegraph" / "codegraph.db"
-        if present and (status := index(tree)):
-            return f"Indexing the overlay failed (codegraph exit {status})."
-        if not present:
-            built.parent.mkdir(parents=True)
-            sqlite3.connect(built).close()
-        stamp(built, sha=base.sha, fingerprint=key, paths=paths)
-        built.chmod(0o664)
-        built.replace(overlay)
-    return ""
+    with (overlay.parent / "lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _build_overlay_locked(root, caches=caches, output=output, index=index)
 
 
 def overlay_problem(
@@ -432,3 +414,42 @@ def _missing_columns(database: Path) -> list[str]:
     except sqlite3.Error:
         return ["(unreadable)", *required]
     return [column for column in required if column not in present]
+
+
+def _build_overlay_locked(
+    root: Path,
+    *,
+    caches: Path,
+    output: Callable[[Sequence[str]], str | None],
+    index: Callable[[Path], int],
+) -> str:
+    """Sync and publish an overlay while its caller holds the publisher lock."""
+    base = stamped(backbone_database(caches))
+    if base is None:
+        return _absent(backbone_database(caches))
+    paths = changed(root, sha=base.sha, output=output)
+    if paths is None:
+        return _unfetched(base.sha)
+    overlay = overlay_database(caches, root=root)
+    key = fingerprint(root, sha=base.sha, paths=paths)
+    current = stamped(overlay)
+    if current is not None and (current.sha, current.fingerprint) == (base.sha, key):
+        return ""
+    with tempfile.TemporaryDirectory(prefix="backbone-", dir=overlay.parent) as scratch:
+        tree = Path(scratch) / "tree"
+        present = [path for path in paths if (root / path).is_file()]
+        for path in present:
+            (tree / path).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(root / path, tree / path)
+        built = tree / ".codegraph" / "codegraph.db"
+        built.parent.mkdir(parents=True)
+        seeded = current is not None and not _missing_columns(overlay)
+        if seeded:
+            shutil.copyfile(overlay, built)
+        key = fingerprint(tree, sha=base.sha, paths=paths)
+        if (present or seeded) and (status := index(tree)):
+            return f"Indexing the overlay failed (codegraph exit {status})."
+        stamp(built, sha=base.sha, fingerprint=key, paths=paths)
+        built.chmod(0o664)
+        built.replace(overlay)
+    return ""
