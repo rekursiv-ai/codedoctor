@@ -15,6 +15,7 @@ Examples:
 
 from __future__ import annotations
 
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol, cast
 
@@ -26,25 +27,42 @@ import sys
 import tempfile
 import time
 
-from _pytest.config import hookimpl
+from _pytest.config import Config, hookimpl
 
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Sequence
 
+    from _pytest.config.argparsing import Parser
+
+    from codedoctor.affected import affected
     from codedoctor.gate import gate
     from codedoctor.lib import sidecars
-    from codedoctor.testing import coverage_summary, listing, tiers
+    from codedoctor.testing import coverage_summary, listing, outcomes, tiers
     from codedoctor.testing.tiers import Tier
 else:
     from wrapt import lazy_import
 
     # Pytest loads this plugin before coverage starts; defer the gate's imports.
+    affected = lazy_import("codedoctor.affected.affected")
     gate = lazy_import("codedoctor.gate.gate")
     sidecars = lazy_import("codedoctor.lib.sidecars")
     coverage_summary = lazy_import("codedoctor.testing.coverage_summary")
     listing = lazy_import("codedoctor.testing.listing")
+    outcomes = lazy_import("codedoctor.testing.outcomes")
     tiers = lazy_import("codedoctor.testing.tiers")
+
+
+def pytest_addoption(parser: Parser) -> None:
+    """Register the gate's private own-test outcome log."""
+    parser.addoption("--gate-outcomes", type=Path, default=None)
+
+
+def pytest_configure(config: Config) -> None:
+    """Record outcomes only in the controller, never its xdist workers."""
+    destination = cast(Path | None, config.getoption("gate_outcomes"))
+    if destination is not None and not hasattr(config, "workerinput"):
+        config.pluginmanager.register(outcomes.Outcomes(destination), "gate-outcomes")
 
 
 @hookimpl(wrapper=True)
@@ -110,18 +128,18 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
     sources = [path for path in files if not sidecars.is_test(context.root / path)]
     directories = sorted({Path(path).parent.as_posix() for path in sources})
     measured = context.installed("pytest_cov")
+    collect_coverage = not gate.skipped(context.environ, "coverage-floor")
     cov: list[str] = (
         [
             *(f"--cov={directory}" for directory in directories),
             # Which test ran each line: ``coverage-floor`` counts a file's own.
             "--cov-context=test",
-            "--no-cov-on-fail",
             "--cov-fail-under=0",
             "--cov-report=term-missing:skip-covered"
             if context.environ.get("PRECOMMIT_COVERAGE_DETAIL") == "1"
             else "--cov-report=",
         ]
-        if measured and directories
+        if measured and directories and collect_coverage
         else []
     )
     # A private data file: `coverage erase` or a combine in the checkout deletes
@@ -136,6 +154,7 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
             (own, [], cov),
             (extra, [], []),
         ]
+        failure = 0
         for index, (tests, marker, measuring) in enumerate(passes):
             if not tests:
                 continue
@@ -148,20 +167,38 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
                 listing_file=Path(temp) / f"selected-{index}.txt",
                 count=count,
             )
+            if measuring and data.is_file():
+                outcomes.save(
+                    data,
+                    events=Path(temp) / "outcomes",
+                    tests=tests,
+                    status=status,
+                )
             if status not in {0, 5}:
-                left.write_text(f"pytest exited {status}\n")
-                return status
+                failure = status
+                break
+        if not collect_coverage:
+            left.write_text(
+                f"pytest exited {failure}\n"
+                if failure
+                else "pytest passed but recorded no coverage: coverage-floor is skipped\n",
+            )
+            return failure
         if not cov or not data.is_file():
             left.write_text(
-                "pytest passed but recorded no coverage"
-                + ("" if cov else ": pytest-cov is not installed")
-                + "\n",
+                f"pytest exited {failure}\n"
+                if failure
+                else (
+                    "pytest passed but recorded no coverage"
+                    + ("" if cov else ": pytest-cov is not installed")
+                    + "\n"
+                ),
             )
-            return 0
+            return failure
         below = coverage_summary.shortfall(sources, data=data)
         shutil.move(data, left)
     sys.stderr.writelines(f"{line}\n" for line in below)
-    return int(bool(below))
+    return failure or int(bool(below))
 
 
 def floor(context: gate.Context) -> int:
@@ -374,9 +411,7 @@ def _selected(
             file for path in files for file in sidecars.related(path, root=context.root)
         }
     )
-    own = sorted(
-        path.as_posix() for path in selected if sidecars.is_test(context.root / path)
-    )
+    own = sorted(path.as_posix() for path in selected)
     walked = gate.walk(
         context,
         files=files,
@@ -386,11 +421,13 @@ def _selected(
         workers=workers,
     )
     owned = set(own)
-    # Export overlays are public-root templates, not runnable monorepo tests.
+    patterns = affected.collection_patterns(context.root)[2]
+    # Manual suites are tests for coverage exclusion, not ordinary pytest targets.
     runnable = {
         test.partition("::")[0]
         for test in (*own, *walked)
         if ".export" not in Path(test.partition("::")[0]).parts
+        and any(fnmatch(Path(test.partition("::")[0]).name, p) for p in patterns)
     }
     return [test for test in own if test in runnable], sorted(
         {test for test in walked if test.partition("::")[0] in runnable - owned},
@@ -444,7 +481,9 @@ def _run_pytest(
                 "-p",
                 __name__,
                 *marker,
+                *(["--no-cov"] if not cov and context.installed("pytest_cov") else []),
                 *narrowed,
+                *([f"--gate-outcomes={data.parent / 'outcomes'}"] if cov else []),
                 named,
             ],
         )

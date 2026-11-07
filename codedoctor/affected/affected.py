@@ -192,7 +192,7 @@ def harvest(
     # each changed test file seeds every test in it, so the walk can only name
     # the whole suite. Named as its files, which collect faster than nodeids;
     # walked, it took 48.3s, and past 7 minutes once each seed read an overlay.
-    patterns = _collection_patterns(Path())
+    patterns = collection_patterns(Path())
     if saturated:
         if emit == "files":
             return sorted(set(changed))
@@ -410,73 +410,6 @@ def ensure_derived(database: Path) -> Path | None:
     return cache
 
 
-# `modules` is built in Python because the path arithmetic has to strip a SUFFIX: SQL's
-# `replace(path, '.py', '')` removes that substring anywhere it appears, so `api.pyi`
-# became `apii` and matched no import.
-#
-# The other four exist purely so the recursive CTE stops re-deriving them. Each
-# replaces a construct SQLite cannot index from inside the walk, and together they are
-# the difference between a walk that finishes and one that does not -- 25 seeds at depth
-# 1 went 32.3s to 0.34s, byte-identical rows:
-#
-# `refs` the `reference_kind = 'calls'` filter. `unresolved_refs` has no index on it, so
-# every hop built an AUTOMATIC PARTIAL COVERING INDEX over 276k rows and threw it away.
-# `defcount` the `COUNT(DISTINCT file_path)` guard on the unresolved arm, `anycount` and
-# its counterpart on the edges arm: correlated aggregates re-run per candidate row (`USE
-# TEMP B-TREE FOR count`). `imports` the `kind = 'import'` probes, which read a whole
-# file's nodes by `file_path` and discarded ~95% of them.
-def _build_derived(connection: sqlite3.Connection) -> None:
-    """Materialize the walk's correlated subqueries as indexed tables."""
-    connection.executescript(
-        """
-        CREATE TABLE modules (file_path TEXT, dotted TEXT, package TEXT);
-        CREATE INDEX ix_modules ON modules(file_path);
-        """,
-    )
-    connection.executemany(
-        """INSERT INTO modules VALUES (?, ?, ?)""",
-        _module_rows(
-            cast(
-                list[tuple[str]],
-                connection.execute(
-                    """SELECT DISTINCT file_path FROM source.nodes
-                    WHERE file_path LIKE '%.py' OR file_path LIKE '%.pyi'""",
-                ).fetchall(),
-            ),
-        ),
-    )
-    connection.executescript(
-        """
-        CREATE TABLE refs AS
-          SELECT from_node_id, name_tail, file_path FROM source.unresolved_refs
-          WHERE reference_kind = 'calls';
-        CREATE INDEX ix_refs ON refs(name_tail);
-        CREATE TABLE defcount AS
-          SELECT name, COUNT(DISTINCT file_path) AS n FROM source.nodes
-          WHERE kind IN ('function', 'method', 'class') GROUP BY name;
-        CREATE INDEX ix_defcount ON defcount(name);
-        CREATE TABLE anycount AS
-          SELECT name, COUNT(DISTINCT file_path) AS n FROM source.nodes
-          WHERE kind != 'import' GROUP BY name;
-        CREATE INDEX ix_anycount ON anycount(name);
-        CREATE TABLE imports (file_path TEXT, module TEXT, boundary TEXT);
-        CREATE INDEX ix_imports ON imports(file_path);
-        """,
-    )
-    connection.executemany(
-        """INSERT INTO imports VALUES (?, ?, ?)""",
-        _import_rows(
-            cast(
-                list[tuple[str, str]],
-                connection.execute(
-                    """SELECT file_path, qualified_name FROM source.nodes
-                    WHERE kind = 'import'""",
-                ).fetchall(),
-            ),
-        ),
-    )
-
-
 def _module_rows(paths: Sequence[tuple[str]]) -> list[tuple[str, str, str]]:
     """Return ``(file_path, dotted, package)`` for each Python file in ``paths``."""
     return [
@@ -572,12 +505,16 @@ class _Tools(TypedDict, total=False):
     pytest: _Pytest
 
 
-class _Pyproject(TypedDict, total=False):
-    tool: _Tools
+def collection_patterns(root: Path) -> tuple[list[str], list[str], list[str]]:
+    """Return pytest's collection globs from the project configuration.
 
+    Args:
+      root: The project directory containing pytest's configuration.
 
-def _collection_patterns(root: Path) -> tuple[list[str], list[str], list[str]]:
-    """Return pytest's ``(python_functions, python_classes, python_files)`` globs."""
+    Returns:
+      patterns: The ``python_functions``, ``python_classes``, and ``python_files`` globs.
+
+    """
     settings: dict[str, object] = {}
     pyproject = root / "pyproject.toml"
     if pyproject.is_file():
@@ -1204,3 +1141,74 @@ def _quietly(argv: Sequence[str]) -> int:
     except FileNotFoundError:
         sys.stderr.write(f"{argv[0]}: command not found\n")
         return 127
+
+
+# `modules` is built in Python because the path arithmetic has to strip a SUFFIX: SQL's
+# `replace(path, '.py', '')` removes that substring anywhere it appears, so `api.pyi`
+# became `apii` and matched no import.
+#
+# The other four exist purely so the recursive CTE stops re-deriving them. Each
+# replaces a construct SQLite cannot index from inside the walk, and together they are
+# the difference between a walk that finishes and one that does not -- 25 seeds at depth
+# 1 went 32.3s to 0.34s, byte-identical rows:
+#
+# `refs` the `reference_kind = 'calls'` filter. `unresolved_refs` has no index on it, so
+# every hop built an AUTOMATIC PARTIAL COVERING INDEX over 276k rows and threw it away.
+# `defcount` the `COUNT(DISTINCT file_path)` guard on the unresolved arm, `anycount` and
+# its counterpart on the edges arm: correlated aggregates re-run per candidate row (`USE
+# TEMP B-TREE FOR count`). `imports` the `kind = 'import'` probes, which read a whole
+# file's nodes by `file_path` and discarded ~95% of them.
+def _build_derived(connection: sqlite3.Connection) -> None:
+    """Materialize the walk's correlated subqueries as indexed tables."""
+    connection.executescript(
+        """
+        CREATE TABLE modules (file_path TEXT, dotted TEXT, package TEXT);
+        CREATE INDEX ix_modules ON modules(file_path);
+        """,
+    )
+    connection.executemany(
+        """INSERT INTO modules VALUES (?, ?, ?)""",
+        _module_rows(
+            cast(
+                list[tuple[str]],
+                connection.execute(
+                    """SELECT DISTINCT file_path FROM source.nodes
+                    WHERE file_path LIKE '%.py' OR file_path LIKE '%.pyi'""",
+                ).fetchall(),
+            ),
+        ),
+    )
+    connection.executescript(
+        """
+        CREATE TABLE refs AS
+          SELECT from_node_id, name_tail, file_path FROM source.unresolved_refs
+          WHERE reference_kind = 'calls';
+        CREATE INDEX ix_refs ON refs(name_tail);
+        CREATE TABLE defcount AS
+          SELECT name, COUNT(DISTINCT file_path) AS n FROM source.nodes
+          WHERE kind IN ('function', 'method', 'class') GROUP BY name;
+        CREATE INDEX ix_defcount ON defcount(name);
+        CREATE TABLE anycount AS
+          SELECT name, COUNT(DISTINCT file_path) AS n FROM source.nodes
+          WHERE kind != 'import' GROUP BY name;
+        CREATE INDEX ix_anycount ON anycount(name);
+        CREATE TABLE imports (file_path TEXT, module TEXT, boundary TEXT);
+        CREATE INDEX ix_imports ON imports(file_path);
+        """,
+    )
+    connection.executemany(
+        """INSERT INTO imports VALUES (?, ?, ?)""",
+        _import_rows(
+            cast(
+                list[tuple[str, str]],
+                connection.execute(
+                    """SELECT file_path, qualified_name FROM source.nodes
+                    WHERE kind = 'import'""",
+                ).fetchall(),
+            ),
+        ),
+    )
+
+
+class _Pyproject(TypedDict, total=False):
+    tool: _Tools

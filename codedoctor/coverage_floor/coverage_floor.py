@@ -23,13 +23,12 @@ Examples:
 
 from __future__ import annotations
 
-from contextlib import suppress
+from contextlib import closing, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, Protocol, cast
 
 import argparse
 import os
-import re
 import sys
 
 from coverage import results
@@ -40,6 +39,7 @@ import coverage
 from codedoctor.gate.gate import skipped
 from codedoctor.lib import pyproject_flags
 from codedoctor.lib.sidecars import is_test, paired
+from codedoctor.testing.outcomes import invalid_tests
 
 
 if TYPE_CHECKING:
@@ -147,26 +147,31 @@ def report(
         source's import, count.
 
     Returns:
-      below: Whether any measured unit is under its floor; with no source
-        measured, False.
+      below: Whether any source lacks measurements, has failed or unfinished
+        own tests, or belongs to a unit below its floor.
 
     """
-    measurement = coverage.Coverage(data_file=str(data))
-    measurement.load()
-    measured = set(measurement.get_data().measured_files())
-    # `morfs`, not `include`: an include list is matched as one glob per
-    # source against every measured file, 3.7s for 472 sources. A source the
-    # data never saw is left out, exactly as `include` leaves it out.
+    measurement = _own_measurement(data, sources=sources, owners=owners)
+    measured = measurement.get_data().measured_files()
+    invalid = invalid_tests(data)
+    below = False
+    for source in sources:
+        failed = sorted(invalid.intersection(owners[source]))
+        if failed:
+            sys.stdout.write(
+                f"coverage-floor: {source} has failed or unfinished tests: "
+                f"{', '.join(failed)}\n",
+            )
+            below = True
+        if str(Path(source).resolve()) not in measured:
+            sys.stdout.write(f"coverage-floor: {source} has no coverage measurement\n")
+            below = True
+    # `morfs`, not `include`: one glob per source took 3.7s for 472 sources.
     morfs = [source for source in sources if str(Path(source).resolve()) in measured]
     # No table: printing one re-read every source, 10s of an --all-files run, and
     # each unit below its floor already names its missed lines.
     units: dict[str, tuple[float, int, int, list[str]]] = {}
     for source in morfs:
-        # The empty context is import: a module's own lines run then, before
-        # any test, whichever test file imported it.
-        measurement.get_data().set_query_contexts(
-            ["^$", *(f"^{re.escape(test)}::" for test in owners[source])],
-        )
         _, statements, _, missing, gaps = measurement.analysis2(source)
         unit = source if scope == "file" else str(Path(source).parent)
         floor = floors[
@@ -180,7 +185,6 @@ def report(
             where = [*where, gaps if scope == "file" else f"{source}: {gaps}"]
         units[unit] = (floor, total + len(statements), missed + len(missing), where)
     precision = measurement.config.precision
-    below = False
     for unit, (floor, total, missed, where) in units.items():
         percent = 100 * (total - missed) / total if total else 100.0
         if results.should_fail_under(percent, floor, precision):
@@ -190,7 +194,42 @@ def report(
                 f"is below {floor:g}%; missed {'; '.join(where)}\n",
             )
             below = True
+    measurement.get_data().close()
     return below
+
+
+def _own_measurement(
+    data: Path,
+    *,
+    sources: Sequence[str],
+    owners: Mapping[str, Sequence[str]],
+) -> coverage.Coverage:
+    """Filter file-scoped contexts without rescanning every test for every source."""
+    measurement = coverage.Coverage(data_file=None)
+    filtered = measurement.get_data()
+    with closing(coverage.CoverageData(basename=str(data), read_only=True)) as recorded:
+        recorded.read()
+        measured = recorded.measured_files()
+        with recorded.keep_db_open():
+            for source in sources:
+                filename = str(Path(source).resolve())
+                if filename not in measured:
+                    continue
+                tests = set(owners[source])
+                # Import-time lines count regardless of which test imported them.
+                lines = [
+                    line
+                    for line, contexts in recorded.contexts_by_lineno(filename).items()
+                    if any(
+                        not context or context.partition("::")[0] in tests
+                        for context in contexts
+                    )
+                ]
+                filtered.add_lines({filename: lines})
+                tracer = recorded.file_tracer(filename) or ""
+                if tracer:
+                    filtered.add_file_tracers({filename: tracer})
+    return measurement
 
 
 # No file is a ``pytest`` gate that never ran. Under a ``SKIP`` naming it that is

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, cast
+from unittest.mock import Mock
 
 import argparse
 import sys
@@ -16,6 +17,7 @@ import yaml
 
 from codedoctor.coverage_floor import coverage_floor
 from codedoctor.lib.testing.checks import assert_help_without_docstring
+from codedoctor.testing import outcomes
 
 
 if TYPE_CHECKING:
@@ -211,6 +213,129 @@ def test_a_run_floors_each_source_by_its_own_tests_lines_alone(
     )
 
 
+@pytest.mark.parametrize("failed", ["pkg/m_test.py", "pkg/o_test.py"])
+@pytest.mark.parametrize("executed", [_CALLED, [1, 2, 3, 4]])
+def test_failures_are_scoped_to_own_tests_without_hiding_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failed: str,
+    executed: list[int],
+) -> None:
+    _tree(
+        tmp_path,
+        {"pkg/m.py": _SOURCE, "pkg/m_test.py": "", "pkg/m_split_test.py": ""},
+    )
+    monkeypatch.chdir(tmp_path)
+    data = tmp_path / ".coverage"
+    _measured(
+        tmp_path,
+        {"pkg/m_test.py::test_f|run": {"pkg/m.py": executed}},
+        data=data,
+    )
+    events = tmp_path / "events"
+    events.write_text(
+        f"selected\nfailed\t{failed}::test_f\n"
+        + (
+            "failed\tpkg/m_split_test.py::test_g\n" if failed == "pkg/m_test.py" else ""
+        ),
+    )
+    outcomes.save(data, events=events, tests=["pkg/m_test.py"], status=1)
+
+    assert _main(monkeypatch, "--floor", "pkg/=100", "--", "pkg/m.py") == int(
+        failed == "pkg/m_test.py" or executed == _CALLED,
+    )
+    output = capsys.readouterr().out
+    assert output == (
+        (
+            "coverage-floor: pkg/m.py has failed or unfinished tests: "
+            "pkg/m_split_test.py, pkg/m_test.py\n"
+            if failed == "pkg/m_test.py"
+            else ""
+        )
+        + (
+            "coverage-floor: pkg/m.py at 75% is below 100%; missed 4\n"
+            if executed == _CALLED
+            else ""
+        )
+    )
+
+
+def test_reporting_uses_only_file_scoped_context_queries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _tree(tmp_path, {"pkg/m.py": _SOURCE, "pkg/n.py": _SOURCE})
+    monkeypatch.chdir(tmp_path)
+    data = tmp_path / ".coverage"
+    _measured(
+        tmp_path,
+        {
+            "": {"pkg/m.py": [1], "pkg/n.py": [1]},
+            "pkg/m_test.py::TestM::test_f|run": {"pkg/m.py": [2, 3]},
+            "pkg/n_test.py::test_f|run": {"pkg/n.py": [2, 3, 4]},
+            "unrelated_test.py::test_f|run": {"pkg/m.py": [4]},
+        },
+        data=data,
+    )
+    before = data.read_bytes()
+
+    def global_query(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Global context scans must not run per source")
+
+    monkeypatch.setattr(coverage.CoverageData, "set_query_contexts", global_query)
+    reader = Mock(wraps=coverage.CoverageData)
+    monkeypatch.setattr(coverage, "CoverageData", reader)
+    assert coverage_floor.report(
+        data,
+        sources=["pkg/m.py", "pkg/n.py"],
+        floors={"pkg/": 100.0},
+        scope="file",
+        owners={"pkg/m.py": ["pkg/m_test.py"], "pkg/n.py": ["pkg/n_test.py"]},
+    )
+    assert capsys.readouterr().out == (
+        "coverage-floor: pkg/m.py at 75% is below 100%; missed 4\n"
+    )
+    reader.assert_called_once_with(basename=str(data), read_only=True)
+    assert data.read_bytes() == before
+
+
+def test_owned_measurement_preserves_file_tracers(tmp_path: Path) -> None:
+    data = tmp_path / ".coverage"
+    filename = str(tmp_path / "m.py")
+    recorded = coverage.CoverageData(basename=str(data))
+    recorded.add_lines({filename: [1]})
+    recorded.add_file_tracers({filename: "example.plugin"})
+    recorded.write()
+    recorded.close()
+
+    measurement = coverage_floor._own_measurement(
+        data,
+        sources=[filename],
+        owners={filename: []},
+    )
+    assert measurement.get_data().file_tracer(filename) == "example.plugin"
+    measurement.get_data().close()
+
+
+def test_owned_lines_keep_coverages_multiline_statement_mapping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _tree(
+        tmp_path,
+        {"pkg/m.py": "def f():\n    return (\n        1\n    )\n", "pkg/m_test.py": ""},
+    )
+    monkeypatch.chdir(tmp_path)
+    _measured(
+        tmp_path,
+        {"": {"pkg/m.py": [1]}, "pkg/m_test.py::test_f|run": {"pkg/m.py": [3]}},
+        data=tmp_path / ".coverage",
+    )
+    assert _main(monkeypatch, "--floor", "pkg/=100", "--", "pkg/m.py") == 0
+
+
 def test_a_split_test_counts_as_the_modules_own(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -395,17 +520,22 @@ def test_without_pytests_data_the_floor_passes_only_where_pytest_was_skipped(
 
 @pytest.mark.parametrize(
     ("hand_off", "reason"),
-    [("pytest exited 2\n", "pytest exited 2"), ("", "an empty hand-off")],
+    [
+        (b"pytest exited 2\n", "pytest exited 2"),
+        (b"", "an empty hand-off"),
+        (b"\xff\n", "\ufffd"),
+    ],
 )
 def test_a_pytest_run_that_measured_nothing_fails_the_floor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    hand_off: str,
+    hand_off: bytes,
     reason: str,
 ) -> None:
     """``pytest`` failed: its hand-off says so, and the floor must not pass."""
-    _tree(tmp_path, {"pkg/m.py": _SOURCE, "pkg/m_test.py": "", "data": hand_off})
+    _tree(tmp_path, {"pkg/m.py": _SOURCE, "pkg/m_test.py": ""})
+    (tmp_path / "data").write_bytes(hand_off)
     monkeypatch.chdir(tmp_path)
 
     assert _main(monkeypatch, "--floor", "pkg/=100", "--", "pkg/m.py", data="data") == 1
@@ -495,7 +625,7 @@ def test_report_floors_each_measured_unit(
     assert capsys.readouterr().out == (f"coverage-floor: {shown}\n" if shown else "")
 
 
-def test_report_skips_a_source_the_data_never_saw(
+def test_report_fails_a_source_the_data_never_saw(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -506,14 +636,16 @@ def test_report_skips_a_source_the_data_never_saw(
     _measured(tmp_path, {"": {"pkg/n.py": _ALL_TWENTY}}, data=data)
     sources = ["pkg/m.py", "pkg/n.py"]
 
-    assert not coverage_floor.report(
+    assert coverage_floor.report(
         data,
         sources=sources,
         floors={"pkg/": 100.0},
         scope="file",
         owners=_owners(sources),
     )
-    assert capsys.readouterr().out == ""
+    assert capsys.readouterr().out == (
+        "coverage-floor: pkg/m.py has no coverage measurement\n"
+    )
 
 
 def test_report_pools_only_one_directory_s_sources(
@@ -649,6 +781,13 @@ def test_flags_parse_to_their_types(capsys: pytest.CaptureFixture[str]) -> None:
     )
 
     assert (defaults.paths, defaults.scope, defaults.floor) == ([], "file", [])
+    assert (
+        cast(
+            coverage_floor.Flags,
+            parser.parse_args(["--data", "d", "--scope", "file"]),
+        ).scope
+        == "file"
+    )
     assert (flags.data, flags.paths, flags.scope) == (Path("d"), ["x.py"], "directory")
     assert flags.floor == ["a=b/=90"]
     assert coverage_floor._floor(flags.floor[-1]) == ("a=b/", 90.0)
