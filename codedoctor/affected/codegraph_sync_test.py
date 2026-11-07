@@ -44,7 +44,6 @@ class _Tools:
         self.installed = installed
         self.installable = installable
         self.calls: list[list[str]] = []
-        self.spawned: list[tuple[list[str], Path, Path]] = []
 
     def run(self, argv: Sequence[str]) -> int:
         """Run one argv: codegraph writes an index into the tree it names."""
@@ -59,11 +58,6 @@ class _Tools:
         if "rev-parse" in argv:
             return f"{self.sha}\n" if self.sha else None
         return self.diff if "diff" in argv else ""
-
-    def spawn(self, argv: Sequence[str], *, cwd: Path, log: Path) -> object:
-        """Record a detached process in place of starting it."""
-        self.spawned.append((list(argv), cwd, log))
-        return None
 
     def which(self, name: str) -> str | None:
         """Find only the codegraph CLI: installed, or installable and installed by npm."""
@@ -110,9 +104,7 @@ def _sync(tmp_path: Path, tools: _Tools) -> str:
         root,
         caches=tmp_path / "caches",
         run=tools.run,
-        output=tools.output,
         which=tools.which,
-        spawn=tools.spawn,
     )
 
 
@@ -345,191 +337,58 @@ def test_a_failed_index_names_the_commit_and_status(tmp_path: Path) -> None:
     assert problem == "Indexing 0123456789ab failed (codegraph exit 3)."
 
 
-def test_a_missing_backbone_starts_one_in_the_background(tmp_path: Path) -> None:
-    """The first commit pays nothing; its gates select without the graph."""
-    tools = _Tools()
-
-    problem = _sync(tmp_path, tools)
-
-    log = backbone.overlay_database(tmp_path / "caches", root=tmp_path / "root")
-    assert problem == (
-        "No CodeGraph backbone yet; building one in the background "
-        f"(log: {log.with_name('refresh.log')}). "
-        "Gates select without the graph until it lands."
-    )
-    assert tools.spawned == [
-        (
-            [
-                sys.executable,
-                "-m",
-                "codedoctor.affected.codegraph_sync",
-                "--caches",
-                str(tmp_path / "caches"),
-                "--refresh",
-            ],
-            tmp_path / "root",
-            backbone.overlay_database(
-                tmp_path / "caches",
-                root=tmp_path / "root",
-            ).with_name(
-                "refresh.log",
-            ),
-        ),
-    ]
-    assert str(tools.spawned[0][2]) in problem
-
-
-def test_a_published_backbone_gets_this_worktrees_overlay(tmp_path: Path) -> None:
-    _refresh(tmp_path, _Tools())
-    tools = _Tools()
+def test_a_missing_backbone_indexes_the_current_worktree(tmp_path: Path) -> None:
+    tools = _Tools(sha="")
 
     assert _sync(tmp_path, tools) == ""
-    assert tools.spawned == []
-    overlay = backbone.overlay_database(tmp_path / "caches", root=tmp_path / "root")
-    assert backbone.stamped(overlay) is not None
+    assert tools.calls == [
+        ["codegraph", "init", "--yes", str(tmp_path / "root")],
+    ]
+    assert (tmp_path / "root/.codegraph/codegraph.db").is_file()
 
 
-def test_a_backbone_behind_origin_main_is_refreshed_in_the_background(
-    tmp_path: Path,
-) -> None:
-    """Nothing else republished it: 29 commits behind, the overlay held 1,019 files."""
+def test_a_published_backbone_is_not_used_by_the_hook(tmp_path: Path) -> None:
     _refresh(tmp_path, _Tools(sha=_OLD))
     tools = _Tools(sha=_NEW)
 
     assert _sync(tmp_path, tools) == ""
-    assert tools.spawned == [
-        (
-            [
-                sys.executable,
-                "-m",
-                "codedoctor.affected.codegraph_sync",
-                "--caches",
-                str(tmp_path / "caches"),
-                "--refresh",
-                "--fetch",
-            ],
-            tmp_path / "root",
-            backbone.overlay_database(
-                tmp_path / "caches",
-                root=tmp_path / "root",
-            ).with_name("refresh.log"),
-        ),
+    assert tools.calls == [
+        ["codegraph", "init", "--yes", str(tmp_path / "root")],
     ]
-    overlay = backbone.overlay_database(tmp_path / "caches", root=tmp_path / "root")
-    assert backbone.stamped(overlay) is not None
-    assert tools.ran("rev-parse") == [
-        [
-            "git",
-            "-C",
-            str(tmp_path / "root"),
-            "rev-parse",
-            "--verify",
-            "origin/main^{commit}",
-        ],
-    ]
-
-
-def test_the_gate_gives_no_worktree_a_cli_index(tmp_path: Path) -> None:
-    """Each gate-made CLI index copied the whole backbone: 825 MB per worktree."""
-    _refresh(tmp_path, _Tools())
-
-    _sync(tmp_path, _Tools())
-
-    assert not (tmp_path / "root" / ".codegraph").exists()
-    overlay = backbone.overlay_database(tmp_path / "caches", root=tmp_path / "root")
-    assert not (overlay.parent / "cli").exists()
+    assert backbone.stamped(backbone.backbone_database(tmp_path / "caches")) == (
+        backbone.Stamp(sha=_OLD)
+    )
 
 
 def test_the_gate_restores_a_removed_cli_link_without_copying(tmp_path: Path) -> None:
-    _refresh(tmp_path, _Tools())
     root = tmp_path / "root"
     root.mkdir()
-    caches = tmp_path / "caches"
-    assert codegraph_sync.link_cli_index(root, caches=caches) == ""
-    link = root / ".codegraph"
-    database = link.resolve() / "codegraph.db"
-    before = database.read_bytes(), database.stat().st_ino
-    link.unlink()
-
-    assert _sync(tmp_path, _Tools()) == ""
-
-    assert link.is_symlink()
-    assert link.resolve() == database.parent
-    assert (database.read_bytes(), database.stat().st_ino) == before
-
-
-def test_the_gate_restores_a_cli_link_without_a_backbone(tmp_path: Path) -> None:
-    root = tmp_path / "root"
-    root.mkdir()
-    caches = tmp_path / "caches"
-    database = backbone.overlay_database(caches, root=root).parent / "cli/codegraph.db"
+    database = backbone.overlay_database(tmp_path / "caches", root=root)
+    database = database.parent / "cli/codegraph.db"
     _index(database)
+    tools = _Tools()
 
-    assert "building one in the background" in _sync(tmp_path, _Tools())
-
-    assert (root / ".codegraph").is_symlink()
+    assert _sync(tmp_path, tools) == ""
     assert (root / ".codegraph").resolve() == database.parent
-
-
-def test_the_gate_reports_a_cli_link_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    root = tmp_path / "root"
-    root.mkdir()
-    caches = tmp_path / "caches"
-    database = backbone.overlay_database(caches, root=root).parent / "cli/codegraph.db"
-    _index(database)
-
-    def denied(self: Path, target: Path) -> None:
-        assert self == root / ".codegraph"
-        assert target == database.parent
-        raise PermissionError("link denied")
-
-    monkeypatch.setattr(Path, "symlink_to", denied)
-
-    assert "link denied" in _sync(tmp_path, _Tools())
-    assert not (root / ".codegraph").is_symlink()
-
-
-def test_the_gate_does_not_link_an_unseeded_cli_directory(tmp_path: Path) -> None:
-    _refresh(tmp_path, _Tools())
-    root = tmp_path / "root"
-    root.mkdir()
-    home = backbone.overlay_database(tmp_path / "caches", root=root).parent / "cli"
-    home.mkdir(parents=True)
-
-    assert _sync(tmp_path, _Tools()) == ""
-
-    assert not (root / ".codegraph").is_symlink()
-    assert list(home.iterdir()) == []
+    assert tools.calls == [["codegraph", "sync", "--quiet", str(root)]]
 
 
 @pytest.mark.parametrize("symlink", [False, True])
-def test_the_gate_preserves_an_existing_cli_index(
-    tmp_path: Path,
-    symlink: bool,
-) -> None:
-    _refresh(tmp_path, _Tools())
+def test_the_gate_syncs_an_existing_cli_index(tmp_path: Path, symlink: bool) -> None:
     root = tmp_path / "root"
     root.mkdir()
-    caches = tmp_path / "caches"
-    assert codegraph_sync.link_cli_index(root, caches=caches) == ""
     link = root / ".codegraph"
-    link.unlink()
-    own = tmp_path / "own"
     if symlink:
+        own = tmp_path / "own"
+        _index(own / "codegraph.db")
         link.symlink_to(own)
     else:
-        link.mkdir()
+        _index(link / "codegraph.db")
+    tools = _Tools()
 
-    assert _sync(tmp_path, _Tools()) == ""
-
+    assert _sync(tmp_path, tools) == ""
     assert link.is_symlink() is symlink
-    if symlink:
-        assert link.readlink() == own
-    else:
-        assert list(link.iterdir()) == []
+    assert tools.calls == [["codegraph", "sync", "--quiet", str(root)]]
 
 
 def test_a_worktree_gets_a_cli_index_seeded_from_the_backbone(tmp_path: Path) -> None:
@@ -575,6 +434,29 @@ def test_an_existing_cli_index_is_left_alone(tmp_path: Path) -> None:
     assert list(own.iterdir()) == []
 
 
+def test_cli_link_permission_failure_is_reported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    caches = tmp_path / "caches"
+    database = backbone.overlay_database(caches, root=root).parent / "cli/codegraph.db"
+    _index(database)
+
+    def denied(self: Path, target: Path) -> None:
+        assert self == root / ".codegraph"
+        assert target == database.parent
+        raise PermissionError("link denied")
+
+    monkeypatch.setattr(Path, "symlink_to", denied)
+
+    assert codegraph_sync.link_cli_index(root, caches=caches) == (
+        f"Linking {root / '.codegraph'} to {database.parent} failed: link denied"
+    )
+    assert not (root / ".codegraph").is_symlink()
+
+
 def test_a_cli_index_without_a_backbone_is_refused(tmp_path: Path) -> None:
     """An empty ``cli`` directory once stood in for an index the copy never made."""
     root = tmp_path / "root"
@@ -591,16 +473,15 @@ def test_a_cli_index_without_a_backbone_is_refused(tmp_path: Path) -> None:
     assert not (overlay.parent / "cli").exists()
 
 
-def test_an_overlay_is_indexed_by_the_codegraph_cli(tmp_path: Path) -> None:
-    _refresh(tmp_path, _Tools())
+def test_current_files_are_indexed_by_the_codegraph_cli(tmp_path: Path) -> None:
     (tmp_path / "root").mkdir()
     (tmp_path / "root" / "a.py").write_text("def f(): pass\n")
-    tools = _Tools(diff="a.py\0")
+    tools = _Tools()
 
     assert _sync(tmp_path, tools) == ""
-    ((codegraph, init, yes, tree),) = tools.ran("codegraph")
-    assert (codegraph, init, yes) == ("codegraph", "init", "--yes")
-    assert Path(tree).name == "tree"
+    assert tools.ran("codegraph") == [
+        ["codegraph", "init", "--yes", str(tmp_path / "root")],
+    ]
 
 
 def test_a_missing_cli_that_npm_cannot_install_is_reported(tmp_path: Path) -> None:
@@ -620,8 +501,11 @@ def test_a_missing_cli_is_installed_then_used(tmp_path: Path) -> None:
 
     problem = _sync(tmp_path, tools)
 
-    assert tools.calls == [["npm", "install", "-g", "@colbymchenry/codegraph"]]
-    assert "background" in problem
+    assert tools.calls == [
+        ["npm", "install", "-g", "@colbymchenry/codegraph"],
+        ["codegraph", "init", "--yes", str(tmp_path / "root")],
+    ]
+    assert problem == ""
 
 
 def test_an_installed_cli_is_not_reinstalled(tmp_path: Path) -> None:
@@ -682,9 +566,7 @@ def _main(
         assert kwargs == {
             "caches": caches,
             "run": run_argv,
-            "output": output_argv,
             "which": shutil.which,
-            "spawn": codegraph_sync.spawn,
         }
         called.append(f"sync {root}")
         return "overlay problem"
@@ -777,7 +659,7 @@ def test_the_help_describes_both_modes(
         codegraph_sync.main()
     text = capsys.readouterr().out
 
-    assert "Keep the shared CodeGraph backbone" in text
+    assert "Keep this worktree's CodeGraph index current." in text
     assert "--refresh republishes the backbone" in text
     assert "--cli links this worktree" in text
     assert "exec uv" not in text

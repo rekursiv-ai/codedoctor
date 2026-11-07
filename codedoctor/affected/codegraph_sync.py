@@ -3,13 +3,12 @@
 # fmt: off
 '''' 2>/dev/null #
 exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
-Keep the shared CodeGraph backbone and this worktree's overlay current.
+Keep this worktree's CodeGraph index current.
 
 Hook mode runs when an enabled hook's resolved PRECOMMIT_SCOPE needs the graph.
-It restores a missing CLI link to an existing cached index, installs the CLI
-if missing, starts building the backbone in the background
-when none exists, and indexes this worktree's changes into its overlay. It never
-fails a commit: a problem is printed, and `affected` refuses a stale overlay.
+It installs the CLI if missing and syncs the current filesystem state into the
+worktree's index. It never resolves or fetches a commit. It never fails a commit:
+a problem is printed, and `affected` retries before selecting dependents.
 
 --refresh republishes the backbone at origin/main; a timer runs it with --fetch.
 
@@ -26,7 +25,6 @@ Examples:
 
 from __future__ import annotations
 
-from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 from urllib.request import pathname2url
@@ -84,9 +82,7 @@ def main() -> int:
             Path.cwd(),
             caches=flags.caches,
             run=run_argv,
-            output=output_argv,
             which=shutil.which,
-            spawn=spawn,
         )
     ):
         sys.stderr.write(f"codegraph-sync: {problem}\n")
@@ -112,42 +108,25 @@ def opted_in(environ: Mapping[str, str]) -> bool:
     )
 
 
-class Spawn(Protocol):
-    """Starts ``argv`` detached in ``cwd``, its output appended to ``log``."""
-
-    def __call__(self, argv: Sequence[str], *, cwd: Path, log: Path) -> object:
-        """Start the process; return its handle."""
-        ...
-
-
 def sync(
     root: Path,
     *,
     caches: Path,
     run: Callable[[Sequence[str]], int],
-    output: Callable[[Sequence[str]], str | None],
     which: Callable[[str], str | None],
-    spawn: Spawn,
 ) -> str:
-    """Bring worktree ``root``'s overlay current, starting a backbone if none exists.
+    """Sync the current worktree's files into its CodeGraph index.
 
     Args:
       root: The worktree.
       caches: The CodeGraph cache directory.
       run: Runs one argv; returns its exit code.
-      output: Runs one argv; returns its stdout, or None when it failed.
       which: Finds an executable on PATH.
-      spawn: Starts the backbone build detached.
 
     Returns:
       problem: Why the gates must select without the graph; empty otherwise.
 
     """
-    cached_cli = backbone.overlay_database(caches, root=root).parent / "cli"
-    if (cached_cli / "codegraph.db").is_file() and (
-        problem := link_cli_index(root, caches=caches)
-    ):
-        return problem
     if which("codegraph") is None:
         run(["npm", "install", "-g", "@colbymchenry/codegraph"])
         if which("codegraph") is None:
@@ -155,35 +134,7 @@ def sync(
                 "The codegraph CLI is missing, and `npm install -g "
                 "@colbymchenry/codegraph` did not install it."
             )
-    database = backbone.backbone_database(caches)
-    log = backbone.overlay_database(caches, root=root).with_name("refresh.log")
-    command = [
-        sys.executable,
-        "-m",
-        "codedoctor.affected.codegraph_sync",
-        "--caches",
-        str(caches),
-        "--refresh",
-    ]
-    if not database.exists():
-        spawn(command, cwd=root, log=log)
-        return (
-            f"No CodeGraph backbone yet; building one in the background (log: {log}). "
-            "Gates select without the graph until it lands."
-        )
-    # Nothing else republishes the backbone, and every commit since it was built
-    # lands in each overlay: 29 behind, an overlay indexed 1,019 files, not 219.
-    # Fetched in the background, so the commit never waits on the network.
-    published = backbone.stamped(database)
-    head = _origin_main(root, output=output)
-    if published is not None and head and published.sha != head:
-        spawn([*command, "--fetch"], cwd=root, log=log)
-    return backbone.build_overlay(
-        root,
-        caches=caches,
-        output=output,
-        index=partial(backbone.index_tree, run=run),
-    )
+    return backbone.sync_worktree(root, caches=caches, run=run)
 
 
 def refresh(

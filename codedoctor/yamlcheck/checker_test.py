@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from pathlib import Path
+from unittest.mock import patch
 
 import sys
 
@@ -11,10 +12,6 @@ from ruamel.yaml import YAML, YAMLError
 import pytest
 
 from codedoctor.yamlcheck import checker
-
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 @pytest.mark.parametrize(
@@ -88,6 +85,23 @@ def test_does_not_change_other_yaml_loaders(tmp_path: Path) -> None:
     assert checker.check([path]) == 0
     with pytest.raises(YAMLError):
         YAML(typ="safe").load("ports: !reset []")
+
+
+def test_uses_pure_safe_loader_and_explicit_utf8(tmp_path: Path) -> None:
+    path = tmp_path / "unicode.yml"
+    path.write_text("label: café\n", encoding="utf-8")
+    with (
+        patch.object(checker, "YAML", wraps=YAML) as loader,
+        patch.object(
+            Path,
+            "read_text",
+            autospec=True,
+            side_effect=Path.read_text,
+        ) as read_text,
+    ):
+        assert checker.check([path]) == 0
+    loader.assert_called_once_with(typ="safe", pure=True)
+    read_text.assert_called_once_with(path, encoding="utf-8")
 
 
 def test_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

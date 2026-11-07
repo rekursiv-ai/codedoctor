@@ -128,6 +128,82 @@ def test_a_tree_syncs_its_existing_index_or_initializes_once(
     ]
 
 
+def test_worktree_sync_uses_current_files_without_a_backbone(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.py").write_text("def f(): pass\n")
+    seen: list[list[str]] = []
+
+    def run(argv: Sequence[str]) -> int:
+        seen.append(list(argv))
+        _codegraph(root / ".codegraph" / "codegraph.db", files=["a.py"])
+        return 0
+
+    assert backbone.sync_worktree(root, caches=tmp_path / "caches", run=run) == ""
+    assert seen == [["codegraph", "init", "--yes", str(root)]]
+    assert (root / ".codegraph").is_symlink()
+    home = backbone.overlay_database(tmp_path / "caches", root=root).parent
+    assert (root / ".codegraph").resolve() == home / "cli"
+
+
+def test_worktree_sync_reuses_cached_state_and_locks_the_writer(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    caches = tmp_path / "caches"
+    home = backbone.overlay_database(caches, root=root).parent
+    (home / "cli").mkdir(parents=True)
+    calls: list[Path] = []
+
+    def run(argv: Sequence[str]) -> int:
+        with (home / "current.lock").open("a") as lock, pytest.raises(BlockingIOError):
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return _indexer(calls)(Path(argv[-1]))
+
+    assert backbone.sync_worktree(root, caches=caches, run=run) == ""
+    assert backbone.sync_worktree(root, caches=caches, run=run) == ""
+    assert calls == [root, root]
+    assert (root / ".codegraph").resolve() == home / "cli"
+    with (home / "current.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_worktree_sync_rejects_an_incompatible_index(tmp_path: Path) -> None:
+    database = _codegraph(tmp_path / ".codegraph/codegraph.db")
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("ALTER TABLE edges RENAME COLUMN target TO renamed")
+
+    def run(argv: Sequence[str]) -> int:
+        del argv
+        return 0
+
+    assert backbone.sync_worktree(tmp_path, caches=tmp_path / "caches", run=run) == (
+        f"{database} lacks edges.target: CodeGraph's schema changed, and "
+        "the walk in `affected.py` must follow it."
+    )
+
+
+def test_worktree_sync_updates_the_existing_index(tmp_path: Path) -> None:
+    _codegraph(tmp_path / ".codegraph" / "codegraph.db")
+    seen: list[list[str]] = []
+
+    def run(argv: Sequence[str]) -> int:
+        seen.append(list(argv))
+        return 0
+
+    assert backbone.sync_worktree(tmp_path, caches=tmp_path / "caches", run=run) == ""
+    assert seen == [["codegraph", "sync", "--quiet", str(tmp_path)]]
+
+
+def test_worktree_sync_reports_the_actual_index_failure(tmp_path: Path) -> None:
+    def run(argv: Sequence[str]) -> int:
+        del argv
+        return 3
+
+    assert backbone.sync_worktree(tmp_path, caches=tmp_path / "caches", run=run) == (
+        "Indexing the current worktree failed (codegraph exit 3)."
+    )
+
+
 def test_every_worktree_reads_the_one_backbone(tmp_path: Path) -> None:
     assert backbone.backbone_database(tmp_path) == (
         tmp_path / "backbone" / "codegraph.db"

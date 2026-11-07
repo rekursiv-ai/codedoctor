@@ -67,6 +67,40 @@ class Stamp:
     paths: tuple[str, ...] = ()
 
 
+def sync_worktree(
+    root: Path,
+    *,
+    caches: Path,
+    run: Callable[[Sequence[str]], int],
+) -> str:
+    """Sync the current filesystem into its worktree index, without resolving commits.
+
+    Args:
+      root: The worktree whose current files are indexed.
+      caches: Storage for a new worktree's index outside the checkout.
+      run: Runs the CodeGraph CLI and returns its exit code.
+
+    Returns:
+      problem: Why the index cannot be used; empty on success.
+
+    """
+    home = overlay_database(caches, root=root).parent
+    home.mkdir(parents=True, exist_ok=True)
+    with (home / "current.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        index = root / ".codegraph"
+        if not index.exists() and not index.is_symlink():
+            target = home / "cli"
+            target.mkdir(exist_ok=True)
+            index.symlink_to(target.resolve())
+        if status := index_tree(root, run=run):
+            return f"Indexing the current worktree failed (codegraph exit {status})."
+        database = index / "codegraph.db"
+        if missing := _missing_columns(database):
+            return _renamed(database, missing)
+    return ""
+
+
 def backbone_database(caches: Path) -> Path:
     """Return the shared backbone index under ``caches``."""
     return caches / "backbone" / "codegraph.db"

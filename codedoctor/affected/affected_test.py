@@ -21,7 +21,6 @@ import pytest
 
 from codedoctor.affected import affected, backbone
 from codedoctor.affected.affected import collection_patterns, harvest
-from codedoctor.gate.gate import output_argv
 
 
 if TYPE_CHECKING:
@@ -43,6 +42,11 @@ def in_tmp_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     passes here, and only diverges once the two configs do.
     """
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        backbone,
+        "sync_worktree",
+        Mock(return_value="index unavailable"),
+    )
 
 
 # The harvester's only contract is that pytest accepts what it prints, and only pytest
@@ -2081,73 +2085,51 @@ def test_selector_method_without_class_owner_uses_file_selector(
 
 def _recorded_harvest(
     monkeypatch: pytest.MonkeyPatch,
-    *,
-    overlay: Path | None = None,
 ) -> list[dict[str, object]]:
-    """Replace ``harvest`` with a recorder; the graph reads as current, with ``overlay``."""
+    """Replace ``harvest`` with a recorder and worktree sync with a successful fake."""
     calls: list[dict[str, object]] = []
 
     def recorded(database: Path, **kwargs: object) -> list[str]:
         calls.append({"database": database, **kwargs})
         return []
 
-    def current(caches: Path, **_: object) -> tuple[str, Path | None]:
-        del caches
-        return ("", overlay)
+    def current(root: Path, **_: object) -> str:
+        del root
+        return ""
 
     monkeypatch.setattr(affected, "harvest", recorded)
-    monkeypatch.setattr(backbone, "overlay_problem", current)
+    monkeypatch.setattr(backbone, "sync_worktree", current)
     return calls
 
 
-def test_a_stale_overlay_is_rebuilt_before_the_walk(
+def test_current_files_are_synced_before_the_walk(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Another process editing the worktree kept the walk off the graph."""
     calls = _recorded_harvest(monkeypatch)
-    overlay = tmp_path / "overlay.db"
-    answers = iter([("The overlay is stale.", None), ("", overlay)])
-    asked: list[tuple[Path, Path, object]] = []
-    rebuilt: list[tuple[Path, Path, object]] = []
+    synced: list[tuple[Path, Path]] = []
     indexed: list[list[str]] = []
 
-    def problem(
-        caches: Path,
-        *,
-        root: Path,
-        output: object,
-    ) -> tuple[str, Path | None]:
-        asked.append((caches, root, output))
-        return next(answers)
-
-    def build(
-        root: Path,
-        *,
-        caches: Path,
-        output: object,
-        index: Callable[[Path], int],
-    ) -> str:
-        rebuilt.append((root, caches, output))
-        assert index(tmp_path) == 0
+    def sync(root: Path, *, caches: Path, run: Callable[[Sequence[str]], int]) -> str:
+        assert not calls
+        synced.append((root, caches))
+        assert run(["codegraph", "sync", "--quiet", str(root)]) == 0
         return ""
 
     def run(argv: Sequence[str]) -> int:
         indexed.append(list(argv))
         return 0
 
-    monkeypatch.setattr(backbone, "overlay_problem", problem)
-    monkeypatch.setattr(backbone, "build_overlay", build)
+    monkeypatch.setattr(backbone, "sync_worktree", sync)
     monkeypatch.setattr(affected, "_quietly", run)
     argv = ["affected.py", "--caches", str(tmp_path), "--depth", "2", "--", "a.py"]
     monkeypatch.setattr(sys, "argv", argv)
 
     assert affected.main() == 0
-    looked = (tmp_path, Path.cwd(), output_argv)
-    assert asked == [looked, looked]
-    assert rebuilt == [(Path.cwd(), tmp_path, output_argv)]
-    assert indexed == [["codegraph", "init", "--yes", str(tmp_path)]]
-    assert (calls[0]["depth"], calls[0]["overlay"]) == (2, overlay)
+    assert synced == [(Path.cwd(), tmp_path)]
+    assert indexed == [["codegraph", "sync", "--quiet", str(Path.cwd())]]
+    assert calls[0]["database"] == Path.cwd() / ".codegraph/codegraph.db"
+    assert (calls[0]["depth"], calls[0]["overlay"]) == (2, None)
 
 
 @pytest.mark.parametrize(
@@ -2214,26 +2196,21 @@ def test_a_missing_index_cli_exits_127_like_a_shell(
     assert err == f"{missing}: command not found\n"
 
 
-def test_a_saturated_changeset_never_rebuilds_the_overlay(
+def test_a_saturated_changeset_never_syncs_the_index(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Every file handed in needs no graph, so a stale overlay costs nothing."""
+    """Every file handed in needs no graph."""
     calls = _recorded_harvest(monkeypatch)
 
-    def problem(caches: Path, **_: object) -> tuple[str, Path | None]:
-        del caches
-        return ("The overlay is stale.", None)
-
-    def build(root: Path, **_: object) -> str:
+    def sync(root: Path, **_: object) -> str:
         del root
-        raise AssertionError("a saturated changeset rebuilt the overlay")
+        raise AssertionError("a saturated changeset synced the index")
 
     def covers(changed: list[str], **_: object) -> bool:
         del changed
         return True
 
-    monkeypatch.setattr(backbone, "overlay_problem", problem)
-    monkeypatch.setattr(backbone, "build_overlay", build)
+    monkeypatch.setattr(backbone, "sync_worktree", sync)
     monkeypatch.setattr(affected, "_covers_universe", covers)
     monkeypatch.setattr(sys, "argv", ["affected.py", "--depth", "2", "--", "a.py"])
 
@@ -2241,25 +2218,24 @@ def test_a_saturated_changeset_never_rebuilds_the_overlay(
     assert calls[0]["saturated"] is True
 
 
-def test_an_overlay_that_will_not_rebuild_selects_without_the_graph(
+def test_a_failed_sync_reports_its_error_and_selects_without_the_graph(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     calls = _recorded_harvest(monkeypatch)
 
-    def problem(caches: Path, **_: object) -> tuple[str, Path | None]:
-        del caches
-        return ("No CodeGraph backbone.", None)
-
-    def build(root: Path, **_: object) -> str:
+    def sync(root: Path, **_: object) -> str:
         del root
-        return "no backbone"
+        return "Indexing failed (codegraph exit 3)."
 
-    monkeypatch.setattr(backbone, "overlay_problem", problem)
-    monkeypatch.setattr(backbone, "build_overlay", build)
+    monkeypatch.setattr(backbone, "sync_worktree", sync)
     monkeypatch.setattr(sys, "argv", ["affected.py", "--depth", "2", "--", "a.py"])
 
     assert affected.main() == 0
     assert (calls[0]["depth"], calls[0]["overlay"]) == (0, None)
+    assert capsys.readouterr().err == (
+        "affected: Indexing failed (codegraph exit 3). Selecting without the graph.\n"
+    )
 
 
 def test_the_skip_token_forces_depth_zero_and_keeps_the_other_flags(
@@ -2337,7 +2313,7 @@ def test_help_documents_every_flag(
     text = " ".join(capsys.readouterr().out.split())
 
     for expected in (
-        "Reads the shared backbone with this worktree's overlay laid over it,",
+        "Syncs the current worktree's CodeGraph index before reading it read-only.",
         "python -m codedoctor.affected --diff /dev/stdin lib.py",
         "files Changed repository-relative paths.",
         "--diff PATH Unified diff naming the changed lines, e.g. /dev/stdin.",
@@ -2914,7 +2890,7 @@ def test_a_graph_problem_is_reported_and_the_walk_falls_back(
     assert affected.main() == 0
     out, err = capfd.readouterr()
     assert out == "x_test.py\n"
-    assert "No CodeGraph backbone" in err
+    assert "index unavailable" in err
     assert "without the graph" in err
 
 
@@ -2951,7 +2927,7 @@ def test_a_problem_with_a_readable_backbone_still_never_walks_it(
     assert affected.main() == 0
     out, err = capfd.readouterr()
     assert out == "x_test.py\n"
-    assert "No overlay" in err
+    assert "index unavailable" in err
 
 
 @pytest.mark.cli_git
@@ -2960,7 +2936,7 @@ def test_main_checks_the_overlay_against_the_real_worktree(
     monkeypatch: pytest.MonkeyPatch,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    """Freshness is decided by asking git, not by trusting the stamp."""
+    """A missing commit does not replace the current-state indexing diagnostic."""
     caches = tmp_path / "caches"
     _stale_backbone(caches)
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
@@ -2977,7 +2953,9 @@ def test_main_checks_the_overlay_against_the_real_worktree(
     )
 
     assert affected.main() == 0
-    assert "git fetch origin" in capfd.readouterr().err
+    err = capfd.readouterr().err
+    assert "index unavailable" in err
+    assert "git fetch" not in err
 
 
 def test_a_skipped_graph_reads_and_reports_nothing(
@@ -3060,18 +3038,17 @@ def test_the_derived_cache_is_group_readable_and_keyed_on_this_code(
     assert not sibling.exists()
 
 
-def test_a_fresh_overlay_reaches_harvest(
+def test_the_current_worktree_index_reaches_harvest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    found = tmp_path / "overlay.db"
-    calls = _recorded_harvest(monkeypatch, overlay=found)
+    calls = _recorded_harvest(monkeypatch)
     monkeypatch.delenv("SKIP", raising=False)
     monkeypatch.setattr(sys, "argv", ["affected", "--caches", "/c", "--", "x.py"])
 
     assert affected.main() == 0
-    assert calls[0]["database"] == Path("/c/backbone/codegraph.db")
-    assert calls[0]["overlay"] == found
+    assert calls[0]["database"] == tmp_path / ".codegraph/codegraph.db"
+    assert calls[0]["overlay"] is None
     assert calls[0]["depth"] == 1
 
 
