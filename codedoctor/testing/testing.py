@@ -386,8 +386,14 @@ def _selected(
         workers=workers,
     )
     owned = set(own)
-    return own, sorted(
-        {test for test in walked if test.partition("::")[0] not in owned},
+    # Export overlays are public-root templates, not runnable monorepo tests.
+    runnable = {
+        test.partition("::")[0]
+        for test in (*own, *walked)
+        if ".export" not in Path(test.partition("::")[0]).parts
+    }
+    return [test for test in own if test in runnable], sorted(
+        {test for test in walked if test.partition("::")[0] in runnable - owned},
     )
 
 

@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
+from unittest.mock import Mock
 
 import argparse
 import importlib
 import os
 import stat
-import subprocess
 import sys
 
 import coverage
@@ -81,33 +82,28 @@ def processes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> fakes.Processe
     return fakes.isolate(tmp_path, monkeypatch=monkeypatch)
 
 
-@pytest.mark.parametrize("module", [gate, typecheck, testing])
+@pytest.mark.parametrize("module", [gate, typecheck, testing, coverage_summary])
 def test_every_gate_imports_without_coverage_installed(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     module: ModuleType,
 ) -> None:
-    """An export without pytest-cov still type-checks and spools; madcatter has none.
+    """An export without pytest-cov still type-checks and spools; madcatter has none."""
+    monkeypatch.setitem(sys.modules, "coverage", None)
+    if module is testing:
+        for dependency in ("codedoctor.gate.gate", "codedoctor.lib.sidecars"):
+            monkeypatch.setitem(sys.modules, dependency, None)
+            parent, _, child = dependency.rpartition(".")
+            monkeypatch.delattr(sys.modules[parent], child)
+    name = f"{module.__name__}_without_coverage"
+    spec = spec_from_file_location(name, module.__file__)
+    assert spec is not None
+    assert spec.loader is not None
+    loaded = module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, loaded)
 
-    ``testing`` is the one that reaches ``coverage``, through ``coverage_summary``.
-    """
-    blocker = tmp_path / "coverage.py"
-    blocker.write_text("raise ModuleNotFoundError(\"No module named 'coverage'\")\n")
-    deferred = (
-        "; import sys; "
-        "assert 'codedoctor.gate.gate' not in sys.modules; "
-        "assert 'codedoctor.lib.sidecars' not in sys.modules"
-        if module is testing
-        else ""
-    )
-    done = subprocess.run(  # noqa: S603 -- this interpreter; fixed argv.
-        [sys.executable, "-c", f"import {module.__name__}{deferred}"],
-        env={**os.environ, "PYTHONPATH": os.pathsep.join([str(tmp_path), *sys.path])},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    spec.loader.exec_module(loaded)
 
-    assert done.returncode == 0, done.stderr
+    assert loaded.__name__ == name
 
 
 def test_one_gates_depth_never_widens_the_other(tmp_path: Path) -> None:
@@ -213,6 +209,43 @@ def test_scope_controls_pairing_and_dependency_expansion(
     else:
         assert tools.argfiles[-2:] == [["a_test.py", "test_a.py"], ["b_test.py"]]
         assert tools.listings == [["b_test.py::test_b"]]
+
+
+@pytest.mark.parametrize("mode", ["exact", "sidecar", "affected:1"])
+def test_export_overlays_are_never_collected_as_monorepo_tests(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    tools = fakes.Recorder(
+        output=(
+            "pkg/.export/conftest.py\npkg/.export/mod_test.py::test_bad\n"
+            "extra_test.py::TestOk::test_ok[/.export/value]\n"
+        ),
+        installed=False,
+    )
+    assert (
+        _pytest(
+            tmp_path,
+            tools,
+            [
+                ".export/conftest.py",
+                "pkg/.export/mod_test.py",
+                "kept_test.py",
+                ".exported/ok_test.py",
+            ],
+            dependents="pkg.affected",
+            PRECOMMIT_SCOPE=mode,
+        )
+        == 0
+    )
+    if mode == "affected:1":
+        assert tools.argfiles[-2:] == [
+            [".exported/ok_test.py", "kept_test.py"],
+            ["extra_test.py"],
+        ]
+        assert tools.listings == [["extra_test.py::TestOk::test_ok[/.export/value]"]]
+    else:
+        assert tools.argfiles == [[".exported/ok_test.py", "kept_test.py"]]
 
 
 def test_exact_source_alone_never_collects_an_adjacent_test(tmp_path: Path) -> None:
@@ -1025,7 +1058,8 @@ def test_a_changed_parity_script_is_a_test_not_a_measured_source(
     assert "--cov=pkg" not in tools.argfiles[0]
 
 
-def test_a_day_old_hand_off_is_dropped_and_a_fresh_one_kept(tmp_path: Path) -> None:
+@pytest.mark.parametrize("age", [24 * 60 * 60, 24 * 60 * 60 + 1])
+def test_only_handoffs_older_than_a_day_are_dropped(tmp_path: Path, age: int) -> None:
     """A concurrent run's hand-off is fresh; one ``SKIP=coverage-floor`` left is not."""
     stale, fresh = tmp_path / "coverage.1", tmp_path / "coverage.2"
     for path in (stale, fresh):
@@ -1035,12 +1069,32 @@ def test_a_day_old_hand_off_is_dropped_and_a_fresh_one_kept(tmp_path: Path) -> N
     other.write_text("spool")
     os.utime(other, (0, 0))
 
-    testing._drop_stale_handoffs(tmp_path, now=2 * 24 * 60 * 60)
+    testing._drop_stale_handoffs(tmp_path, now=age)
 
     assert sorted(path.name for path in tmp_path.iterdir()) == [
+        *(["coverage.1"] if age == 24 * 60 * 60 else []),
         "coverage.2",
         "pytest.1",
     ]
+
+
+@pytest.mark.parametrize("operation", ["stat", "unlink"])
+def test_handoff_cleanup_survives_a_concurrent_floor_removing_the_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    stale = tmp_path / "coverage.1"
+    stale.touch()
+    os.utime(stale, (0, 0))
+    missing = Mock(side_effect=FileNotFoundError)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "glob", Mock(return_value=(stale,)))
+        patch.setattr(Path, operation, missing)
+
+        testing._drop_stale_handoffs(tmp_path, now=24 * 60 * 60 + 1)
+
+    missing.assert_called_once_with()
 
 
 def test_a_spooled_test_file_named_test_first_runs_itself(tmp_path: Path) -> None:
