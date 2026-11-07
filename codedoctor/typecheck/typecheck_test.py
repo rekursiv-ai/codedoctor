@@ -54,6 +54,32 @@ def test_ty_checks_every_spooled_file_once_minus_excludes(tmp_path: Path) -> Non
     ]
 
 
+@pytest.mark.parametrize("mode", ["exact", "sidecar", "affected:3"])
+def test_scope_controls_typechecked_sidecars(tmp_path: Path, mode: str) -> None:
+    _spool(tmp_path, "a_test.py")
+    fakes.touch(tmp_path, ["a.py", "test_a.py"])
+    tools = fakes.Recorder(output="a.py\na_test.py\ntest_a.py\nb.py\n")
+    assert (
+        _typecheck(
+            "ty-check",
+            tmp_path,
+            tools,
+            dependents="pkg.affected",
+            PRECOMMIT_SCOPE=mode,
+        )
+        == 0
+    )
+    assert (
+        tools.calls[-1][3:]
+        == {
+            "exact": ["a_test.py"],
+            "sidecar": ["a.py", "a_test.py", "test_a.py"],
+            "affected:3": ["a.py", "a_test.py", "test_a.py", "b.py"],
+        }[mode]
+    )
+    assert any("--emit" in call for call in tools.calls) is (mode == "affected:3")
+
+
 def test_pyrefly_checks_what_ty_checked(tmp_path: Path) -> None:
     _spool(tmp_path, "a.py")
     _typecheck("ty-check", tmp_path, fakes.Recorder())
@@ -78,7 +104,7 @@ def test_pyrefly_checks_the_spool_when_ty_was_skipped(tmp_path: Path) -> None:
         tmp_path,
         tools,
         dependents="pkg.affected",
-        PRECOMMIT_CODEGRAPH_TYPECHECK="2",
+        PRECOMMIT_SCOPE_PYREFLY_CHECK="affected:2",
         WORKERS_PYREFLY_CHECK="5",
     )
 
@@ -89,40 +115,30 @@ def test_pyrefly_checks_the_spool_when_ty_was_skipped(tmp_path: Path) -> None:
     assert check[-2:] == ["a.py", "b.py"]
 
 
-def test_pyrefly_checks_nothing_when_ty_checked_nothing(tmp_path: Path) -> None:
-    """Every spooled file excluded: an empty hand-off, not a missing one."""
+def test_pyrefly_checks_its_own_spool_even_when_ty_checked_nothing(
+    tmp_path: Path,
+) -> None:
+    """Each checker owns its selection independently."""
     _spool(tmp_path, "third_party/v.py")
     _typecheck("ty-check", tmp_path, fakes.Recorder())
     _spool(tmp_path, "a.py")
     tools = fakes.Recorder()
 
     assert _typecheck("pyrefly-check", tmp_path, tools) == 0
-    assert tools.calls == []
+    assert tools.calls[-1][-1] == "a.py"
 
 
 @pytest.mark.parametrize(
     ("name", "checker"),
     [("pyrefly-check", "pyrefly"), ("basedpyright", "basedpyright")],
 )
-@pytest.mark.parametrize(
-    ("value", "enabled"),
-    [
-        (None, False),
-        ("", False),
-        ("0", False),
-        ("false", False),
-        ("01", False),
-        ("1", True),
-        ("2", True),
-    ],
-)
+@pytest.mark.parametrize("skipped", [False, True])
 def test_the_fixer_runs_the_checker_in_its_place(
     tmp_path: Path,
     name: str,
     checker: str,
-    value: str | None,
     *,
-    enabled: bool,
+    skipped: bool,
 ) -> None:
     _spool(tmp_path, "a.py")
     tools = fakes.Recorder()
@@ -132,7 +148,7 @@ def test_the_fixer_runs_the_checker_in_its_place(
         tmp_path,
         tools,
         fixer="pkg.fixer",
-        **({"PRECOMMIT_BASEDPYRIGHT": value} if value is not None else {}),
+        SKIP="basedpyright" if skipped else "",
     )
 
     [[_, *head, named]] = tools.calls
@@ -146,7 +162,7 @@ def test_the_fixer_runs_the_checker_in_its_place(
         "3",
         "--typechecker",
         "pyrefly",
-        *(["basedpyright"] if enabled or name == "basedpyright" else []),
+        *([] if skipped else ["basedpyright"]),
         "--",
     ]
     assert named.startswith("@")
@@ -202,7 +218,7 @@ def test_dependents_widen_the_files_then_excludes_apply(tmp_path: Path) -> None:
         tmp_path,
         tools,
         dependents="pkg.affected",
-        PRECOMMIT_CODEGRAPH_TYPECHECK="3",
+        PRECOMMIT_SCOPE_TY_CHECK="affected:3",
     )
 
     walk, check = tools.calls
@@ -235,7 +251,7 @@ def test_a_failed_or_empty_walk_checks_the_spooled_files(
         tmp_path,
         tools,
         dependents="pkg.affected",
-        PRECOMMIT_CODEGRAPH_TYPECHECK="3",
+        PRECOMMIT_SCOPE_TY_CHECK="affected:3",
     )
 
     assert tools.calls[-1][-1] == "a.py"
@@ -243,9 +259,9 @@ def test_a_failed_or_empty_walk_checks_the_spooled_files(
 
 @pytest.mark.parametrize(
     ("dependents", "value"),
-    [(None, "3"), ("pkg.affected", "0"), ("pkg.affected", "")],
+    [(None, "affected:3"), ("pkg.affected", "exact"), ("pkg.affected", "sidecar")],
 )
-def test_the_walk_needs_both_the_module_and_the_opt_in(
+def test_the_walk_needs_both_the_module_and_affected_scope(
     tmp_path: Path,
     dependents: str | None,
     value: str,
@@ -258,7 +274,7 @@ def test_the_walk_needs_both_the_module_and_the_opt_in(
         tmp_path,
         tools,
         dependents=dependents,
-        PRECOMMIT_CODEGRAPH_TYPECHECK=value,
+        PRECOMMIT_SCOPE_TY_CHECK=value,
     )
 
     assert [call[-1] for call in tools.calls] == ["a.py"]
@@ -311,7 +327,7 @@ def test_the_cli_widens_through_its_dependents_module(
     Path("a.py").touch()
     monkeypatch.setattr(sys, "argv", ["gate", "spool", "ty-check", "a.py"])
     assert gate.main() == 0
-    monkeypatch.setenv("PRECOMMIT_CODEGRAPH_TYPECHECK", "2")
+    monkeypatch.setenv("PRECOMMIT_SCOPE_TY_CHECK", "affected:2")
     monkeypatch.setattr(
         sys,
         "argv",
@@ -352,27 +368,19 @@ def test_each_checker_is_a_command_of_its_own(
     assert flags.handler is typecheck._check
 
 
-@pytest.mark.parametrize("value", [None, "", "0", "false", "01", "1", "2"])
-def test_cli_environment_gate(
+def test_basedpyright_runs_without_an_enablement_setting(
     processes: fakes.Processes,
     monkeypatch: pytest.MonkeyPatch,
-    value: str | None,
 ) -> None:
     Path("a.py").touch()
     monkeypatch.setattr(sys, "argv", ["gate", "spool", "basedpyright", "a.py"])
     assert gate.main() == 0
     processes.calls.clear()
-    if value is not None:
-        monkeypatch.setenv("PRECOMMIT_BASEDPYRIGHT", value)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["typecheck", "basedpyright", "--when", "PRECOMMIT_BASEDPYRIGHT"],
-    )
+    monkeypatch.setattr(sys, "argv", ["typecheck", "basedpyright"])
 
-    assert typecheck.main() == (4 if value in {"1", "2"} else 0)
+    assert typecheck.main() == 4
     checks = [call for call in processes.calls if "--threads=1" in call]
-    assert len(checks) == (1 if value in {"1", "2"} else 0)
+    assert len(checks) == 1
     assert list(Path().glob("precommit-spool-*/basedpyright.*")) == []
 
 
@@ -407,7 +415,7 @@ def test_the_help_names_each_checker_and_the_fixer_module(
     for name in ("ty-check", "pyrefly-check", "basedpyright"):
         assert f"{name} Run {name} over its spool." in top
     assert "--fixer MODULE" in pyrefly
-    assert "--when VARIABLE" in pyrefly
+    assert "--when" not in pyrefly
 
 
 @pytest.mark.parametrize(

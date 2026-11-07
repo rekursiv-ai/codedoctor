@@ -133,6 +133,9 @@ def isolate_mutation_environment(
 
     """
     monkeypatch.delenv("PRECOMMIT_MUTATION_SEED", raising=False)
+    monkeypatch.delenv("PRECOMMIT_SCOPE", raising=False)
+    monkeypatch.delenv("PRECOMMIT_SCOPE_MUTATION", raising=False)
+    monkeypatch.delenv("SKIP", raising=False)
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     temporary = tmp_path_factory.mktemp("snapshots")
     monkeypatch.setattr(tempfile, "tempdir", str(temporary))
@@ -905,8 +908,19 @@ def test_emitting_filters_samples_without_running(
     root = _repo(tmp_path, body=_TWO_FUNCTIONS)
     (root / "pyproject.toml").write_text('[tool.mutmut]\nsource_paths = ["."]\n')
     paths = ["other.py", "pkg/fresh.py", "script.py"]
+    candidates_by_path = {
+        "other.py": ("other.x_first__mutmut_*", "other.x_second__mutmut_*"),
+        "pkg/fresh.py": ("pkg.fresh.x_first__mutmut_*", "pkg.fresh.x_second__mutmut_*"),
+        "script.py": ("script.x_first__mutmut_*", "script.x_second__mutmut_*"),
+    }
     for path in paths:
         (root / path).write_text(_TWO_FUNCTIONS)
+
+    def file_filters(path: str, *, root: Path) -> tuple[str, ...]:
+        del root
+        return candidates_by_path[path]
+
+    monkeypatch.setattr(mutated, "_file_filters", file_filters)
     monkeypatch.chdir(root)
     run = Mock()
     monkeypatch.setattr(mutated, "run_shard", run)
@@ -1116,7 +1130,7 @@ def test_missing_paired_tests_fails_without_running_a_repository_suite(
     _git(root, "init", "-q")
     (root / "pkg/fresh.py").write_text(_TWO_FUNCTIONS)
     monkeypatch.chdir(root)
-    monkeypatch.setattr(sys, "argv", ["mutated", "--blocking", "pkg/fresh.py"])
+    monkeypatch.setattr(sys, "argv", ["mutated", "pkg/fresh.py"])
 
     assert mutated.main() == 1
     captured = capsys.readouterr()
@@ -1146,7 +1160,7 @@ def test_a_surviving_mutant_is_reported_with_its_diff(
         "def test_first():\n    assert isinstance(first(2), int)\n",
     )
     monkeypatch.chdir(root)
-    monkeypatch.setattr(sys, "argv", ["mutated", "--blocking", "pkg/mod.py"])
+    monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py"])
 
     assert mutated.main() == 1
 
@@ -1955,7 +1969,7 @@ def test_broad_run_uses_paired_tests_and_unmutated_support(
         (root / "pkg/mod.py").read_text().replace("+ 1", "+ 2"),
     )
     monkeypatch.chdir(root)
-    monkeypatch.setattr(sys, "argv", ["mutated", "--blocking", "pkg/mod.py"])
+    monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py"])
 
     assert mutated.main() == 0
     assert not (root / "mutants").exists()
@@ -2159,6 +2173,33 @@ def test_paired_tests_ask_the_index_for_depth_zero_nodeids(
     ]
 
 
+@pytest.mark.parametrize("output", [None, ""])
+def test_an_unavailable_graph_reports_the_sidecar_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    output: str | None,
+) -> None:
+    query = Mock(return_value=output)
+    monkeypatch.setattr(mutated, "output_argv", query)
+
+    assert mutated._affected(tmp_path, files=["a.py"], depth=1, emit="nodeids") == []
+    query.assert_called_once()
+    assert query.call_args.args[0][:-1] == [
+        sys.executable,
+        "-m",
+        "codedoctor.affected",
+        "--depth",
+        "1",
+        "--emit",
+        "nodeids",
+        "--",
+    ]
+    assert capsys.readouterr().err == (
+        "mutation: dependency graph unavailable; using sidecars\n"
+    )
+
+
 def test_filters_skip_tests_and_paths_outside_the_sources(tmp_path: Path) -> None:
     source = tmp_path / "pkg" / "mod.py"
     source.parent.mkdir()
@@ -2209,6 +2250,27 @@ def second(value):
 """
 
 
+@pytest.fixture
+def sampled_filters(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Supply mutmut's known answers; selection still parses and checks each file."""
+    filters: dict[str, tuple[str, ...]] = {
+        f"pkg/{name}.py": (
+            f"pkg.{name}.x_first__mutmut_*",
+            f"pkg.{name}.x{CLASS_NAME_SEPARATOR}{owner}{CLASS_NAME_SEPARATOR}method__mutmut_*",
+            f"pkg.{name}.x_second__mutmut_*",
+        )
+        for name, owner in (("mod", "Holder"), ("a", "A"), ("b", "B"), ("c", "C"))
+    }
+    filters["pkg/broken.py"] = ()
+
+    def file_filters(path: str, *, root: Path) -> tuple[str, ...]:
+        del root
+        return filters[path]
+
+    monkeypatch.setattr(mutated, "_file_filters", file_filters)
+
+
+@pytest.mark.usefixtures("sampled_filters")
 @pytest.mark.parametrize("seed", ["", "1", "2", "3", "seven"])
 @pytest.mark.parametrize(
     ("rate", "most"),
@@ -2266,6 +2328,7 @@ def test_a_capped_sample_checks_lazily_and_matches_the_full_one(
         assert sum(map(len, checked)) < len(files)
 
 
+@pytest.mark.usefixtures("sampled_filters")
 def test_a_cap_above_the_mutable_count_keeps_every_mutable_function(
     tmp_path: Path,
 ) -> None:
@@ -2285,6 +2348,7 @@ def test_a_cap_above_the_mutable_count_keeps_every_mutable_function(
     ) == (sample(full, seed="", size=2), 3)
 
 
+@pytest.mark.usefixtures("sampled_filters")
 def test_an_uncapped_sample_checks_every_file(tmp_path: Path) -> None:
     root = _repo(tmp_path, body=_SAMPLED)
     full = function_filters(root, files=["pkg/mod.py"], sources=("pkg",))
@@ -2753,6 +2817,34 @@ def test_a_zero_size_samples_nothing() -> None:
     assert sample(("first",), seed="seed", size=0) == ()
 
 
+@pytest.mark.parametrize("mode", ["exact", "sidecar", "affected:2"])
+def test_mutation_scope_selects_sources_and_tests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    root = _repo(tmp_path, body=_TWO_FUNCTIONS)
+    (root / "pkg/mod_test.py").touch()
+    (root / "pkg/mod_extra_test.py").touch()
+    monkeypatch.chdir(root)
+    monkeypatch.setenv("PRECOMMIT_SCOPE", mode)
+    monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py", "pkg/mod_test.py"])
+    monkeypatch.setattr(
+        mutated,
+        "select_functions",
+        Mock(return_value=(("pkg.mod.x_first__mutmut_*",), 1)),
+    )
+    run = Mock(return_value=[])
+    monkeypatch.setattr(mutated, "_run_shards", run)
+    output = Mock(return_value="pkg/other.py\n")
+    monkeypatch.setattr(mutated, "output_argv", output)
+
+    assert mutated.main() == 0
+    shard = cast(tuple[Shard, ...], run.call_args.kwargs["shards"])[0]
+    assert shard.tests == (("pkg/mod_test.py",) if mode == "exact" else None)
+    assert output.called is (mode == "affected:2")
+
+
 def test_main_handles_selection_error_and_empty_selection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2780,49 +2872,25 @@ def test_main_reports_snapshot_preparation_error(
 ) -> None:
     """An unusable snapshot fails its file, reported with the error's type."""
     _unusable_snapshot(tmp_path, monkeypatch)
-    monkeypatch.setattr(sys, "argv", ["mutated", "--blocking", "pkg/mod.py"])
+    monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py"])
     assert mutated.main() == 1
     captured = capsys.readouterr()
     assert "mutation: pkg/mod.py: OSError: no snapshot\n" in captured.err
     assert "  pkg/mod.py\n" in captured.out
 
 
-@pytest.mark.parametrize(
-    ("argv", "variable", "status"),
-    [
-        ([], None, 0),
-        ([], "0", 0),
-        ([], "yes", 0),
-        ([], "1", 1),
-        (["--blocking"], None, 1),
-    ],
-    ids=["unset", "zero", "not-a-count", "set", "flag"],
-)
-def test_a_finding_fails_the_run_only_when_blocking_is_on(
+def test_a_finding_always_fails_the_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    *,
-    argv: list[str],
-    variable: str | None,
-    status: int,
 ) -> None:
-    if variable is None:
-        monkeypatch.delenv("PRECOMMIT_MUTATION_BLOCKING", raising=False)
-    else:
-        monkeypatch.setenv("PRECOMMIT_MUTATION_BLOCKING", variable)
     _unusable_snapshot(tmp_path, monkeypatch)
-    monkeypatch.setattr(sys, "argv", ["mutated", *argv, "pkg/mod.py"])
+    monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py"])
 
-    assert mutated.main() == status
+    assert mutated.main() == 1
     out = capsys.readouterr().out
-    # Either way the finding is printed; advice says so instead of failing.
     assert "  pkg/mod.py\n" in out
-    advisory = (
-        "mutation: advisory, so nothing above fails this run; "
-        "PRECOMMIT_MUTATION_BLOCKING=1 makes it fail.\n"
-    )
-    assert out.endswith(advisory) is (status == 0)
+    assert "advisory" not in out
 
 
 def _unusable_snapshot(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2870,7 +2938,7 @@ def test_an_unparsable_paired_test_fails_its_file_in_one_line(
     )
     snapshot = Mock()
     monkeypatch.setattr(mutated, "copy_snapshot", snapshot)
-    monkeypatch.setattr(sys, "argv", ["mutated", "--blocking", "pkg/mod.py"])
+    monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py"])
 
     assert mutated.main() == 1
 
@@ -4134,10 +4202,17 @@ def test_capped_selection_checks_only_until_the_rate_can_fill_the_cap(
 ) -> None:
     root = _repo(tmp_path, body="")
     files = [f"pkg/m{n}.py" for n in range(count)]
+    known = {f"pkg/m{n}.py": (f"pkg.m{n}.x_f__mutmut_*",) for n in range(count)}
     for name in files:
         (root / name).write_text(
             "def f(x):\n    return x + 1\n\ndef stub():\n    ...\n",
         )
+
+    def file_filters(path: str, *, root: Path) -> tuple[str, ...]:
+        del root
+        return known[path]
+
+    monkeypatch.setattr(mutated, "_file_filters", file_filters)
     full = function_filters(root, files=files, sources=("pkg",))
     check = Mock(wraps=mutated.function_filters)
     monkeypatch.setattr(mutated, "function_filters", check)
@@ -4270,7 +4345,7 @@ def test_remainder_cli_executes_only_requested_null_ids(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["mutated", "--workers", "1", "--blocking", "--remainder", str(manifest)],
+        ["mutated", "--workers", "1", "--remainder", str(manifest)],
     )
 
     assert mutated.main() == 0
@@ -4419,7 +4494,7 @@ def test_remainder_rejects_invalid_identity_before_execution(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["mutated", "--workers", "1", "--blocking", "--remainder", str(manifest)],
+        ["mutated", "--workers", "1", "--remainder", str(manifest)],
     )
 
     assert mutated.main() == 1
@@ -4481,7 +4556,7 @@ def test_remainder_compares_the_canonical_snapshot_configuration(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["mutated", "--workers", "1", "--blocking", "--remainder", str(manifest)],
+        ["mutated", "--workers", "1", "--remainder", str(manifest)],
     )
 
     assert mutated.main() == (1 if config_change else 0)
@@ -4610,7 +4685,7 @@ def test_empty_remainder_does_not_launch_a_whole_function(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["mutated", "--workers", "1", "--blocking", "--remainder", str(manifest)],
+        ["mutated", "--workers", "1", "--remainder", str(manifest)],
     )
 
     assert mutated.main() == 0
@@ -4658,7 +4733,7 @@ def test_remainder_reference_keeps_its_adjacent_metadata(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["mutated", "--workers", "1", "--blocking", "--remainder", str(manifest)],
+        ["mutated", "--workers", "1", "--remainder", str(manifest)],
     )
 
     assert mutated.main() == (0 if identity == "matching" else 1)

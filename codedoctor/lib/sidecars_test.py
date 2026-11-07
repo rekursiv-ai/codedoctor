@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from codedoctor.lib.sidecars import candidates, is_test, paired
+from codedoctor.lib.sidecars import candidates, is_test, paired, related
 
 
 def test_a_nested_source_pairs_beside_in_tests_and_in_the_root_mirror() -> None:
@@ -150,6 +150,37 @@ def test_a_hand_run_suite_is_a_test_by_what_it_defines(
     module.write_text(body)
 
     assert is_test(module) is test
+
+
+@pytest.mark.parametrize(
+    "named",
+    [
+        "pkg/mod.py",
+        "pkg/mod_test.py",
+        "pkg/tests/test_mod_extra.py",
+        "tests/mod_test.py",
+    ],
+)
+def test_related_finds_source_and_all_its_test_pairs(
+    tmp_path: Path,
+    named: str,
+) -> None:
+    files = [
+        "pkg/mod.py",
+        "pkg/mod_test.py",
+        "pkg/tests/test_mod_extra.py",
+        "tests/mod_test.py",
+    ]
+    for name in [*files, "pkg/unrelated.py", "pkg/unrelated_test.py"]:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    assert related(named, root=tmp_path) == sorted(map(Path, files))
+
+
+def test_related_keeps_an_unpaired_file(tmp_path: Path) -> None:
+    (tmp_path / "orphan_test.py").touch()
+    assert related("orphan_test.py", root=tmp_path) == [Path("orphan_test.py")]
 
 
 def test_a_missing_module_is_judged_by_its_name_alone(tmp_path: Path) -> None:

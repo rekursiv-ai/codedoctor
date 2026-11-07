@@ -23,10 +23,9 @@ throughput. A line is written as each file finishes, and every surviving
 mutant is reported with its diff. --timeout-sec kills a mutmut run that
 takes longer, failing its file and no other; without it, runs have no limit.
 
-Findings are advice: they are printed and the run exits 0, unless --blocking
-is given or PRECOMMIT_MUTATION_BLOCKING holds a positive integer; then any
-finding exits 1. A run that cannot select functions or lay out its snapshots
-exits 1 either way.
+Findings and setup failures exit 1. PRECOMMIT_SCOPE and
+PRECOMMIT_SCOPE_MUTATION select exact, sidecar, or affected:N scope.
+Exact uses only supplied test files; sidecar is the default.
 
 Examples:
   mutated
@@ -34,7 +33,6 @@ Examples:
   mutated pkg/serialize.py
   mutated --explain pkg/serialize.py
   mutated --emit filters pkg/serialize.py
-  mutated --blocking pkg/serialize.py
 
 """
 
@@ -100,7 +98,7 @@ import libcst as cst
 import tomlkit
 
 from codedoctor.affected.affected import harvest
-from codedoctor.gate.gate import positive
+from codedoctor.gate.gate import argfile, output_argv, scope, skipped
 from codedoctor.lib import pyproject_flags, sidecars
 from codedoctor.lib.files import tempclaim, walk
 from codedoctor.lib.kernel_pins import kernel_pins
@@ -122,8 +120,8 @@ def main() -> int:
     """Mutate-test the functions in the named files.
 
     Returns:
-      status: Nonzero when the run could not start, or when blocking is on and
-        it found failed or inconclusive mutations; zero otherwise.
+      status: Nonzero for setup failures, surviving or inconclusive mutations;
+        zero when all selected mutants were killed or no functions were selected.
 
     """
     parser = argparse.ArgumentParser(
@@ -147,6 +145,23 @@ def main() -> int:
                 walk.expand(flags.paths, suffixes={".py"}),
                 root=root,
             )
+            depth = scope("mutation", environ=os.environ)
+            tests = tuple(path for path in named if sidecars.is_test(root / path))
+            if depth >= 0:
+                named = list(
+                    dict.fromkeys(
+                        [
+                            *named,
+                            *(
+                                p.as_posix()
+                                for path in named
+                                for p in sidecars.related(path, root=root)
+                                if not sidecars.is_test(root / p)
+                            ),
+                            *_affected(root, files=named, depth=depth, emit="files"),
+                        ],
+                    ),
+                )
             preferred = (
                 frozenset[str]()
                 if flags.prefer_changed is None
@@ -163,6 +178,8 @@ def main() -> int:
                 preferred=preferred,
             )
             shards = plan_shards(_filters_by_source(filters, files=named))
+            if depth < 0:
+                shards = tuple(replace(shard, tests=tests) for shard in shards)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         sys.stderr.write(f"mutation: cannot select functions: {error}\n")
         return 1
@@ -204,14 +221,7 @@ def main() -> int:
     except (OSError, subprocess.CalledProcessError) as error:
         sys.stderr.write(f"mutation: cannot prepare the snapshot: {error}\n")
         return 1
-    found = _print_reports(reports)
-    if found and not flags.blocking:
-        print(
-            "mutation: advisory, so nothing above fails this run; "
-            "PRECOMMIT_MUTATION_BLOCKING=1 makes it fail.",
-        )
-        return 0
-    return found
+    return _print_reports(reports)
 
 
 def mutable_sources(root: Path) -> tuple[str, ...]:
@@ -477,6 +487,7 @@ class Shard:
     source: str
     filters: tuple[str, ...]
     remainder: Remainder | None = None
+    tests: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -830,7 +841,6 @@ class _Flags(Protocol):
     workers: int | None
     emit: str
     explain: bool
-    blocking: bool
     remainder: Path | None
 
 
@@ -938,13 +948,6 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="JSON",
         help="Run the exact retained-null IDs in a Shard manifest, without sampling.",
     )
-    blocking = positive(os.environ.get("PRECOMMIT_MUTATION_BLOCKING"))
-    parser.add_argument(
-        "--blocking",
-        action="store_true",
-        default=bool(blocking),
-        help="Exit 1 on any finding (default: PRECOMMIT_MUTATION_BLOCKING, or off).",
-    )
 
 
 def _filters_by_source(
@@ -1035,7 +1038,11 @@ def _mutate(
     """Lay out ``snapshot``, run mutmut there, and read back what it recorded."""
     if shard.remainder is not None and not shard.remainder.mutants:
         return ShardReport(source=shard.source)
-    tests = _paired_tests(root, sources=(shard.source,))
+    tests = (
+        _paired_tests(root, sources=(shard.source,))
+        if shard.tests is None
+        else shard.tests
+    )
     if shard.remainder is not None and set(shard.filters) - set(
         function_filters(root, files=[shard.source], sources=mutable_sources(root)),
     ):
@@ -1340,14 +1347,46 @@ def _paired_tests(root: Path, *, sources: tuple[str, ...]) -> tuple[str, ...]:
     # In-process: depth 0 opens no index, and a subprocess per file paid a
     # whole interpreter start for a handful of ``is_file`` probes.
     with chdir(root):
-        return tuple(
-            harvest(
-                Path(".codegraph/codegraph.db"),
-                changed=list(sources),
-                depth=0,
-                emit="nodeids",
-            ),
+        own = harvest(
+            Path(".codegraph/codegraph.db"),
+            changed=list(sources),
+            depth=0,
+            emit="nodeids",
         )
+        extra = _affected(
+            root,
+            files=list(sources),
+            depth=scope("mutation", environ=os.environ),
+            emit="nodeids",
+        )
+    return tuple(sorted(set(own) | set(extra)))
+
+
+def _affected(root: Path, *, files: list[str], depth: int, emit: str) -> list[str]:
+    """Return graph selections, retaining sidecars when graph selection fails."""
+    if depth <= 0 or skipped(os.environ, "harvest-affected"):
+        return []
+    with chdir(root), argfile(files) as named:
+        found = (
+            output_argv(
+                [
+                    sys.executable,
+                    "-m",
+                    "codedoctor.affected",
+                    "--depth",
+                    str(depth),
+                    "--emit",
+                    emit,
+                    "--",
+                    named,
+                ],
+            )
+            or ""
+        )
+    if not found:
+        sys.stderr.write("mutation: dependency graph unavailable; using sidecars\n")
+        return []
+    return found.splitlines()
 
 
 def _collect(snapshot: Path, *, shard: Shard) -> ShardReport:
