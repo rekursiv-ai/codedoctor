@@ -146,6 +146,25 @@ def test_an_unstamped_database_has_no_stamp(tmp_path: Path, content: bytes) -> N
     assert backbone.stamped(tmp_path / "absent.db") is None
 
 
+def test_an_emptied_stamp_table_has_no_stamp(tmp_path: Path) -> None:
+    database = _codegraph(tmp_path / "x.db")
+    backbone.stamp(database, sha=_SHA, fingerprint="f", paths=["a.py"])
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("DELETE FROM codedoctor_stamp")
+
+    assert backbone.stamped(database) is None
+
+
+def test_a_database_that_cannot_be_opened_has_no_stamp(tmp_path: Path) -> None:
+    database = _codegraph(tmp_path / "x.db")
+    backbone.stamp(database, sha=_SHA, fingerprint="f", paths=["a.py"])
+    database.chmod(0)
+    try:
+        assert backbone.stamped(database) is None
+    finally:
+        database.chmod(0o600)
+
+
 def test_changed_unions_the_diff_and_untracked_files() -> None:
     assert backbone.changed(
         Path("/repo"),

@@ -38,6 +38,7 @@ from treekle import ReadError, from_plain
 
 from codedoctor.affected import backbone
 from codedoctor.gate.gate import output_argv
+from codedoctor.lib import sidecars
 from codedoctor.lib.files import walk
 from codedoctor.lib.worker_count import worker_count
 
@@ -841,42 +842,9 @@ def _skipped(token: str) -> bool:
     return skip is not None and token in {name.strip() for name in skip.split(",")}
 
 
-# The `tests/` candidate is a SIBLING of the source directory, not a root-level mirror
-# of its full path: a `tools/` package may keep its tests in `tools/tests/`, the one
-# exception the house style allows to the adjacent-sidecar rule.
 def _sidecars(changed: list[str]) -> list[Path]:
     """Return the test files paired by name with ``changed``, where they exist."""
-    paired: list[Path] = []
-    for path in changed:
-        source = Path(path)
-        stem = source.stem.removesuffix("_test").removeprefix("test_")
-        paired.extend(
-            candidate
-            for candidate in (
-                source.with_name(f"{stem}_test.py"),
-                source.with_name(f"test_{stem}.py"),
-                source.parent / "tests" / f"{stem}_test.py",
-                source.parent / "tests" / f"test_{stem}.py",
-            )
-            if candidate.is_file()
-        )
-        if source.stem != stem:
-            continue
-        owners = [
-            module.stem
-            for module in source.parent.glob(f"{stem}_*.py")
-            if module.is_file() and not module.stem.endswith("_test")
-        ]
-        for directory in (source.parent, source.parent / "tests"):
-            for pattern in (f"{stem}_*_test.py", f"test_{stem}_*.py"):
-                for candidate in directory.glob(pattern):
-                    name = candidate.stem.removeprefix("test_")
-                    if candidate.is_file() and not any(
-                        name == owner or name.startswith(f"{owner}_")
-                        for owner in owners
-                    ):
-                        paired.append(candidate)
-    return paired
+    return [test for path in changed for test in sidecars.paired(path)]
 
 
 # ONE seed, never a list: `harvest` must know which changed file produced a hit so an

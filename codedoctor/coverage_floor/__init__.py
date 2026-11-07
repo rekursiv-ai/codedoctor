@@ -1,1 +1,1 @@
-"""The ``coverage-floor`` pre-commit hook: each changed source under its own tests."""
+"""Floor each changed source by its own tests; ``coverage-floor`` reads the pytest run."""

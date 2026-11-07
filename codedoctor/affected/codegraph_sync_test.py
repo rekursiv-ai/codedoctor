@@ -229,6 +229,32 @@ def test_a_failed_index_keeps_the_published_backbone(tmp_path: Path) -> None:
     )
 
 
+def test_an_index_missing_a_table_fails_the_derived_build(tmp_path: Path) -> None:
+    """Readers would rebuild the derived tables and fail too, so the refresh fails."""
+    tools = _Tools()
+
+    def tableless(argv: Sequence[str]) -> int:
+        tools.calls.append(list(argv))
+        if argv[0] == "codegraph":
+            index = Path(argv[-1]) / ".codegraph" / "codegraph.db"
+            index.parent.mkdir(parents=True)
+            with closing(sqlite3.connect(index)) as connection, connection:
+                connection.execute("CREATE TABLE nodes (id TEXT)")
+        return 0
+
+    problem = codegraph_sync.refresh(
+        tmp_path / "repo",
+        caches=tmp_path / "caches",
+        fetch=False,
+        run=tableless,
+        output=tools.output,
+    )
+
+    database = backbone.backbone_database(tmp_path / "caches")
+    assert problem == f"Building the derived tables of {database} failed."
+    assert not list(database.parent.glob("codegraph.db.affected-*"))
+
+
 def test_a_held_lock_skips_the_refresh(tmp_path: Path) -> None:
     """Two refreshes at once would both write the one snapshot tree."""
     home = tmp_path / "caches" / "backbone"

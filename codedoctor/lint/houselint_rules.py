@@ -3719,7 +3719,9 @@ class SingleUseHelperRule:
           rewritten: The full new source, or None when nothing changes.
 
         """
-        helpers = [h for h in _single_use_helpers(unit) if h.call is not None]
+        helpers = [
+            (h, call) for h in _single_use_helpers(unit) if (call := h.call) is not None
+        ]
         # Every edit is an absolute offset into the ORIGINAL source and they are
         # applied bottom-up, so a call-site rewrite that shortens the file
         # cannot shift a def deletion below it onto the wrong lines. Two
@@ -3728,10 +3730,7 @@ class SingleUseHelperRule:
         # for the next run, which the dispatcher's idempotence check permits.
         edits: list[tuple[int, int, str]] = []
         starts = _line_starts(unit.source)
-        for helper in helpers:
-            call = helper.call
-            if call is None:
-                raise ValueError("Expected call is not None.")
+        for helper, call in helpers:
             replacement = _inline_call(helper.node, call, unit)
             if replacement is None:
                 continue
@@ -4772,8 +4771,7 @@ def _percent_format(message: ast.JoinedStr, source: str) -> tuple[str, list[str]
         if isinstance(part, ast.Constant):
             fmt.append(str(part.value).replace("%", "%%"))
             continue
-        if not isinstance(part, ast.FormattedValue):
-            continue
+        assert isinstance(part, ast.FormattedValue)
         spec = ""
         if isinstance(part.format_spec, ast.JoinedStr):
             # A nested field (``{x:>{w}}``) keeps its own text, so the spec
@@ -5740,12 +5738,10 @@ def _inline_call(node: ast.FunctionDef, call: ast.Call, unit: Unit) -> str | Non
     body = _without_docstring(node.body)
     ret = body[0]
     assert isinstance(ret, ast.Return)
-    if ret.value is None:
-        raise ValueError("Expected ret.value is not None.")
     expr = ret.value
+    assert isinstance(expr, ast.expr)
     tree = unit.tree
-    if tree is None:
-        raise ValueError("Expected tree is not None.")
+    assert isinstance(tree, ast.Module)
     # A spelling is the parameter only where the def's own scope resolves it:
     # a lambda or comprehension in the body may bind the same name, and a
     # walrus that rebinds the parameter is a second occurrence of it.
@@ -5819,8 +5815,7 @@ def _inline_call(node: ast.FunctionDef, call: ast.Call, unit: Unit) -> str | Non
         return None
     starts = _line_starts(unit.source)
     text = ast.get_source_segment(unit.source, expr)
-    if text is None:
-        raise ValueError("Expected text is not None.")
+    assert isinstance(text, str)
     expr_start = _offset(starts, expr.lineno, expr.col_offset)
     pieces: list[tuple[int, int, str]] = []
     for n in refs:
@@ -5883,8 +5878,7 @@ def _bind_arguments(
         bound[positional[index].arg] = arg
     keywordable = {p.arg for p in [*args.args, *args.kwonlyargs]}
     for kw in call.keywords:
-        if kw.arg is None:
-            raise ValueError("Expected kw.arg is not None.")
+        assert isinstance(kw.arg, str)
         if kw.arg not in keywordable or kw.arg in bound:
             return None
         bound[kw.arg] = kw.value
@@ -5951,8 +5945,7 @@ def _enclosing_def(
 def _local_classes(unit: Unit) -> frozenset[str]:
     """Names of classes defined at this module's top level."""
     tree = unit.tree
-    if tree is None:
-        raise ValueError("Expected tree is not None.")
+    assert isinstance(tree, ast.Module)
     return frozenset(n.name for n in tree.body if isinstance(n, ast.ClassDef))
 
 
@@ -5969,12 +5962,10 @@ def _local_classes(unit: Unit) -> frozenset[str]:
 def _keeps_bindings(node: ast.FunctionDef, call: ast.Call, unit: Unit) -> bool:
     """Return whether every name inlining ``call`` moves resolves as it did."""
     tree = unit.tree
-    if tree is None:
-        raise ValueError("Expected tree is not None.")
+    assert isinstance(tree, ast.Module)
     ret = _without_docstring(node.body)[0]
     assert isinstance(ret, ast.Return)
-    if ret.value is None:
-        raise ValueError("Expected ret.value is not None.")
+    assert isinstance(ret.value, ast.expr)
     scopes = _cached_scopes(tree)
     params = {a.arg for a in _all_args(node)}
     if node.type_params or scopes.bound[node] - params:
@@ -6022,8 +6013,7 @@ def _keeps_evaluation(
 ) -> bool:
     """Return whether each argument ``reads`` maps to runs as the call ran it."""
     tree = unit.tree
-    if tree is None:
-        raise ValueError("Expected tree is not None.")
+    assert isinstance(tree, ast.Module)
     scopes = _cached_scopes(tree)
     starts = _cached_line_starts(unit.source)
     computed: list[ast.Name] = []
@@ -6042,16 +6032,17 @@ def _keeps_evaluation(
         return True
     # On the unconditional path of one scope, source order is evaluation order. A
     # comprehension runs its calls when it is reached, after its first iterable.
-    computed.sort(key=lambda n: _span(starts, n)[0])
-    order = [_span(starts, reads[n])[0] for n in computed]
-    last = _span(starts, computed[-1])[0]
+    # Names, and the arguments they read, never overlap: start and end order alike.
+    computed.sort(key=lambda n: _span(starts, n)[0])  # pragma: no mutate
+    order = [_span(starts, reads[n])[0] for n in computed]  # pragma: no mutate
+    last = _span(starts, computed[-1])[0]  # pragma: no mutate
     return order == sorted(order) and not any(
         isinstance(
             n,
             ast.Call | ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp,
         )
         and scopes.owner[n] is node
-        and _span(starts, n)[1] <= last
+        and _span(starts, n)[1] <= last  # pragma: no mutate -- no call ends at a name
         and any(isinstance(m, ast.Call) for m in ast.walk(n))
         for n in ast.walk(expr)
     )
@@ -6260,8 +6251,11 @@ def _is_knob(stmt: ast.Assign | ast.AnnAssign) -> bool:
     value = stmt.value
     if value is None:
         return False
-    # A literal is never a call, so only a ``X | Y`` of literals needs exempting.
-    return _is_literal_value(value) and not _is_type_expression(value)
+    # A literal is never a call or a subscript, so only a ``X | Y`` union alias of
+    # literals needs exempting.
+    return _is_literal_value(value) and not (
+        isinstance(value, ast.BinOp) and isinstance(value.op, ast.BitOr)
+    )
 
 
 def _target_name(stmt: ast.Assign | ast.AnnAssign) -> str | None:
@@ -6296,41 +6290,6 @@ def _is_literal_value(value: ast.expr) -> bool:
             k is not None and _is_literal_value(k) and _is_literal_value(v)
             for k, v in zip(value.keys, value.values, strict=True)
         )
-    return False
-
-
-# Any uppercase-initial subscript base is also treated as a type (``Mapping[...]`` / a
-# user alias), since config knobs are scalars.
-def _is_type_expression(
-    value: ast.expr,
-    *,
-    type_bases: frozenset[str] = frozenset(
-        {
-            "Literal",
-            "Callable",
-            "Union",
-            "Optional",
-            "Annotated",
-            "ClassVar",
-            "Final",
-            "dict",
-            "list",
-            "tuple",
-            "set",
-            "frozenset",
-            "type",
-        },
-    ),
-) -> bool:
-    """Whether the RHS is a type alias rather than a runtime value."""
-    if isinstance(value, ast.BinOp) and isinstance(value.op, ast.BitOr):
-        return True  # ``X | Y`` union alias.
-    if isinstance(value, ast.Subscript):
-        head = value.value
-        if isinstance(head, ast.Attribute):
-            return True  # ``typing.Mapping[...]`` etc.
-        if isinstance(head, ast.Name):
-            return head.id in type_bases or head.id[:1].isupper()
     return False
 
 
@@ -7393,10 +7352,8 @@ def _line_starts(source: str) -> _LineStarts:
 # a log message put the splice one character short and cut the closing paren.
 def _offset(starts: _LineStarts, line: int | None, column: int | None) -> int:
     """Convert an AST line and byte column to an absolute character offset."""
-    if line is None:
-        raise ValueError("Expected line is not None.")
-    if column is None:
-        raise ValueError("Expected column is not None.")
+    assert isinstance(line, int)
+    assert isinstance(column, int)
     text = starts.lines[line - 1]
     if text.isascii():
         return starts.starts[line - 1] + column

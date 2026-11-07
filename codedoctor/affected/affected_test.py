@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Final, cast
 from unittest.mock import Mock
 
@@ -97,6 +98,20 @@ def _run_cli(*argv: str, skip: str = "") -> subprocess.CompletedProcess[str]:
 #
 # States `_connect`'s keyword arguments rather than forwarding `**kwargs`: a splat of
 # `object` matches none of `connect`'s overloads.
+# Never ``sqlite3.connect`` itself: coverage writes its own SQLite data while the test
+# runs, and a process-wide double crashed the coverage run.
+def _patch_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    connect: Callable[..., sqlite3.Connection],
+) -> None:
+    """Make ``affected`` open databases through ``connect``, and nothing else."""
+    module = SimpleNamespace(
+        **{name: getattr(sqlite3, name) for name in dir(sqlite3) if name[:2] != "__"},
+    )
+    module.connect = connect
+    monkeypatch.setattr(affected, "sqlite3", module)
+
+
 def _connect_double(
     attempts: list[str],
     observe: Callable[[sqlite3.Connection], None] = lambda connection: None,  # noqa: ARG005 -- The default callback preserves the injectable observation seam without using its connection.
@@ -1264,7 +1279,7 @@ def test_a_worker_exception_still_closes_every_handle(
     database = _index(tmp_path)
     _tree(tmp_path)
     handles: list[sqlite3.Connection] = []
-    monkeypatch.setattr(sqlite3, "connect", _connect_double([], handles.append))
+    _patch_connect(monkeypatch, _connect_double([], handles.append))
     real = affected._reachable
     seen: list[str] = []
 
@@ -1304,7 +1319,7 @@ def test_the_pool_opens_one_connection_per_thread_not_per_seed(
     database = _index(tmp_path)
     _tree(tmp_path)
     opened: list[str] = []
-    monkeypatch.setattr(sqlite3, "connect", _connect_double(opened))
+    _patch_connect(monkeypatch, _connect_double(opened))
     harvest(database, changed=["lib.py", "mid.py", "twin.py"], depth=1, emit="nodeids")
     # The derived-table build opens its own writable file; count index opens.
     assert sum(entry.endswith("codegraph.db?mode=ro") for entry in opened) == 1
@@ -1505,7 +1520,7 @@ def test_a_saturated_changeset_returns_the_inputs_without_walking(
     database = _index(tmp_path)
     _tree(tmp_path)
     opened: list[str] = []
-    monkeypatch.setattr(sqlite3, "connect", _connect_double(opened))
+    _patch_connect(monkeypatch, _connect_double(opened))
     assert harvest(
         database,
         changed=["lib.py", "mid.py"],
@@ -1728,7 +1743,7 @@ def test_a_negative_depth_opens_no_connection(
     database = _index(tmp_path)
     _tree(tmp_path)
     opened: list[str] = []
-    monkeypatch.setattr(sqlite3, "connect", _connect_double(opened))
+    _patch_connect(monkeypatch, _connect_double(opened))
     harvest(database, changed=["lib.py"], depth=-1, emit="nodeids")
     assert opened == []
 
@@ -1867,7 +1882,7 @@ def test_connect_returns_none_when_open_fails(
         del args, kwargs
         raise sqlite3.OperationalError("locked")
 
-    monkeypatch.setattr(sqlite3, "connect", fail)
+    _patch_connect(monkeypatch, fail)
     assert affected._connect(database) is None
 
 
@@ -1907,6 +1922,26 @@ def test_an_empty_diff_has_no_hunks(tmp_path: Path) -> None:
     (tmp_path / "empty.diff").touch()
 
     assert affected._parse_diff(tmp_path / "empty.diff") == {}
+
+
+def test_a_diffs_headers_and_body_lines_mark_no_ranges(tmp_path: Path) -> None:
+    """Only `+++` names and `@@` hunks count; `git diff`'s other lines are noise."""
+    diff = tmp_path / "change.diff"
+    diff.write_text(
+        "diff --git a/a.py b/a.py\nindex 1..2 100644\n--- a/a.py\n+++ b/a.py\n"
+        "@@ -1,2 +1,2 @@\n context\n-old\n+new\n",
+    )
+
+    assert affected._parse_diff(diff) == {"a.py": [(1, 2)]}
+
+
+def test_a_graph_without_tables_reaches_nothing() -> None:
+    """A database the index never wrote fails the walk; the seed reaches nothing."""
+    connection = sqlite3.connect(":memory:")
+    try:
+        assert affected._reachable(connection, seed="a.py", depth=1) == []
+    finally:
+        connection.close()
 
 
 def test_the_diff_reaches_harvest_from_the_command_line(
@@ -2187,6 +2222,20 @@ def test_the_rebuilds_index_output_never_reaches_the_selection(
     assert "Initializing CodeGraph" in err
 
 
+def test_a_missing_index_cli_exits_127_like_a_shell(
+    tmp_path: Path,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    missing = str(tmp_path / "codegraph")
+
+    status = affected._quietly([missing, "init"])
+
+    out, err = capfd.readouterr()
+    assert status == 127
+    assert out == ""
+    assert err == f"{missing}: command not found\n"
+
+
 def test_a_saturated_changeset_never_rebuilds_the_overlay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2462,6 +2511,26 @@ def test_every_sidecar_spelling_pairs_with_its_source(
     (tmp_path / sidecar).touch()
 
     assert affected._sidecars([changed]) == [Path(sidecar)]
+
+
+@pytest.mark.parametrize("changed", ["pkg/thing_test.py", "pkg/test_thing.py"])
+def test_a_changed_test_pairs_without_its_modules_split_tests(
+    tmp_path: Path,
+    changed: str,
+) -> None:
+    """Only a changed SOURCE pulls in its split tests; a changed test does not.
+
+    The splits are named so that a test file read as a source would match them
+    as its own: ``thing_test_*_test.py`` and ``test_thing_*_test.py``.
+    """
+    splits = ("thing_test_x_test.py", "test_thing_x_test.py")
+    (tmp_path / "pkg").mkdir()
+    for name in ("thing.py", changed.removeprefix("pkg/"), *splits):
+        (tmp_path / "pkg" / name).touch()
+
+    assert sorted(affected._sidecars([changed, "pkg/thing.py"])) == sorted(
+        [Path(changed), Path(changed), *(Path("pkg", name) for name in splits)],
+    )
 
 
 # `(id, kind, name, file_path, start_line)`; `qualified_name` is the name, and every

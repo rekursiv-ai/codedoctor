@@ -87,3 +87,8 @@ TIERS: Final = {
         ),
     )
 }
+
+# Every tier a developer's machine can run: a module's database and slow tests
+# are its own tests too, so the gates that floor a file run them, where the
+# project's default ``-m`` would drop them.
+RUNNABLE: Final = "not cluster and not cuda and not performance"

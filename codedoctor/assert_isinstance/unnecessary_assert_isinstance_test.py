@@ -512,6 +512,19 @@ def test_a_crashed_checker_raises_instead_of_clearing_every_candidate(
     assert (raised.value.returncode, raised.value.stderr) == (status, "panic\n")
 
 
+def test_a_site_that_is_not_an_assert_is_rejected(tmp_path: Path) -> None:
+    """The file changed since the probe flagged it; blanking the line would corrupt it."""
+    (tmp_path / "m.py").write_text("x = 1\ny = 2\n")
+
+    with pytest.raises(ValueError, match="Expected match is not None"):
+        unnecessary_assert_isinstance.still_needed(
+            {(tmp_path / "m.py", 2)},
+            root=tmp_path,
+            checkers=[],
+        )
+    assert (tmp_path / "m.py").read_text() == "x = 1\ny = 2\n"
+
+
 def test_a_crashed_ty_fails_the_run_and_deletes_nothing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -237,6 +237,27 @@ def test_a_file_that_never_parsed_may_still_be_fixed(tmp_path: Path) -> None:
     assert written == (path,)
 
 
+def test_a_fix_error_is_never_raised_for_a_rewrite_that_parses(tmp_path: Path) -> None:
+    """Without a ``SyntaxError`` to chain, a ``FixError`` would blame a sound rule."""
+    with pytest.raises(AssertionError, match="x = 1"):
+        houselint._raise_fix_error("trim", tmp_path / "m.py", "x = 1\n")
+
+
+def test_a_reported_finding_its_fix_cannot_rewrite_is_kept(tmp_path: Path) -> None:
+    """The check opens the fix gate; a fix returning None leaves the finding."""
+    path = _write(tmp_path, "BAD\n")
+
+    findings, written = run(
+        [path],
+        active=(_Counting(),),
+        fixing=frozenset({"counting"}),
+    )
+
+    assert [(f.line, f.rule) for f in findings] == [(1, "counting")]
+    assert written == ()
+    assert path.read_text() == "BAD\n"
+
+
 def test_shipped_kinds_are_python_pyi_and_jupyter(tmp_path: Path) -> None:
     """The kinds are pre-commit's ``identify`` tags, as the hook's ``types_or``."""
     kinds = {
@@ -834,6 +855,22 @@ def test_exclude_matches_a_repo_relative_path(tmp_path: Path) -> None:
     )
 
     assert findings == ()
+
+
+def test_a_path_outside_the_root_is_matched_as_given(tmp_path: Path) -> None:
+    """Nothing is relative to a foreign root, so an anchored glob cannot match."""
+    path = _write(tmp_path / "sub", "BAD\n")
+    (tmp_path / "elsewhere").mkdir()
+
+    findings, _ = run(
+        [path],
+        active=(_Counting(),),
+        fixing=frozenset(),
+        exclude=(_exclusion("sub/mod.py"),),
+        root=tmp_path / "elsewhere",
+    )
+
+    assert [f.path for f in findings] == [path]
 
 
 def test_a_path_two_rules_fixed_is_listed_once(tmp_path: Path) -> None:

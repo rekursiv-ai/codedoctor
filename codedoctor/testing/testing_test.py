@@ -16,7 +16,7 @@ import pytest
 from codedoctor.gate import fakes, gate, spool
 from codedoctor.lib.testing.checks import assert_help_without_docstring
 from codedoctor.testing import coverage_summary, listing, testing
-from codedoctor.testing.tiers import TIERS, Tier
+from codedoctor.testing.tiers import RUNNABLE, TIERS, Tier
 from codedoctor.typecheck import typecheck
 
 
@@ -111,11 +111,18 @@ def test_pytest_runs_each_changed_files_pairs_with_its_directory_measured(
     )
 
     [test] = tools.calls
-    assert test[3:6] == ["-m", "pytest", "-q"]
+    assert test[2:7] == [
+        "COVERAGE_CORE=ctrace",
+        sys.executable,
+        "-m",
+        "pytest",
+        "--dist=no",
+    ]
     assert tools.argfiles == [
         [
             "--cov=.",
             "--cov=pkg",
+            "--cov-context=test",
             "--no-cov-on-fail",
             "--cov-fail-under=0",
             "--cov-report=",
@@ -131,6 +138,7 @@ def test_pytest_without_pytest_cov_measures_nothing(tmp_path: Path) -> None:
 
     _pytest(tmp_path, tools, ["a.py"], existing=["a_test.py"])
 
+    # Nothing measured, so no slower coverage core either.
     assert [call[3:5] for call in tools.calls] == [["-m", "pytest"]]
     assert tools.argfiles == [["a_test.py"]]
 
@@ -205,6 +213,87 @@ def test_pytest_fails_changed_sources_below_the_floor(
 
     assert _pytest(tmp_path, tools, ["a.py", "a_test.py"]) == expected
     assert ("below fail_under=100" in capsys.readouterr().err) is bool(expected)
+
+
+def test_pytest_leaves_its_coverage_for_the_floor_and_clears_a_stale_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "a.py").write_text("x = 1\n")
+    (root / "a_test.py").touch()
+    monkeypatch.chdir(root)
+    context = fakes.context(tmp_path, _Measured(root, executed=1))
+    spool.append(context.directory, gate="pytest", key=9, paths=["a.py", "a_test.py"])
+    left = testing.handoff(context)
+    left.write_text("an earlier run's")
+
+    assert testing.pytest(context, dependents=None) == 0
+
+    measured = coverage.CoverageData(basename=str(left))
+    measured.read()
+    assert measured.lines(str(root / "a.py")) == [1]
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [(0, "pytest passed but recorded no coverage"), (1, "pytest exited 1")],
+)
+def test_a_run_that_measured_nothing_says_why_in_its_hand_off(
+    tmp_path: Path,
+    status: int,
+    reason: str,
+) -> None:
+    """Never absent: absent is a skipped ``pytest``, which the floor passes.
+
+    The floor prints the reason, so a failed run is told from a passing one that
+    recorded nothing, and no earlier run's data is read as this one's.
+    """
+    context = fakes.context(tmp_path, fakes.Recorder(status=status))
+    for name in ("a.py", "a_test.py"):
+        (context.root / name).touch()
+    spool.append(context.directory, gate="pytest", key=9, paths=["a.py"])
+    testing.handoff(context).write_text("an earlier run's")
+
+    assert testing.pytest(context, dependents=None) == status
+    assert testing.handoff(context).read_text() == f"{reason}\n"
+
+
+def test_the_floor_reads_pytests_run_and_clears_it(tmp_path: Path) -> None:
+    tools = fakes.Recorder()
+    context = fakes.context(tmp_path, tools)
+    (context.root / "a.py").touch()
+    spool.append(context.directory, gate="coverage-floor", key=9, paths=["a.py"])
+    data = testing.handoff(context)
+    data.write_text("pytest's")
+
+    assert testing.floor(context) == 0
+
+    [run] = tools.calls
+    assert run[1:5] == ["-m", "codedoctor.coverage_floor", "--data", str(data)]
+    assert tools.argfiles == [["a.py"]]
+    assert not data.exists()
+
+
+def test_the_floor_with_nothing_spooled_runs_nothing(tmp_path: Path) -> None:
+    tools = fakes.Recorder()
+    context = fakes.context(tmp_path, tools)
+    spool.append(context.directory, gate="coverage-floor", key=9, paths=[])
+
+    assert testing.floor(context) == 0
+    assert tools.calls == []
+
+
+def test_the_floor_without_its_spool_fails(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tools = fakes.Recorder()
+
+    assert testing.floor(fakes.context(tmp_path, tools)) == 1
+    assert tools.calls == []
+    assert "coverage-floor-spool" in capsys.readouterr().err
 
 
 def test_pytest_without_coverage_data_skips_the_summary(
@@ -316,7 +405,7 @@ def test_pytest_reads_its_selection_from_an_argfile(tmp_path: Path) -> None:
         *("-p", listing.__name__),
     ]
     selection = Path(test_files.removeprefix("--test-files="))
-    assert selection.name == "selected.txt"
+    assert selection.name == "selected-1.txt"
     assert selection.parent.name.startswith("precommit-")
     path = Path(argfile.removeprefix("@"))
     assert path.name == "args"
@@ -366,8 +455,14 @@ def test_the_gate_sizes_the_walk_and_pytest_from_its_own_workers(
     assert test[test.index("-n") + 1] == "5"
 
 
-def test_pytest_prefers_the_graphs_tests_to_the_pairs(tmp_path: Path) -> None:
-    tools = fakes.Recorder(output="b_test.py::t\n", installed=False)
+def test_own_tests_run_every_tier_measured_and_the_graphs_the_default(
+    tmp_path: Path,
+) -> None:
+    """Only the own tests ``coverage-floor`` reads pay for slow and database tiers.
+
+    A graph test inside an own file runs once, with the own file.
+    """
+    tools = fakes.Recorder(output="b_test.py::t\na_test.py::u\n")
 
     _pytest(
         tmp_path,
@@ -378,9 +473,25 @@ def test_pytest_prefers_the_graphs_tests_to_the_pairs(tmp_path: Path) -> None:
         PRECOMMIT_CODEGRAPH_PYTEST="1",
     )
 
-    [walk] = [call for call in tools.calls if "--emit" in call]
+    walk, own, graph = tools.calls
     assert walk[3:8] == ["--emit", "nodeids", "--depth", "1", "--workers"]
-    assert tools.argfiles == [["a.py"], ["b_test.py"]]
+    assert own[2] == "COVERAGE_CORE=ctrace"
+    # Whole files: no listing plugin, whose import would precede coverage.
+    assert own[own.index("--tb=short") + 1 :][:2] == ["-m", RUNNABLE]
+    assert "-p" not in own
+    assert "COVERAGE_CORE=ctrace" not in graph
+    assert graph[graph.index("--tb=short") + 1] == "-p"
+    assert tools.argfiles[1:] == [
+        [
+            "--cov=.",
+            "--cov-context=test",
+            "--no-cov-on-fail",
+            "--cov-fail-under=0",
+            "--cov-report=",
+            "a_test.py",
+        ],
+        ["b_test.py"],
+    ]
     assert tools.listings == [["b_test.py::t"]]
 
 
@@ -535,7 +646,25 @@ def test_the_cli_runs_pytest(
     monkeypatch.setattr(sys, "argv", ["testing", "pytest"])
 
     assert testing.main() == 4
-    assert processes.calls[-1][3:5] == ["-m", "pytest"]
+    assert processes.calls[-1][4:6] == ["-m", "pytest"]
+
+
+def test_the_cli_floors_the_spooled_files(
+    processes: fakes.Processes,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "a.py").write_text("")
+    monkeypatch.setattr(sys, "argv", ["gate", "spool", "coverage-floor", "a.py"])
+    gate.main()
+    monkeypatch.setattr(sys, "argv", ["testing", "coverage-floor"])
+
+    assert testing.main() == 4
+    assert processes.calls[-1][1:4] == [
+        "-m",
+        "codedoctor.coverage_floor",
+        "--data",
+    ]
 
 
 def test_the_cli_runs_a_tier(
@@ -782,19 +911,34 @@ def test_a_tier_without_its_capability_runs_nothing(tmp_path: Path) -> None:
     assert tools.calls == []
 
 
-@pytest.mark.parametrize(
-    ("name", "test"),
-    [
-        ("conftest.py", True),
-        ("a_test.py", True),
-        ("test_a.py", True),
-        ("a.py", False),
-        ("test.py", False),
-        ("pytest_a.py", False),
-    ],
-)
-def test_a_test_file_is_named_as_pytest_collects_one(name: str, test: bool) -> None:
-    assert testing._is_test(f"pkg/{name}") is test
+def test_a_changed_parity_script_is_a_test_not_a_measured_source(
+    tmp_path: Path,
+) -> None:
+    """The one rule ``sidecars.is_test`` names it a test; it widens no ``--cov``."""
+    tools = fakes.Recorder()
+
+    _pytest(tmp_path, tools, ["pkg/x_parity.py", "a.py"], existing=["a_test.py"])
+
+    assert tools.argfiles[0][0] == "--cov=."
+    assert "--cov=pkg" not in tools.argfiles[0]
+
+
+def test_a_day_old_hand_off_is_dropped_and_a_fresh_one_kept(tmp_path: Path) -> None:
+    """A concurrent run's hand-off is fresh; one ``SKIP=coverage-floor`` left is not."""
+    stale, fresh = tmp_path / "coverage.1", tmp_path / "coverage.2"
+    for path in (stale, fresh):
+        path.write_text("data")
+    os.utime(stale, (0, 0))
+    other = tmp_path / "pytest.1"
+    other.write_text("spool")
+    os.utime(other, (0, 0))
+
+    testing._drop_stale_handoffs(tmp_path, now=2 * 24 * 60 * 60)
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "coverage.2",
+        "pytest.1",
+    ]
 
 
 def test_a_spooled_test_file_named_test_first_runs_itself(tmp_path: Path) -> None:

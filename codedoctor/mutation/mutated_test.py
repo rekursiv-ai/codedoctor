@@ -2324,6 +2324,29 @@ def test_the_functions_a_change_touched_are_named(tmp_path: Path) -> None:
     ) == frozenset({"pkg.mod.x_f7__mutmut_*", "pkg.new.x_g__mutmut_*"})
 
 
+def test_a_new_file_that_does_not_parse_names_no_function(tmp_path: Path) -> None:
+    root = _changed_repo(tmp_path)
+    (root / "pkg/broken.py").write_text("def broken(:\n")
+
+    assert mutated.changed_functions(
+        root,
+        base="HEAD",
+        files=["pkg/mod.py", "pkg/broken.py"],
+    ) == frozenset({"pkg.mod.x_f7__mutmut_*"})
+
+
+def test_no_python_file_needs_no_diff(tmp_path: Path) -> None:
+    """``tmp_path`` is no git checkout, so running git here would raise."""
+    assert (
+        mutated.changed_functions(
+            tmp_path,
+            base="HEAD",
+            files=["README.md"],
+        )
+        == frozenset()
+    )
+
+
 @pytest.mark.parametrize(
     "setting",
     ["diff.noprefix", "diff.mnemonicPrefix", "diff.external"],
@@ -2657,11 +2680,6 @@ def test_argument_defaults_and_test_file_classification() -> None:
     assert parser.get_default("workers") is None
     assert parser.get_default("paths") == [Path()]
     assert parser.get_default("emit") == "run"
-    assert mutated._is_test("conftest.py")
-    assert mutated._is_test("test_mod.py")
-    assert mutated._is_test("mod_test.py")
-    assert mutated._is_test("ops/git/sync/mod_parity.py")
-    assert not mutated._is_test("module.py")
 
 
 def test_the_seed_comes_from_the_environment(
@@ -4516,6 +4534,31 @@ def test_remainder_requires_retained_identity(
     run.assert_not_called()
     assert capsys.readouterr().err.endswith(
         ": remainder manifest must include retained identity\n",
+    )
+
+
+def test_remainder_cannot_be_combined_with_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A manifest names its own source; paths beside it would be silently dropped."""
+    run = Mock()
+    monkeypatch.setattr(mutated, "_run_mutmut", run)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["mutated", "--remainder", "remainder.json", "pkg/mod.py"],
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        mutated.main()
+
+    assert exited.value.code == 2
+    run.assert_not_called()
+    assert capsys.readouterr().err.endswith(
+        "error: remainder manifests cannot be combined with paths\n",
     )
 
 

@@ -56,7 +56,7 @@ every gate and is the fullest example.
 | `codedoctor.gate` | `spool`, `run` and `threaded`: the shared machinery |
 | `codedoctor.typecheck` | `ty-check`, `pyrefly-check`, `basedpyright` |
 | `codedoctor.testing` | the tests paired with each changed file, whole-suite tiers, and the pytest plugin that selects and records node ids |
-| `codedoctor.coverage_floor` | each changed source's coverage by its own tests |
+| `codedoctor.coverage_floor` | each changed source's coverage by its own tests, read from the `pytest` gate's run |
 | `codedoctor.mutation` | mutation testing of the changed functions (`codedoctor[mutation]`) |
 | `codedoctor.lint` | `houselint`, AST rules configured in `[tool.houselint]` |
 | `codedoctor.assert_isinstance` | deletes each `assert isinstance` a checker proves redundant |
