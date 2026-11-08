@@ -3117,7 +3117,7 @@ def test_xdg_rule_reports_home_lookup_forms(tmp_path: Path) -> None:
         'import os\na = os.getenv("HOME")\nb = os.environ["HOME"]\n',
     )
     findings = houselint_rules.XdgLiteralRule(helper="codedoctor.lib.userdirs").check(
-        unit
+        unit,
     )
     assert len(findings) == 2
     assert all("userdirs" in finding.message for finding in findings)
