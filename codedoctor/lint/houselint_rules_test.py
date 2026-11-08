@@ -431,7 +431,9 @@ def test_xdg_findings_name_each_rederivation(tmp_path: Path) -> None:
     assert [
         (f.line, f.message)
         for f in _findings(
-            tmp_path, XdgLiteralRule(helper="codedoctor.lib.userdirs"), body
+            tmp_path,
+            XdgLiteralRule(helper="codedoctor.lib.userdirs"),
+            body,
         )
     ] == [
         (6, f"literal {xdg + ' as a bare non-docstring string'!r}{tail}"),
