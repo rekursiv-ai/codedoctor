@@ -1,4 +1,4 @@
-"""Tests for ``houselint``: rule protocol, per-rule flags, and one parse."""
+"""Tests for ``checker``: rule protocol, per-rule flags, and one parse."""
 
 from __future__ import annotations
 
@@ -20,19 +20,19 @@ import sys
 import pytest
 
 from codedoctor.lint import (
+    checker,
+    custom_types,
     house_ignore,
-    houselint,
-    houselint_rules,
-    houselint_types,
+    rules,
 )
-from codedoctor.lint.houselint import Exclusion, Rule, run
-from codedoctor.lint.houselint_rules import (
+from codedoctor.lint.checker import Exclusion, Rule, run
+from codedoctor.lint.custom_types import Finding, Unit
+from codedoctor.lint.rules import (
     ConfigGlobalsRule,
     DataclassRule,
     DigitsRule,
     StaticMethodRule,
 )
-from codedoctor.lint.houselint_types import Finding, Unit
 
 
 if TYPE_CHECKING:
@@ -47,7 +47,7 @@ if TYPE_CHECKING:
 # exclusions.
 @pytest.fixture(autouse=True)
 def _outside_any_pyproject(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Run from a directory no ``[tool.houselint]`` governs."""
+    """Run from a directory no ``[tool.codedoctor.lint]`` governs."""
     monkeypatch.chdir(tmp_path)
 
 
@@ -61,23 +61,23 @@ def _write(tmp_path: Path, body: str, name: str = "mod.py") -> Path:
 
 def _exclusion(spec: str) -> Exclusion:
     """Parse one ``--exclude`` value against the shipped registry."""
-    return houselint.parse_exclusion(
+    return checker.parse_exclusion(
         spec,
-        known={rule.name for rule in houselint.default_rules()} | {"counting"},
+        known={rule.name for rule in checker.default_rules()} | {"counting"},
     )
 
 
 # Goes through ``_add_arguments`` rather than constructing a Namespace so the flag
 # SPELLING is under test too: a renamed flag breaks this, which is the point.
-def _configured[R: Rule](rule: R, /, *argv: str) -> tuple[R, houselint._Flags]:
+def _configured[R: Rule](rule: R, /, *argv: str) -> tuple[R, checker._Flags]:
     """Parse ``argv`` through the real parser and apply them to ``rule``."""
     parser = argparse.ArgumentParser()
-    houselint._add_arguments(parser)
+    checker._add_arguments(parser)
     flags = cast(
-        houselint._Flags,
+        checker._Flags,
         parser.parse_args(["--select", rule.name, *argv, "unused.py"]),
     )
-    active, _ = houselint.select_rules(
+    active, _ = checker.select_rules(
         (rule,),
         select=flags.select,
         fix=flags.fix,
@@ -196,12 +196,12 @@ class _Breaking:
 def test_a_fix_that_breaks_the_parse_raises(tmp_path: Path, name: str) -> None:
     """A fixer's output reached disk unchecked and left stubs unparseable.
 
-    A broken fix is a houselint bug, not a finding in the user's file, so the
+    A broken fix is a checker bug, not a finding in the user's file, so the
     run stops with the rule, the file, and the parse error that proves it.
     """
     path = _write(tmp_path, "x = 1\n", name=name)
 
-    with pytest.raises(houselint.FixError) as raised:
+    with pytest.raises(checker.FixError) as raised:
         run([path], active=(_Breaking(),), fixing=frozenset({"breaking"}))
 
     assert path.read_text() == "x = 1\n"
@@ -217,15 +217,15 @@ def test_a_broken_fix_exits_nonzero_with_a_traceback(
 ) -> None:
     """``main`` lets the error escape: a crash must not read as clean or as findings."""
     path = _write(tmp_path, "x = 1\n")
-    monkeypatch.setattr(houselint, "default_rules", lambda: (_Breaking(),))
+    monkeypatch.setattr(checker, "default_rules", lambda: (_Breaking(),))
     monkeypatch.setattr(
         sys,
         "argv",
-        ["houselint.py", "--select", "breaking", "--fix", "breaking", str(path)],
+        ["checker.py", "--select", "breaking", "--fix", "breaking", str(path)],
     )
 
-    with pytest.raises(houselint.FixError):
-        houselint.main()
+    with pytest.raises(checker.FixError):
+        checker.main()
 
 
 def test_a_file_that_never_parsed_may_still_be_fixed(tmp_path: Path) -> None:
@@ -240,7 +240,7 @@ def test_a_file_that_never_parsed_may_still_be_fixed(tmp_path: Path) -> None:
 def test_a_fix_error_is_never_raised_for_a_rewrite_that_parses(tmp_path: Path) -> None:
     """Without a ``SyntaxError`` to chain, a ``FixError`` would blame a sound rule."""
     with pytest.raises(AssertionError, match="x = 1"):
-        houselint._raise_fix_error("trim", tmp_path / "m.py", "x = 1\n")
+        checker._raise_fix_error("trim", tmp_path / "m.py", "x = 1\n")
 
 
 def test_a_reported_finding_its_fix_cannot_rewrite_is_kept(tmp_path: Path) -> None:
@@ -261,14 +261,14 @@ def test_a_reported_finding_its_fix_cannot_rewrite_is_kept(tmp_path: Path) -> No
 def test_shipped_kinds_are_python_pyi_and_jupyter(tmp_path: Path) -> None:
     """The kinds are pre-commit's ``identify`` tags, as the hook's ``types_or``."""
     kinds = {
-        name: houselint.read_unit(_write(tmp_path, "x = 1\n", name=name))
+        name: checker.read_unit(_write(tmp_path, "x = 1\n", name=name))
         for name in ("m.py", "m.pyi")
     }
     assert {name: getattr(unit, "kind", None) for name, unit in kinds.items()} == {
         "m.py": "python",
         "m.pyi": "pyi",
     }
-    notebook = houselint.read_unit(_write(tmp_path, "{}", name="n.ipynb"))
+    notebook = checker.read_unit(_write(tmp_path, "{}", name="n.ipynb"))
     assert isinstance(notebook, Unit)
     assert notebook.kind == "jupyter"
 
@@ -278,7 +278,7 @@ def test_a_stub_still_gets_its_suppressions_checked(tmp_path: Path) -> None:
 
     findings, _ = run(
         [stub],
-        active=(houselint_rules.SuppressionFormRule(),),
+        active=(rules.SuppressionFormRule(),),
         fixing=frozenset(),
     )
 
@@ -287,7 +287,7 @@ def test_a_stub_still_gets_its_suppressions_checked(tmp_path: Path) -> None:
 
 def test_only_rules_safe_on_stubs_declare_pyi() -> None:
     """A stub mirrors another package's signatures; most fixers would rewrite them."""
-    assert {rule.name for rule in houselint.default_rules() if "pyi" in rule.kinds} == {
+    assert {rule.name for rule in checker.default_rules() if "pyi" in rule.kinds} == {
         "digits",
         "emdash",
         "suppression-form",
@@ -296,7 +296,7 @@ def test_only_rules_safe_on_stubs_declare_pyi() -> None:
 
 def test_every_shipped_rule_satisfies_the_protocol(tmp_path: Path) -> None:
     """A rule missing a member would fail only at dispatch, on a real commit."""
-    for rule in houselint.default_rules():
+    for rule in checker.default_rules():
         assert rule.kinds <= {"python", "pyi", "jupyter"}
         assert isinstance(rule.name, str)
         assert rule.name
@@ -333,7 +333,7 @@ def test_a_rule_missing_a_member_is_not_a_rule() -> None:
 
 def test_shipped_rule_names_are_unique() -> None:
     """Two rules sharing a name would make ``--check-<name>`` ambiguous."""
-    names = [rule.name for rule in houselint.default_rules()]
+    names = [rule.name for rule in checker.default_rules()]
     assert len(names) == len(set(names))
 
 
@@ -357,7 +357,7 @@ def test_a_unit_parses_once_for_every_rule_that_needs_a_tree(
         calls += 1
         return ast.parse(source, filename=str(path))
 
-    monkeypatch.setattr(houselint_types, "_parse", counting_parse)
+    monkeypatch.setattr(custom_types, "_parse", counting_parse)
     path = _write(tmp_path, "x = 1\n")
     rules = (DataclassRule(), ConfigGlobalsRule())
 
@@ -466,19 +466,19 @@ def test_a_fix_flag_is_separate_from_the_settings() -> None:
 def test_userdirs_policy_is_set_through_the_set_flag() -> None:
     """Each project names its own helper and namespace; nothing is built in."""
     xdg, _ = _configured(
-        houselint_rules.XdgLiteralRule(),
+        rules.XdgLiteralRule(),
         "--set",
         "xdg-literal.helper=codedoctor.lib.userdirs",
     )
     namespace, _ = _configured(
-        houselint_rules.UserdirsNamespaceRule(),
+        rules.UserdirsNamespaceRule(),
         "--set",
         "userdirs-namespace.namespace=rekursiv-ai",
     )
     assert xdg.helper == "codedoctor.lib.userdirs"
     assert namespace.namespace == "rekursiv-ai"
-    assert houselint_rules.XdgLiteralRule().helper == ""
-    assert houselint_rules.UserdirsNamespaceRule().namespace == ""
+    assert rules.XdgLiteralRule().helper == ""
+    assert rules.UserdirsNamespaceRule().namespace == ""
 
 
 def test_a_setting_is_coerced_to_the_declared_field_type() -> None:
@@ -499,7 +499,7 @@ def test_a_misspelled_setting_is_rejected(
         sys,
         "argv",
         [
-            "houselint.py",
+            "checker.py",
             "--select",
             "digits",
             "--set",
@@ -509,7 +509,7 @@ def test_a_misspelled_setting_is_rejected(
     )
 
     with pytest.raises(SystemExit):
-        houselint.main()
+        checker.main()
 
     assert "has no field(s) ['min_digit']" in capsys.readouterr().err
 
@@ -529,10 +529,10 @@ def test_no_rule_selected_is_an_error(
         tmp_path,
         "from dataclasses import dataclass\n\n@dataclass\nclass A:\n    x: int\n",
     )
-    monkeypatch.setattr(sys, "argv", ["houselint.py", str(path)])
+    monkeypatch.setattr(sys, "argv", ["checker.py", str(path)])
 
     with pytest.raises(SystemExit):
-        houselint.main()
+        checker.main()
 
     assert "--select is required" in capsys.readouterr().err
 
@@ -550,10 +550,10 @@ def test_only_the_named_rule_runs(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["houselint.py", "--select", "globals", str(path)],
+        ["checker.py", "--select", "globals", str(path)],
     )
 
-    assert houselint.main() == 0
+    assert checker.main() == 0
     assert capsys.readouterr().out == ""
 
 
@@ -569,10 +569,10 @@ def test_a_named_rule_reports(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["houselint.py", "--select", "dataclass", str(path)],
+        ["checker.py", "--select", "dataclass", str(path)],
     )
 
-    assert houselint.main() == 1
+    assert checker.main() == 1
     assert "[dataclass]" in capsys.readouterr().out
 
 
@@ -584,10 +584,10 @@ def test_two_rules_can_be_named_together(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["houselint.py", "--select", "globals digits", str(path)],
+        ["checker.py", "--select", "globals digits", str(path)],
     )
 
-    assert houselint.main() == 1
+    assert checker.main() == 1
 
 
 def test_an_excluded_path_is_not_inspected(tmp_path: Path) -> None:
@@ -611,10 +611,10 @@ def test_an_unscoped_exclude_never_opens_the_file(
     """Ruff's ``exclude``: a path every rule skips is not even read."""
     path = _write(tmp_path, "BAD\n", name="drop_test.py")
 
-    def refusing_read_unit(path: Path, /, *, reporter: str = "houselint") -> None:
+    def refusing_read_unit(path: Path, /, *, reporter: str = "codedoctor lint") -> None:
         raise AssertionError(f"opened {path} for {reporter}")
 
-    monkeypatch.setattr(houselint, "read_unit", refusing_read_unit)
+    monkeypatch.setattr(checker, "read_unit", refusing_read_unit)
 
     findings, _ = run(
         [path],
@@ -715,7 +715,7 @@ def test_glob_regex_has_pathlib_semantics(
     expected: bool,
 ) -> None:
     """``*`` and ``?`` stop at ``/``; only ``**`` crosses a directory."""
-    assert (houselint.glob_regex(pattern).match(path) is not None) is expected
+    assert (checker.glob_regex(pattern).match(path) is not None) is expected
 
 
 @pytest.mark.parametrize(
@@ -755,11 +755,11 @@ def test_a_malformed_exclude_flag_is_a_usage_error(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["houselint.py", "--select", "digits", "--exclude", "*.py = digit", str(path)],
+        ["checker.py", "--select", "digits", "--exclude", "*.py = digit", str(path)],
     )
 
     with pytest.raises(SystemExit):
-        houselint.main()
+        checker.main()
 
     assert "unknown rule(s) ['digit']" in capsys.readouterr().err
 
@@ -775,7 +775,7 @@ def test_exclude_flag_is_repeatable(
         sys,
         "argv",
         [
-            "houselint.py",
+            "checker.py",
             "--select",
             "dataclass",
             "--exclude",
@@ -787,7 +787,7 @@ def test_exclude_flag_is_repeatable(
         ],
     )
 
-    assert houselint.main() == 0
+    assert checker.main() == 0
 
 
 @pytest.mark.parametrize(
@@ -832,18 +832,18 @@ def test_a_rule_builds_only_the_views_it_reads(
     observed by counting ``_tokenize`` calls instead.
     """
     path = _write(tmp_path, body)
-    rule = next(r for r in houselint.default_rules() if r.name == rule_name)
-    unit = houselint.read_unit(path)
+    rule = next(r for r in checker.default_rules() if r.name == rule_name)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     tokenized: list[str] = []
-    real_tokenize = houselint_types._tokenize
+    real_tokenize = custom_types._tokenize
 
     def counting_tokenize(source: str) -> Iterator[tokenize.TokenInfo]:
         tokenized.append(source)
         return real_tokenize(source)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(houselint_types, "_tokenize", counting_tokenize)
+        patch.setattr(custom_types, "_tokenize", counting_tokenize)
         rule.check(unit)
         rule.fix(unit)
 
@@ -917,7 +917,7 @@ def test_a_notebook_is_fixed_without_any_declared_view(tmp_path: Path) -> None:
         json.dumps({"cells": [{"cell_type": "code", "source": ["x = 12345\n"]}]}),
         name="n.ipynb",
     )
-    unit = houselint.read_unit(notebook)
+    unit = checker.read_unit(notebook)
     assert isinstance(unit, Unit)
     assert unit.tokens == ()
 
@@ -934,7 +934,7 @@ def test_an_unparseable_file_is_skipped_silently(tmp_path: Path) -> None:
     path = _write(tmp_path, "def (:\n")
     findings, _ = run(
         [path],
-        active=tuple(houselint.default_rules()),
+        active=tuple(checker.default_rules()),
         fixing=frozenset(),
     )
     assert findings == ()
@@ -1012,7 +1012,7 @@ def test_the_pool_is_sized_to_the_paths_not_the_cap(
             sizes.append(max_workers)
             super().__init__(max_workers=max_workers, mp_context=mp_context)
 
-    monkeypatch.setattr(houselint, "ProcessPoolExecutor", _Recording)
+    monkeypatch.setattr(checker, "ProcessPoolExecutor", _Recording)
     few = [_write(tmp_path, "BAD\n", name=f"f{n}.py") for n in range(5)]
     many = [_write(tmp_path, "BAD\n", name=f"m{n:02}.py") for n in range(40)]
 
@@ -1084,15 +1084,15 @@ def test_the_workers_flag_reaches_run(
         seen.append(workers)
         return (), ()
 
-    monkeypatch.setattr(houselint, "run", spying_run)
+    monkeypatch.setattr(checker, "run", spying_run)
     path = _write(tmp_path, "value = 1\n")
     monkeypatch.setattr(
         sys,
         "argv",
-        ["houselint.py", "--select", "digits", "--workers", "3", str(path)],
+        ["checker.py", "--select", "digits", "--workers", "3", str(path)],
     )
 
-    assert houselint.main() == 0
+    assert checker.main() == 0
     assert seen == [3]
 
 
@@ -1105,22 +1105,22 @@ def test_an_unsized_workers_flag_means_serial(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["houselint.py", "--select", "digits", "--workers", "", str(path)],
+        ["checker.py", "--select", "digits", "--workers", "", str(path)],
     )
 
-    assert houselint.main() == 1
+    assert checker.main() == 1
 
 
 # -- DataclassRule detection ---------------------------------------------
 #
 # Ported from check_dataclass_test.py when that module was drained into
-# houselint. These pin the DETECTION logic; everything above pins dispatch.
+# checker. These pin the DETECTION logic; everything above pins dispatch.
 
 
 def _dataclass_findings(tmp_path: Path, body: str) -> Sequence[Finding]:
     """Run DataclassRule over ``body`` and return its findings."""
     path = _write(tmp_path, body)
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     return DataclassRule().check(unit)
 
@@ -1138,7 +1138,7 @@ def test_missing_kwargs_are_reported(tmp_path: Path) -> None:
 def _staticmethod_findings(tmp_path: Path, body: str) -> Sequence[Finding]:
     """Run StaticMethodRule over ``body`` and return its findings."""
     path = _write(tmp_path, body)
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     return StaticMethodRule().check(unit)
 
@@ -1173,7 +1173,7 @@ def test_the_fix_rewrites_every_parameter_shape(tmp_path: Path) -> None:
         "        return k\n"
     )
     path = _write(tmp_path, body)
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     fixed = StaticMethodRule().fix(unit)
     assert fixed is not None
@@ -1184,7 +1184,7 @@ def test_the_fix_rewrites_every_parameter_shape(tmp_path: Path) -> None:
     assert "def kwonly(cls, *, k: int = 1) -> int:" in fixed
     # The rewrite must still be importable, and `cls` must bind the class.
     namespace: dict[str, object] = {}
-    exec(compile(fixed, str(path), "exec"), namespace)  # noqa: S102 -- The test executes source produced by the houselint rewrite itself to verify the transformed code.
+    exec(compile(fixed, str(path), "exec"), namespace)  # noqa: S102 -- The test executes source produced by the checker rewrite itself to verify the transformed code.
     rewritten_class = namespace["A"]
     assert isinstance(rewritten_class, type)
     assert getattr(rewritten_class, "none")() == 1  # noqa: B009 -- The test accesses a dynamically generated fixture attribute whose name is supplied by the rewritten source.
@@ -1222,7 +1222,7 @@ def test_a_local_staticmethod_call_binding_becomes_a_forwarding_classmethod(
         "class A:\n"
         "    cost = staticmethod(price)\n",
     )
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     fixed = StaticMethodRule().fix(unit)
     assert fixed is not None
@@ -1234,12 +1234,12 @@ def test_a_local_staticmethod_call_binding_becomes_a_forwarding_classmethod(
         "        return price(a, b, *rest, k=k, **kw)\n"
     ) in fixed
     namespace: dict[str, object] = {}
-    exec(compile(fixed, str(path), "exec"), namespace)  # noqa: S102 -- The test executes source produced by the houselint rewrite itself to verify the transformed code.
+    exec(compile(fixed, str(path), "exec"), namespace)  # noqa: S102 -- The test executes source produced by the checker rewrite itself to verify the transformed code.
     rewritten_class = namespace["A"]
     assert isinstance(rewritten_class, type)
     assert getattr(rewritten_class, "cost")(1, 2, 3, k=4, z=5) == 15  # noqa: B009 -- The test accesses a dynamically generated fixture attribute whose name is supplied by the rewritten source.
     assert _write(tmp_path, fixed) == path
-    refixed = houselint.read_unit(path)
+    refixed = checker.read_unit(path)
     assert isinstance(refixed, Unit)
     assert StaticMethodRule().fix(refixed) is None
 
@@ -1252,7 +1252,7 @@ def test_an_imported_staticmethod_call_binding_is_not_autofixed(
         tmp_path,
         "from os.path import join\n\nclass A:\n    cost = staticmethod(join)\n",
     )
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert StaticMethodRule().fix(unit) is None
 
@@ -1267,7 +1267,7 @@ def test_an_autograd_staticmethod_is_not_autofixed(tmp_path: Path) -> None:
         "    def forward(ctx: object, x: int) -> int:\n"
         "        return x\n",
     )
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert StaticMethodRule().fix(unit) is None
 
@@ -1278,7 +1278,7 @@ def test_the_fix_is_idempotent(tmp_path: Path) -> None:
         tmp_path,
         "class A:\n    @classmethod\n    def f(cls) -> int:\n        return 1\n",
     )
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert StaticMethodRule().fix(unit) is None
 
@@ -1464,7 +1464,7 @@ def test_an_unrelated_decorator_is_ignored(tmp_path: Path) -> None:
 # -- ConfigGlobalsRule detection -----------------------------------------
 #
 # Ported from check_config_globals_test.py when that module was drained
-# into houselint.
+# into checker.
 
 _CONFIG_HEADER = (
     "from configgle import Fig\n\n\nclass Thing:\n    class Config(Fig['Thing']):\n"
@@ -1474,7 +1474,7 @@ _CONFIG_HEADER = (
 def _globals_findings(tmp_path: Path, body: str) -> Sequence[Finding]:
     """Run ConfigGlobalsRule over ``body`` and return its findings."""
     path = _write(tmp_path, body)
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     return ConfigGlobalsRule().check(unit)
 
@@ -1642,7 +1642,7 @@ def test_non_final_annotated_constant_still_flagged(tmp_path: Path) -> None:
 
 def test_final_with_redundant_suppression_is_error(tmp_path: Path) -> None:
     """``Final`` already exempts, so the marker is superfluous -- and the marker
-    cannot silence that complaint, which is reported as ``houselint``.
+    cannot silence that complaint, which is reported as ``checker``.
     """
     findings = _globals_run(
         tmp_path,
@@ -1650,7 +1650,7 @@ def test_final_with_redundant_suppression_is_error(tmp_path: Path) -> None:
         "ROUTE: Final = '/api/x'  # house-ignore[globals] -- Redundant.\n",
     )
     assert len(findings) == 1
-    assert findings[0].rule == "houselint"
+    assert findings[0].rule == "codedoctor lint"
     assert findings[0].line == 3
     assert "superfluous" in findings[0].message.lower()
 
@@ -1672,7 +1672,7 @@ def test_config_bases_setting_narrows_which_classes_are_configs(
 ) -> None:
     """The base list is a field, so a project with other bases can retarget."""
     path = _write(tmp_path, _CONFIG_HEADER + "        dim: int = DEFAULT_DIM\n")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
 
     assert ConfigGlobalsRule().check(unit)
@@ -1682,13 +1682,13 @@ def test_config_bases_setting_narrows_which_classes_are_configs(
 # -- DigitsRule detection ------------------------------------------------
 #
 # Ported from group_digits_test.py when that module was drained into
-# houselint.
+# checker.
 
 
 def _regrouped(tmp_path: Path, body: str, name: str = "mod.py") -> str | None:
     """Run DigitsRule's fixer over ``body`` and return its rewrite."""
     path = _write(tmp_path, body, name=name)
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     return DigitsRule().fix(unit)
 
@@ -1699,9 +1699,9 @@ def test_check_mode_reports_needed_change_without_writing(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     path = _write(tmp_path, "value = 12345\n")
-    monkeypatch.setattr(sys, "argv", ["houselint.py", "--select", "digits", str(path)])
+    monkeypatch.setattr(sys, "argv", ["checker.py", "--select", "digits", str(path)])
 
-    assert houselint.main() == 1
+    assert checker.main() == 1
     assert path.read_text() == "value = 12345\n"
     assert "[digits]" in capsys.readouterr().out
 
@@ -1714,10 +1714,10 @@ def test_fix_mode_rewrites_the_file(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["houselint.py", "--select", "digits", "--fix", "digits", str(path)],
+        ["checker.py", "--select", "digits", "--fix", "digits", str(path)],
     )
 
-    assert houselint.main() == 0
+    assert checker.main() == 0
     assert path.read_text() == "value = 12_345\n"
 
 
@@ -1742,7 +1742,7 @@ def test_a_float_is_left_alone(tmp_path: Path) -> None:
 
 def test_min_digits_setting_changes_the_threshold(tmp_path: Path) -> None:
     path = _write(tmp_path, "value = 1234\n")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
 
     assert DigitsRule().fix(unit) is None
@@ -1802,7 +1802,7 @@ def test_a_file_is_read_once_and_parsed_once_per_version(
         reads += 1
         return real_read(self)
 
-    monkeypatch.setattr(houselint_types, "_parse", counting_parse)
+    monkeypatch.setattr(custom_types, "_parse", counting_parse)
     monkeypatch.setattr(Path, "read_bytes", counting_read)
     # Both bodies declare a class: ``DataclassRule`` skips a source with no
     # ``class`` keyword without parsing it, so a class-free fixture would
@@ -1841,7 +1841,7 @@ def test_a_notebook_carries_no_python_only_view(tmp_path: Path) -> None:
         name="n.ipynb",
     )
 
-    unit = houselint.read_unit(notebook)
+    unit = checker.read_unit(notebook)
 
     assert isinstance(unit, Unit)
     assert unit.tokens == ()
@@ -1853,7 +1853,7 @@ def test_a_notebook_carries_no_python_only_view(tmp_path: Path) -> None:
 
 def test_no_rule_declares_the_views_it_reads() -> None:
     """``needs`` is gone: a declaration nothing reconciles is a defect source."""
-    for rule in houselint.default_rules():
+    for rule in checker.default_rules():
         assert not hasattr(rule, "needs")
 
 
@@ -1958,11 +1958,11 @@ def test_a_malformed_setting_exits_cleanly(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["houselint.py", "--select", "digits", *flags, str(path)],
+        ["checker.py", "--select", "digits", *flags, str(path)],
     )
 
     with pytest.raises(SystemExit):
-        houselint.main()
+        checker.main()
 
     assert expected in capsys.readouterr().err
     assert path.read_text() == "value = 12345\n"
@@ -1977,11 +1977,11 @@ def test_a_bare_setting_flag_does_not_silently_become_true(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["houselint.py", "--select", "digits", "--digits-min-digits", str(path)],
+        ["checker.py", "--select", "digits", "--digits-min-digits", str(path)],
     )
 
     with pytest.raises(SystemExit):
-        houselint.main()
+        checker.main()
 
     assert path.read_text() == "value = 1234\n"
 
@@ -2002,7 +2002,7 @@ def test_a_container_setting_takes_several_words(
         sys,
         "argv",
         [
-            "houselint.py",
+            "checker.py",
             "--select",
             "globals",
             "--set",
@@ -2011,23 +2011,23 @@ def test_a_container_setting_takes_several_words(
         ],
     )
 
-    assert houselint.main() == 0
+    assert checker.main() == 0
 
 
 def test_select_all_names_every_rule() -> None:
-    active, fixing = houselint.select_rules(
-        houselint.default_rules(),
+    active, fixing = checker.select_rules(
+        checker.default_rules(),
         select="ALL",
         fix="",
         settings=[],
     )
-    assert {r.name for r in active} == {r.name for r in houselint.default_rules()}
+    assert {r.name for r in active} == {r.name for r in checker.default_rules()}
     assert fixing == frozenset()
 
 
 def test_fix_all_names_every_fixable_selected_rule() -> None:
-    active, fixing = houselint.select_rules(
-        houselint.default_rules(),
+    active, fixing = checker.select_rules(
+        checker.default_rules(),
         select="digits dataclass",
         fix="ALL",
         settings=[],
@@ -2039,7 +2039,7 @@ def test_fix_all_names_every_fixable_selected_rule() -> None:
 def test_a_config_base_is_matched_whole_not_as_a_substring(tmp_path: Path) -> None:
     """``"ig" in ("Fig",)`` must never be what decides a class is a Config."""
     path = _write(tmp_path, _CONFIG_HEADER + "        dim: int = DEFAULT_DIM\n")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
 
     assert not ConfigGlobalsRule(config_bases=("ig",)).check(unit)
@@ -2056,7 +2056,7 @@ def test_a_setting_flag_sets_the_rule_field(
         sys,
         "argv",
         [
-            "houselint.py",
+            "checker.py",
             "--select",
             "digits",
             "--set",
@@ -2065,7 +2065,7 @@ def test_a_setting_flag_sets_the_rule_field(
         ],
     )
 
-    assert houselint.main() == 1
+    assert checker.main() == 1
 
 
 def test_a_file_named_fix_does_not_disable_the_fixer(
@@ -2084,10 +2084,10 @@ def test_a_file_named_fix_does_not_disable_the_fixer(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["houselint.py", "--select", "digits", "--fix", "digits", str(path)],
+        ["checker.py", "--select", "digits", "--fix", "digits", str(path)],
     )
 
-    assert houselint.main() == 0
+    assert checker.main() == 0
     assert path.read_text() == "value = 12_345\n"
 
 
@@ -2101,10 +2101,10 @@ def test_a_nonexistent_path_is_not_stolen_as_a_setting(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["houselint.py", "--select", "digits", str(missing)],
+        ["checker.py", "--select", "digits", str(missing)],
     )
 
-    assert houselint.main() == 1
+    assert checker.main() == 1
     assert "nonexistent.py" in capsys.readouterr().out
 
 
@@ -2117,11 +2117,11 @@ def test_there_is_no_fix_flag_for_an_unfixable_rule(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["houselint.py", "--select", "dataclass", "--fix", "dataclass", str(path)],
+        ["checker.py", "--select", "dataclass", "--fix", "dataclass", str(path)],
     )
 
     with pytest.raises(SystemExit):
-        houselint.main()
+        checker.main()
 
 
 def _repo(tmp_path: Path) -> dict[str, Path]:
@@ -2164,7 +2164,7 @@ class _StubRule(_Counting):
 def test_a_rule_that_declares_pyi_parses_and_checks_stubs(tmp_path: Path) -> None:
     stub = _write(tmp_path, "x: int\n", name="m.pyi")
 
-    unit = houselint.read_unit(stub)
+    unit = checker.read_unit(stub)
     assert isinstance(unit, Unit)
     assert isinstance(unit.tree, ast.Module)
     assert unit.tokens
@@ -2178,21 +2178,21 @@ def test_an_abbreviated_flag_is_rejected(
 ) -> None:
     """``--sel`` must not resolve to ``--select``; a typo would configure a rule."""
     path = _write(tmp_path, "value = 12345\n")
-    monkeypatch.setattr(sys, "argv", ["houselint.py", "--sel", "digits", str(path)])
+    monkeypatch.setattr(sys, "argv", ["checker.py", "--sel", "digits", str(path)])
 
     with pytest.raises(SystemExit) as raised:
-        houselint.main()
+        checker.main()
 
     assert raised.value.code == 2
 
 
 def _help(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> str:
-    """Return ``houselint.py --help``, whitespace-normalized."""
+    """Return ``checker.py --help``, whitespace-normalized."""
     # Argparse wraps at hyphens, which a whitespace join cannot undo.
     monkeypatch.setenv("COLUMNS", "10000")
-    monkeypatch.setattr(sys, "argv", ["houselint.py", "--help"])
+    monkeypatch.setattr(sys, "argv", ["checker.py", "--help"])
     with pytest.raises(SystemExit):
-        houselint.main()
+        checker.main()
     return " ".join(capsys.readouterr().out.split())
 
 
@@ -2207,7 +2207,7 @@ def test_help_shows_every_default(
     for expected in (
         "Lint Python files and notebooks against the house rules.",
         "outside hidden directories and .gitignore patterns",
-        "houselint --fix '' report only, rewrite nothing",
+        "codedoctor lint --fix '' report only, rewrite nothing",
         "Exit status: 0 clean, 1 findings remain, 2 usage error.",
         (
             "[--select RULES] [--fix RULES] [--set RULE.FIELD=VALUE] "
@@ -2241,7 +2241,7 @@ def test_help_lists_every_rule_and_marks_the_fixers(
     text = _help(monkeypatch, capsys)
 
     listed = ", ".join(
-        f"{rule.name}{'*' * rule.fixable}" for rule in houselint.default_rules()
+        f"{rule.name}{'*' * rule.fixable}" for rule in checker.default_rules()
     )
     assert text.endswith(f"rules (* can fix): {listed}")
     assert "digits*" in text
@@ -2253,10 +2253,10 @@ def test_help_shows_the_pyproject_values_in_effect(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A default from ``[tool.houselint]`` is what ``--help`` reports."""
+    """A default from ``[tool.codedoctor.lint]`` is what ``--help`` reports."""
     _write(
         tmp_path,
-        '[tool.houselint]\nselect = "ALL"\nfix = "digits"\n'
+        '[tool.codedoctor.lint]\nselect = "ALL"\nfix = "digits"\n'
         'exclude = ["vendor/**", """*_test.py =\n    globals"""]\nworkers = 3\n',
         name="pyproject.toml",
     )
@@ -2279,7 +2279,7 @@ def test_a_percent_in_a_default_is_shown_literally(
 ) -> None:
     _write(
         tmp_path,
-        '[tool.houselint]\nexclude = ["100%(x)s/**"]\n',
+        '[tool.codedoctor.lint]\nexclude = ["100%(x)s/**"]\n',
         name="pyproject.toml",
     )
 
@@ -2305,13 +2305,13 @@ def test_workers_default_to_the_hook_sizing(
         seen.append(workers)
         return (), ()
 
-    monkeypatch.setattr(houselint, "run", spying_run)
+    monkeypatch.setattr(checker, "run", spying_run)
     # Pinned: the real sizing reads the live load, so two calls can disagree.
-    monkeypatch.setattr(houselint, "default_workers", lambda: 7)
+    monkeypatch.setattr(checker, "default_workers", lambda: 7)
     path = _write(tmp_path, "value = 1\n")
-    monkeypatch.setattr(sys, "argv", ["houselint.py", "--select", "digits", str(path)])
+    monkeypatch.setattr(sys, "argv", ["checker.py", "--select", "digits", str(path)])
 
-    assert houselint.main() == 0
+    assert checker.main() == 0
     assert seen == [7]
 
 
@@ -2320,11 +2320,11 @@ def test_no_paths_lints_the_working_directory(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Bare ``houselint.py`` lints ``.``, as bare ``ruff check`` does."""
+    """Bare ``checker.py`` lints ``.``, as bare ``ruff check`` does."""
     _repo(tmp_path)
-    monkeypatch.setattr(sys, "argv", ["houselint.py", "--select", "digits"])
+    monkeypatch.setattr(sys, "argv", ["checker.py", "--select", "digits"])
 
-    assert houselint.main() == 1
+    assert checker.main() == 1
 
     flagged = {line.split(":")[0] for line in capsys.readouterr().out.splitlines()}
     assert flagged == {"a.py", "sub/b.pyi", "sub/deep/keep.ipynb"}
@@ -2334,7 +2334,7 @@ _PYPROJECT = """\
 [project]
 name = "x"
 
-[tool.houselint]
+[tool.codedoctor.lint]
 select = "digits globals"
 fix = "digits"
 exclude = ["vendor/**", "*_test.py = globals"]
@@ -2346,7 +2346,7 @@ def test_pyproject_supplies_the_defaults(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Bare ``houselint.py FILES`` runs what ``[tool.houselint]`` names.
+    """Bare ``checker.py FILES`` runs what ``[tool.codedoctor.lint]`` names.
 
     Found by walking up from the cwd, and its globs are relative to the
     directory holding it, not to the cwd.
@@ -2360,10 +2360,10 @@ def test_pyproject_supplies_the_defaults(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["houselint.py", *map(str, (fixed, ignored, flagged, vendored))],
+        ["checker.py", *map(str, (fixed, ignored, flagged, vendored))],
     )
 
-    assert houselint.main() == 1
+    assert checker.main() == 1
 
     out = capsys.readouterr().out.splitlines()
     assert out[0] == f"rewrote {fixed}"
@@ -2386,7 +2386,7 @@ def test_the_command_line_overrides_pyproject(
         sys,
         "argv",
         [
-            "houselint.py",
+            "checker.py",
             "--select",
             "digits",
             "--fix",
@@ -2398,7 +2398,7 @@ def test_the_command_line_overrides_pyproject(
         ],
     )
 
-    assert houselint.main() == 1
+    assert checker.main() == 1
 
     out = capsys.readouterr().out.splitlines()
     assert [line.split(":")[0] for line in out] == [str(digits)]
@@ -2410,14 +2410,14 @@ def test_a_pyproject_without_the_table_is_passed_over(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The nearest pyproject CONFIGURING houselint wins, as ruff finds its own."""
+    """The nearest pyproject CONFIGURING checker wins, as ruff finds its own."""
     _write(tmp_path, _PYPROJECT, name="pyproject.toml")
     _write(tmp_path, '[project]\nname = "inner"\n', name="inner/pyproject.toml")
     path = _write(tmp_path, "print(12345)\n", name="inner/a.py")
     monkeypatch.chdir(tmp_path / "inner")
-    monkeypatch.setattr(sys, "argv", ["houselint.py", str(path)])
+    monkeypatch.setattr(sys, "argv", ["checker.py", str(path)])
 
-    assert houselint.main() == 0
+    assert checker.main() == 0
     assert path.read_text() == "print(12_345)\n"
 
 
@@ -2438,12 +2438,12 @@ def test_a_bad_pyproject_table_is_a_usage_error(
     fragment: str,
 ) -> None:
     """A typo in the table fails loudly; silently ignoring it would lint nothing."""
-    _write(tmp_path, "[tool.houselint]\n" + table, name="pyproject.toml")
+    _write(tmp_path, "[tool.codedoctor.lint]\n" + table, name="pyproject.toml")
     path = _write(tmp_path, "value = 1\n")
-    monkeypatch.setattr(sys, "argv", ["houselint.py", str(path)])
+    monkeypatch.setattr(sys, "argv", ["checker.py", str(path)])
 
     with pytest.raises(SystemExit) as exit_info:
-        houselint.main()
+        checker.main()
 
     assert exit_info.value.code == 2
     assert fragment in capsys.readouterr().err
@@ -2505,10 +2505,10 @@ def test_a_fix_reports_what_it_rewrote(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["houselint.py", "--select", "digits", "--fix", "digits", str(path)],
+        ["checker.py", "--select", "digits", "--fix", "digits", str(path)],
     )
 
-    assert houselint.main() == 0
+    assert checker.main() == 0
     assert str(path) in capsys.readouterr().out
 
 
@@ -2579,7 +2579,7 @@ def test_an_inline_ignore_anywhere_in_the_statement_suppresses(tmp_path: Path) -
         ")  # house-ignore[tmp-literal] -- Pinned.\n"
         'y = "/tmp"  # house-ignore[other] -- Names another rule.\n',
     )
-    rule = next(r for r in houselint.default_rules() if r.name == "tmp-literal")
+    rule = next(r for r in checker.default_rules() if r.name == "tmp-literal")
     findings, _ = run([path], active=(rule,), fixing=frozenset())
     assert [f.line for f in findings] == [6]
 
@@ -2601,7 +2601,7 @@ def test_an_inline_ignore_on_a_compound_header_covers_the_header(
         "):  # house-ignore[tmp-literal] -- Pinned.\n"
         '    y = "/tmp"\n',
     )
-    rule = next(r for r in houselint.default_rules() if r.name == "tmp-literal")
+    rule = next(r for r in checker.default_rules() if r.name == "tmp-literal")
     findings, _ = run([path], active=(rule,), fixing=frozenset())
     assert [f.line for f in findings] == [6]
 
@@ -2624,9 +2624,9 @@ def test_an_inline_ignore_after_a_wrapped_decorator_covers_the_class(
 
 def test_an_inline_ignore_without_a_reason_is_a_finding(tmp_path: Path) -> None:
     path = _write(tmp_path, 'x = "/tmp"  # house-ignore[tmp-literal]\n')
-    rule = next(r for r in houselint.default_rules() if r.name == "tmp-literal")
+    rule = next(r for r in checker.default_rules() if r.name == "tmp-literal")
     findings, _ = run([path], active=(rule,), fixing=frozenset())
-    assert [(f.line, f.rule) for f in findings] == [(1, "houselint")]
+    assert [(f.line, f.rule) for f in findings] == [(1, "codedoctor lint")]
     assert "-- Reason." in findings[0].message
 
 
@@ -2634,9 +2634,9 @@ def test_a_bare_inline_ignore_is_a_finding_and_suppresses_nothing(
     tmp_path: Path,
 ) -> None:
     path = _write(tmp_path, 'x = "/tmp"  # house-ignore[] -- No rule named.\n')
-    rule = next(r for r in houselint.default_rules() if r.name == "tmp-literal")
+    rule = next(r for r in checker.default_rules() if r.name == "tmp-literal")
     findings, _ = run([path], active=(rule,), fixing=frozenset())
-    assert sorted(f.rule for f in findings) == ["houselint", "tmp-literal"]
+    assert sorted(f.rule for f in findings) == ["codedoctor lint", "tmp-literal"]
     assert any("names no rule" in f.message for f in findings)
 
 
@@ -2651,7 +2651,7 @@ def test_a_file_level_ignore_suppresses_the_listed_rules(tmp_path: Path) -> None
         'x = os.environ.setdefault("A", "/tmp")\n'
         'y = "/tmp"\n',
     )
-    rule = next(r for r in houselint.default_rules() if r.name == "tmp-literal")
+    rule = next(r for r in checker.default_rules() if r.name == "tmp-literal")
     findings, _ = run([path], active=(rule,), fixing=frozenset())
     assert not findings
 
@@ -2663,7 +2663,7 @@ def test_a_file_level_ignore_without_a_reason_is_a_finding(tmp_path: Path) -> No
         "import os\n"
         'x = os.environ.setdefault("A", "/tmp")\n',
     )
-    rule = next(r for r in houselint.default_rules() if r.name == "tmp-literal")
+    rule = next(r for r in checker.default_rules() if r.name == "tmp-literal")
     findings, _ = run([path], active=(rule,), fixing=frozenset())
     assert [f.line for f in findings] == [1]
     assert "-- Reason." in findings[0].message
@@ -2675,7 +2675,7 @@ def test_a_superfluous_file_level_ignore_is_a_finding(tmp_path: Path) -> None:
         tmp_path,
         "# house-ignore[tmp-literal] -- Nothing here.\nx = 1\n",
     )
-    rule = next(r for r in houselint.default_rules() if r.name == "tmp-literal")
+    rule = next(r for r in checker.default_rules() if r.name == "tmp-literal")
     findings, _ = run([path], active=(rule,), fixing=frozenset())
     assert [f.line for f in findings] == [1]
     assert "superfluous" in findings[0].message
@@ -2686,16 +2686,16 @@ def test_a_superfluous_inline_ignore_is_a_finding(tmp_path: Path) -> None:
 
     The autofix for ``staticmethod`` rewrote a decorator but left its marker
     behind; the marker then read as a live exemption on a line that violated
-    nothing. Reported as ``houselint`` so the marker cannot silence itself.
+    nothing. Reported as ``checker`` so the marker cannot silence itself.
     """
     path = _write(
         tmp_path,
         'x = "fine"  # house-ignore[tmp-literal] -- Outlived its violation.\n'
         'y = "/tmp"  # house-ignore[tmp-literal] -- Still needed.\n',
     )
-    rule = next(r for r in houselint.default_rules() if r.name == "tmp-literal")
+    rule = next(r for r in checker.default_rules() if r.name == "tmp-literal")
     findings, _ = run([path], active=(rule,), fixing=frozenset())
-    assert [(f.line, f.rule) for f in findings] == [(1, "houselint")]
+    assert [(f.line, f.rule) for f in findings] == [(1, "codedoctor lint")]
     assert "superfluous inline ignore" in findings[0].message
 
 
@@ -2726,7 +2726,7 @@ def test_an_own_line_marker_is_file_scoped_not_statement_scoped(
         "def f() -> str:\n"
         '    return "/tmp/far"\n',
     )
-    rule = next(r for r in houselint.default_rules() if r.name == "tmp-literal")
+    rule = next(r for r in checker.default_rules() if r.name == "tmp-literal")
     findings, _ = run([path], active=(rule,), fixing=frozenset())
     assert not findings
 
@@ -2748,7 +2748,7 @@ def test_an_indented_own_line_marker_is_still_file_scoped(tmp_path: Path) -> Non
         '    return "/tmp"\n\n\n'
         'y = "/tmp"\n',
     )
-    rule = next(r for r in houselint.default_rules() if r.name == "tmp-literal")
+    rule = next(r for r in checker.default_rules() if r.name == "tmp-literal")
     findings, _ = run([path], active=(rule,), fixing=frozenset())
     assert not findings
 
@@ -2804,7 +2804,7 @@ def test_an_unimported_name_spelled_dataclass_is_not_checked(tmp_path: Path) -> 
 
 def _rule_unit(tmp_path: Path, source: str, name: str = "mod.py") -> Unit:
     """Build a Unit for a rule fixture."""
-    unit = houselint.read_unit(_write(tmp_path, source, name=name))
+    unit = checker.read_unit(_write(tmp_path, source, name=name))
     assert isinstance(unit, Unit)
     return unit
 
@@ -2820,7 +2820,7 @@ def test_annotation_import_walks_all_annotation_shapes(tmp_path: Path) -> None:
         'def f(x: Thing = 1, y=cast("Thing", 2), z=cast("Thing", value=2)) -> Thing:\n'
         "    return x\n",
     )
-    findings = houselint_rules.AnnotationImportRule(
+    findings = rules.AnnotationImportRule(
         costs_ms={"pkg": 100},
     ).check(unit)
     assert len(findings) == 1
@@ -2830,7 +2830,7 @@ def test_annotation_import_walks_all_annotation_shapes(tmp_path: Path) -> None:
 
 def test_single_use_helper_rewrites_and_rejects_unsafe_shapes(tmp_path: Path) -> None:
     """The helper fixer substitutes safe calls and leaves unsafe calls unchanged."""
-    rule = houselint_rules.SingleUseHelperRule()
+    rule = rules.SingleUseHelperRule()
     safe = _rule_unit(tmp_path, "def _add(x, y=1):\n    return x + y\n\nz = _add(2)\n")
     rewritten = rule.fix(safe)
     assert rewritten is not None
@@ -2855,7 +2855,7 @@ def test_cwd_final_rewrites_path_shapes(tmp_path: Path) -> None:
         "HERE = Path(__file__).parent\n"
         "RAW = Path(__file__)\n",
     )
-    rewritten = houselint_rules.CwdFinalRule().fix(unit)
+    rewritten = rules.CwdFinalRule().fix(unit)
     assert rewritten is not None
     assert "_CWD: Final" in rewritten
     assert "_THIS: Final" in rewritten
@@ -2877,7 +2877,7 @@ def test_cwd_final_rewrites_every_parent_expression(tmp_path: Path) -> None:
         "G = Path(__file__)\n",
         name="paths.py",
     )
-    fixed = houselint_rules.CwdFinalRule().fix(unit)
+    fixed = rules.CwdFinalRule().fix(unit)
     assert fixed is not None
     assert "A = _CWD" in fixed or "A = _THIS" in fixed
     assert "_CWD.parents[1]" in fixed
@@ -2895,7 +2895,7 @@ def test_a_dotted_import_marker_keeps_the_import_and_stays_in_use(
     path = _write(tmp_path, body)
     findings, written = run(
         [path],
-        active=(houselint_rules.DottedImportRule(),),
+        active=(rules.DottedImportRule(),),
         fixing=frozenset({"dotted-import"}),
     )
     assert (findings, written) == ((), ())
@@ -2917,8 +2917,8 @@ def test_import_rules_fix_an_alias_and_a_dotted_import_in_one_pass(
     findings, written = run(
         [path],
         active=(
-            houselint_rules.ImportAliasRule(first_party=("pkg",)),
-            houselint_rules.DottedImportRule(),
+            rules.ImportAliasRule(first_party=("pkg",)),
+            rules.DottedImportRule(),
         ),
         fixing=frozenset({"import-alias", "dotted-import"}),
     )
@@ -2943,7 +2943,7 @@ def test_import_hoist_handles_guarded_and_nested_imports(tmp_path: Path) -> None
         "if TYPE_CHECKING:\n    import typing\n"
         "try:\n    import optional\nexcept ImportError:\n    optional = None\n",
     )
-    rule = houselint_rules.ImportHoistRule()
+    rule = rules.ImportHoistRule()
     findings = rule.check(unit)
     assert len(findings) == 1
     rewritten = rule.fix(unit)
@@ -2954,7 +2954,7 @@ def test_import_hoist_handles_guarded_and_nested_imports(tmp_path: Path) -> None
 
 def test_cli_shape_fix_repairs_main_and_polyglot_header(tmp_path: Path) -> None:
     """CLI fixes add returns, move flags, and repair the executable prelude."""
-    rule = houselint_rules.CliShapeRule()
+    rule = rules.CliShapeRule()
     path = _write(
         tmp_path,
         "import argparse\n\n"
@@ -2966,7 +2966,7 @@ def test_cli_shape_fix_repairs_main_and_polyglot_header(tmp_path: Path) -> None:
         "    main()\n",
         name="tool.py",
     )
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     rewritten = rule.fix(unit)
     assert rewritten is not None
@@ -2993,7 +2993,7 @@ def test_nested_import_shape_and_noqa_are_distinguished(tmp_path: Path) -> None:
         "    import sys\n"
         "    return os, sys\n",
     )
-    rule = houselint_rules.ImportHoistRule()
+    rule = rules.ImportHoistRule()
     findings = rule.check(unit)
     assert len(findings) == 1
     assert findings[0].line == 3
@@ -3002,7 +3002,7 @@ def test_nested_import_shape_and_noqa_are_distinguished(tmp_path: Path) -> None:
 def test_dispatch_skips_unknown_suffix_and_reports_missing_path(tmp_path: Path) -> None:
     """Unknown suffixes skip silently; missing selected files report a finding."""
     unknown = _write(tmp_path, "BAD\n", name="notes.txt")
-    assert houselint.read_unit(unknown) is None
+    assert checker.read_unit(unknown) is None
     findings, written = run(
         [unknown],
         active=(_Counting(),),
@@ -3024,7 +3024,7 @@ def test_dispatch_skips_unknown_suffix_and_reports_missing_path(tmp_path: Path) 
 def test_select_unknown_rule_names_are_usage_errors() -> None:
     """Selectors name the invalid rule and the known registry."""
     with pytest.raises(ValueError, match="unknown rule"):
-        houselint.select_rules(
+        checker.select_rules(
             (DigitsRule(),),
             select="missing",
             fix="",
@@ -3035,13 +3035,13 @@ def test_select_unknown_rule_names_are_usage_errors() -> None:
 def test_settings_and_helper_views_report_invalid_inputs() -> None:
     """Settings route before coercion, and marker helpers handle invalid trees."""
     with pytest.raises(ValueError, match="unknown rule"):
-        houselint.select_rules(
+        checker.select_rules(
             (DigitsRule(),),
             select="digits",
             fix="",
             settings=["missing.value=1"],
         )
-    assert houselint._type_name("annotation") == "annotation"
+    assert checker._type_name("annotation") == "annotation"
     unit = Unit(path=Path("broken.py"), source="def (:\nx\n", kind="python")
     finding = Finding(path=unit.path, line=2, rule="digits", message="bad")
     assert house_ignore.suppressing_lines(unit, finding, {}) == ()
@@ -3058,7 +3058,7 @@ def test_config_globals_literal_and_type_shapes(tmp_path: Path) -> None:
         "UNSET: int\n"
         "obj.attr = 1\n",
     )
-    findings = houselint_rules.ConfigGlobalsRule().check(unit)
+    findings = rules.ConfigGlobalsRule().check(unit)
     names = {f.message for f in findings}
     assert any("NEG" in message for message in names)
     assert any("FLOAT" in message for message in names)
@@ -3067,7 +3067,7 @@ def test_config_globals_literal_and_type_shapes(tmp_path: Path) -> None:
 
 def test_single_use_helper_rejects_edge_case_calls(tmp_path: Path) -> None:
     """Unsafe substitutions stay unchanged instead of changing evaluation order."""
-    rule = houselint_rules.SingleUseHelperRule()
+    rule = rules.SingleUseHelperRule()
     cases = {
         "star.py": "def _x(a):\n    return a\ny = _x(*xs)\n",
         "missing.py": "def _x(a, b):\n    return a + b\ny = _x(1)\n",
@@ -3093,7 +3093,7 @@ def test_staticmethod_fix_leaves_existing_cls_and_handles_star_args(
         "    def g(*args):\n"
         "        return len(args)\n",
     )
-    fixed = houselint_rules.StaticMethodRule().fix(unit)
+    fixed = rules.StaticMethodRule().fix(unit)
     assert fixed is not None
     assert "def f(cls, *, value=1)" in fixed
     assert "def g(cls, *args)" in fixed
@@ -3107,7 +3107,7 @@ def test_module_side_effects_accepts_declarative_expression_shapes(
         tmp_path,
         "A = -1\nB = 1 + 2\nC = True and False\nD = 1 if flag else 2\nE = Widget()\n",
     )
-    assert not houselint_rules.ModuleSideEffectsRule().check(unit)
+    assert not rules.ModuleSideEffectsRule().check(unit)
 
 
 def test_xdg_rule_reports_home_lookup_forms(tmp_path: Path) -> None:
@@ -3116,9 +3116,7 @@ def test_xdg_rule_reports_home_lookup_forms(tmp_path: Path) -> None:
         tmp_path,
         'import os\na = os.getenv("HOME")\nb = os.environ["HOME"]\n',
     )
-    findings = houselint_rules.XdgLiteralRule(helper="codedoctor.lib.userdirs").check(
-        unit,
-    )
+    findings = rules.XdgLiteralRule(helper="codedoctor.lib.userdirs").check(unit)
     assert len(findings) == 2
     assert all("userdirs" in finding.message for finding in findings)
 
@@ -3136,12 +3134,12 @@ def test_nested_try_ignores_nested_class_bodies(tmp_path: Path) -> None:
         "except Exception:\n"
         "    pass\n",
     )
-    assert not houselint_rules.NestedTryRule().check(unit)
+    assert not rules.NestedTryRule().check(unit)
 
 
 def test_cli_polyglot_fix_repairs_short_and_bad_headers(tmp_path: Path) -> None:
     """Polyglot fixes add missing lines and preserve a valid exec fast path."""
-    rule = houselint_rules.CliShapeRule()
+    rule = rules.CliShapeRule()
     unit = _rule_unit(tmp_path, "#!/bin/sh\n", name="short.py")
     fixed = rule.fix(unit)
     assert fixed is not None
@@ -3156,7 +3154,7 @@ def test_rule_helpers_cover_attribute_and_unknown_call_shapes(tmp_path: Path) ->
         "ROUTE: typing.Final = '/x'\n"
         "class Config(typing.Fig['Config']):\n    x: int = DEFAULT\n",
     )
-    globals_findings = houselint_rules.ConfigGlobalsRule().check(globals_unit)
+    globals_findings = rules.ConfigGlobalsRule().check(globals_unit)
     assert len(globals_findings) == 1
     assert "DEFAULT" in globals_findings[0].message
     effects_unit = _rule_unit(
@@ -3164,14 +3162,14 @@ def test_rule_helpers_cover_attribute_and_unknown_call_shapes(tmp_path: Path) ->
         "value = unknown_factory()\n",
         name="effects.py",
     )
-    findings = houselint_rules.ModuleSideEffectsRule().check(effects_unit)
+    findings = rules.ModuleSideEffectsRule().check(effects_unit)
     assert len(findings) == 1
     assert "assignment from" in findings[0].message
 
 
 def test_cli_fix_handles_invalid_and_implicit_main_returns(tmp_path: Path) -> None:
     """CLI fixing leaves invalid libraries alone and adds an implicit return."""
-    rule = houselint_rules.CliShapeRule()
+    rule = rules.CliShapeRule()
     invalid = _rule_unit(tmp_path, "def (:\n", name="invalid.py")
     assert rule.fix(invalid) is None
     unit = _rule_unit(
@@ -3190,7 +3188,7 @@ def test_import_hoist_preserves_module_docstring(tmp_path: Path) -> None:
         tmp_path,
         '"""Module."""\n\ndef f():\n    import os\n    return os.name\n',
     )
-    fixed = houselint_rules.ImportHoistRule().fix(unit)
+    fixed = rules.ImportHoistRule().fix(unit)
     assert fixed is not None
     assert fixed.startswith('"""Module."""\n\nimport os\n')
 
@@ -3209,7 +3207,7 @@ def test_lazy_import_cost_sees_an_import_under_a_runtime_if(tmp_path: Path) -> N
         "def h():\n    return 3\n\n\n"
         "def k():\n    return torch.zeros(1)\n",
     )
-    findings = houselint_rules.LazyImportCostRule().check(unit)
+    findings = rules.LazyImportCostRule().check(unit)
     assert [(f.line, f.rule) for f in findings] == [(3, "lazy-import-cost")]
     assert "'torch' costs ~1050 ms" in findings[0].message
     assert "only 1 of 4 defs" in findings[0].message
@@ -3219,7 +3217,7 @@ def test_single_use_helper_skips_an_undecodable_sibling(tmp_path: Path) -> None:
     """A sibling that is not UTF-8 shields nothing and does not crash the scan."""
     (tmp_path / "binary.py").write_bytes(b"\xff\xfe\x00")
     unit = _rule_unit(tmp_path, "def _x(a):\n    return a + 1\n\n\ny = _x(2)\n")
-    findings = houselint_rules.SingleUseHelperRule().check(unit)
+    findings = rules.SingleUseHelperRule().check(unit)
     assert [(f.line, f.rule) for f in findings] == [(1, "single-use-helper")]
     assert "_x is a one-expression helper" in findings[0].message
 
@@ -3244,7 +3242,7 @@ def test_single_use_helper_leaves_unsafe_substitutions(
 ) -> None:
     """Each shape is refused by both check and fix, so no report lacks a fix."""
     unit = _rule_unit(tmp_path, source)
-    rule = houselint_rules.SingleUseHelperRule()
+    rule = rules.SingleUseHelperRule()
     assert rule.check(unit) == ()
     assert rule.fix(unit) is None
 
@@ -3257,8 +3255,8 @@ def test_single_use_helper_inlines_a_dict_argument_unparenthesized(
         tmp_path,
         "def _first(a):\n    return a.get(1)\n\n\ny = _first({1: 2})\n",
     )
-    assert houselint_rules.SingleUseHelperRule().fix(unit) is None
-    assert houselint_rules.ForwarderHelperRule().fix(unit) == "\n\ny = {1: 2}.get(1)\n"
+    assert rules.SingleUseHelperRule().fix(unit) is None
+    assert rules.ForwarderHelperRule().fix(unit) == "\n\ny = {1: 2}.get(1)\n"
 
 
 def test_single_use_helper_inlines_into_a_def_with_locals(tmp_path: Path) -> None:
@@ -3268,7 +3266,7 @@ def test_single_use_helper_inlines_into_a_def_with_locals(tmp_path: Path) -> Non
         "def _inc(a):\n    return a + 1\n\n\ndef f():\n    b = 2\n    return _inc(b)\n",
     )
     assert (
-        houselint_rules.SingleUseHelperRule().fix(unit)
+        rules.SingleUseHelperRule().fix(unit)
         == "\n\ndef f():\n    b = 2\n    return b + 1\n"
     )
 
@@ -3281,7 +3279,7 @@ def test_final_inline_reports_a_binding_under_code_not_a_comment(
         tmp_path,
         "from typing import Final\n_A: Final = 1\nprint(_A)\n",
     )
-    findings = houselint_rules.FinalInlineRule().check(unit)
+    findings = rules.FinalInlineRule().check(unit)
     assert [(f.line, f.rule) for f in findings] == [(2, "final-inline")]
     assert "'_A' is a Final literal read at one site" in findings[0].message
 
@@ -3332,7 +3330,7 @@ def test_a_staticmethod_binding_the_forwarder_cannot_copy_is_left(
 ) -> None:
     """Reported, but the forwarding classmethod would be wrong, so no rewrite."""
     unit = _rule_unit(tmp_path, source)
-    rule = houselint_rules.StaticMethodRule()
+    rule = rules.StaticMethodRule()
     assert [f.rule for f in rule.check(unit)] == ["staticmethod"]
     assert rule.fix(unit) is None
 
@@ -3349,7 +3347,7 @@ def test_staticmethod_fix_finds_a_paren_on_a_continuation_line(
         "    (*args):\n"
         "        return len(args)\n",
     )
-    assert houselint_rules.StaticMethodRule().fix(unit) == (
+    assert rules.StaticMethodRule().fix(unit) == (
         "class A:\n"
         "    @classmethod\n"
         "    def f \\\n"
@@ -3361,7 +3359,7 @@ def test_staticmethod_fix_finds_a_paren_on_a_continuation_line(
 def test_module_side_effects_reports_a_comparison_assignment(tmp_path: Path) -> None:
     """A comparison is not one of the declarative value shapes."""
     unit = _rule_unit(tmp_path, "X = a < b\n")
-    findings = houselint_rules.ModuleSideEffectsRule().check(unit)
+    findings = rules.ModuleSideEffectsRule().check(unit)
     assert [(f.line, f.message) for f in findings] == [
         (1, "assignment from 'a < b' at module scope; move it into a function"),
     ]
@@ -3386,14 +3384,14 @@ def test_cli_fix_leaves_a_canonical_polyglot_alone(tmp_path: Path) -> None:
         _POLYGLOT_PRELUDE + _POLYGLOT_EXEC + "'''\nx = 1\n# vim: ft=python\n",
         name="tool.py",
     )
-    assert houselint_rules.CliShapeRule().fix(unit) is None
+    assert rules.CliShapeRule().fix(unit) is None
 
 
 def test_cli_fix_terminates_the_last_line_before_the_modeline(tmp_path: Path) -> None:
     """A file without a final newline must not glue the modeline onto code."""
     body = _POLYGLOT_PRELUDE + _POLYGLOT_EXEC + "'''\nx = 1"
     unit = _rule_unit(tmp_path, body, name="tool.py")
-    assert houselint_rules.CliShapeRule().fix(unit) == body + "\n# vim: ft=python\n"
+    assert rules.CliShapeRule().fix(unit) == body + "\n# vim: ft=python\n"
 
 
 def test_cli_fix_keeps_a_custom_exec_uv_line(tmp_path: Path) -> None:
@@ -3401,7 +3399,7 @@ def test_cli_fix_keeps_a_custom_exec_uv_line(tmp_path: Path) -> None:
     exec_line = 'exec uv run python3 "$0" "$@"\n'
     body = _POLYGLOT_PRELUDE + exec_line + "'''\nx = 1\n"
     unit = _rule_unit(tmp_path, body, name="tool.py")
-    assert houselint_rules.CliShapeRule().fix(unit) == (
+    assert rules.CliShapeRule().fix(unit) == (
         _POLYGLOT_PRELUDE
         + 'exec uv run python3 -P "$0" "$@"\n'
         + "'''\nx = 1\n# vim: ft=python\n"
@@ -3412,7 +3410,7 @@ def test_cli_fix_of_a_vanished_file_still_returns_the_rewrite(tmp_path: Path) ->
     """The mode bit is best-effort; a missing path cannot block the text fix."""
     path = tmp_path / "gone.py"
     unit = Unit(path=path, source="#!/bin/sh\n", kind="python")
-    assert houselint_rules.CliShapeRule().fix(unit) == "#!/bin/sh\n# vim: ft=python\n"
+    assert rules.CliShapeRule().fix(unit) == "#!/bin/sh\n# vim: ft=python\n"
     assert not path.exists()
 
 
@@ -3432,7 +3430,7 @@ def test_cli_fix_skips_other_keywords_and_a_wrapped_description(
         "    return 0\n",
         name="tool.py",
     )
-    assert houselint_rules.CliShapeRule().fix(unit) is None
+    assert rules.CliShapeRule().fix(unit) is None
 
 
 def test_cwd_final_fix_reuses_existing_bindings(tmp_path: Path) -> None:
@@ -3444,7 +3442,7 @@ def test_cwd_final_fix_reuses_existing_bindings(tmp_path: Path) -> None:
         "_CWD: Final = Path(__file__).resolve().parent\n"
         "Y = Path(__file__).parent\n",
     )
-    assert houselint_rules.CwdFinalRule().fix(unit) == (
+    assert rules.CwdFinalRule().fix(unit) == (
         "from pathlib import Path\n"
         "from typing import Final\n"
         "_CWD: Final = Path(__file__).resolve().parent\n"
@@ -3467,7 +3465,7 @@ def test_cwd_final_fix_rewrites_a_wrapped_path_expression(
     expected: str,
 ) -> None:
     unit = _rule_unit(tmp_path, "from pathlib import Path\n" + source)
-    fixed = houselint_rules.CwdFinalRule().fix(unit)
+    fixed = rules.CwdFinalRule().fix(unit)
     assert fixed is not None
     [value] = [
         stmt.value
@@ -3485,7 +3483,7 @@ def test_cwd_final_fix_rewrites_an_uncalled_resolve_attribute(tmp_path: Path) ->
         "X = Path(__file__).resolve.parent\n"
         "Y = Path(__file__).resolve.parents[2]\n",
     )
-    assert houselint_rules.CwdFinalRule().fix(unit) == (
+    assert rules.CwdFinalRule().fix(unit) == (
         "from pathlib import Path\n"
         "from typing import Final\n\n"
         "_CWD: Final = Path(__file__).resolve().parent\n\n"
@@ -3503,7 +3501,7 @@ def test_import_alias_fix_avoids_def_class_and_parameter_names(tmp_path: Path) -
         "    def f(self, x):\n"
         "        return dirs.config_dir()\n",
     )
-    assert houselint_rules.ImportAliasRule().fix(unit) is None
+    assert rules.ImportAliasRule().fix(unit) is None
 
 
 def test_dotted_import_fix_leaves_unrelated_and_call_rooted_attributes(
@@ -3518,7 +3516,7 @@ def test_dotted_import_fix_leaves_unrelated_and_call_rooted_attributes(
         "y = os.sep\n"
         "z = f().a.b\n",
     )
-    assert houselint_rules.DottedImportRule().fix(unit) == (
+    assert rules.DottedImportRule().fix(unit) == (
         "from pkg.configgle import cli_override\n"
         "import os\n"
         "x = cli_override\n"
@@ -3545,7 +3543,7 @@ def test_import_hoist_honours_an_optional_import_under_a_module_if(
         f"    except {handler}:\n"
         "        optional = None\n",
     )
-    findings = houselint_rules.ImportHoistRule().check(unit)
+    findings = rules.ImportHoistRule().check(unit)
     assert [f.line for f in findings] == expected
 
 
@@ -3556,7 +3554,7 @@ def test_import_hoist_places_the_import_after_existing_imports(
         tmp_path,
         "import sys\n\n\ndef f():\n    import os\n    return os, sys\n",
     )
-    assert houselint_rules.ImportHoistRule().fix(unit) == (
+    assert rules.ImportHoistRule().fix(unit) == (
         "import sys\n\nimport os\n\n\ndef f():\n    return os, sys\n"
     )
 
@@ -3568,13 +3566,13 @@ def test_a_marker_on_the_line_after_a_statement_does_not_cover_it(
         tmp_path,
         'z = 0\nx = "/tmp"\ny = 1  # house-ignore[tmp-literal] -- Next statement.\n',
     )
-    rule = next(r for r in houselint.default_rules() if r.name == "tmp-literal")
+    rule = next(r for r in checker.default_rules() if r.name == "tmp-literal")
 
     findings, _ = run([path], active=(rule,), fixing=frozenset())
 
     assert [(f.line, f.rule) for f in findings] == [
         (2, "tmp-literal"),
-        (3, "houselint"),
+        (3, "codedoctor lint"),
     ]
 
 
@@ -3674,21 +3672,21 @@ def test_a_failed_write_is_one_dispatcher_finding_on_line_one(tmp_path: Path) ->
         locked.chmod(0o644)
 
     assert written == ()
-    assert [str(f) for f in findings if f.rule == "houselint"] == [
-        f"{locked}:1: [houselint] cannot write: Permission denied",
+    assert [str(f) for f in findings if f.rule == "codedoctor lint"] == [
+        f"{locked}:1: [codedoctor lint] cannot write: Permission denied",
     ]
 
 
 def test_an_unreadable_path_is_one_finding_naming_the_os_error(tmp_path: Path) -> None:
     missing = tmp_path / "gone.py"
 
-    assert houselint.read_unit(missing) == Finding(
+    assert checker.read_unit(missing) == Finding(
         path=missing,
         line=1,
-        rule="houselint",
+        rule="codedoctor lint",
         message="cannot read: No such file or directory",
     )
-    assert houselint.read_unit(missing, reporter="other") == Finding(
+    assert checker.read_unit(missing, reporter="other") == Finding(
         path=missing,
         line=1,
         rule="other",
@@ -3700,7 +3698,7 @@ def test_an_undecodable_file_is_one_finding_naming_the_byte(tmp_path: Path) -> N
     path = tmp_path / "mod.py"
     path.write_bytes(b"x = 1\n# \xe9\n")
 
-    assert houselint.read_unit(path, reporter="other") == Finding(
+    assert checker.read_unit(path, reporter="other") == Finding(
         path=path,
         line=1,
         rule="other",
@@ -3719,12 +3717,12 @@ def test_a_fixed_file_is_written_as_utf8(tmp_path: Path) -> None:
 def test_a_fix_error_names_the_rule_path_and_parse_error(tmp_path: Path) -> None:
     path = _write(tmp_path, "x = 1\n")
 
-    with pytest.raises(houselint.FixError) as raised:
+    with pytest.raises(checker.FixError) as raised:
         run([path], active=(_Breaking(),), fixing=frozenset({"breaking"}))
 
     assert str(raised.value) == (
         f"breaking fix produced unparseable source for {path}; fix the rule in "
-        "houselint_rules.py ('(' was never closed, line 2)"
+        "rules.py ('(' was never closed, line 2)"
     )
     cause = raised.value.__cause__
     assert isinstance(cause, SyntaxError)
@@ -3743,25 +3741,25 @@ def test_superfluous_markers_are_dispatcher_findings_on_their_file(
     findings, _ = run([path], active=(_Counting(),), fixing=frozenset())
 
     assert [(f.path, f.line, f.rule) for f in findings] == [
-        (path, 1, "houselint"),
-        (path, 2, "houselint"),
+        (path, 1, "codedoctor lint"),
+        (path, 2, "codedoctor lint"),
     ]
 
 
 def test_an_unset_rule_keeps_its_defaults_while_another_is_set() -> None:
-    active, _ = houselint.select_rules(
-        (DigitsRule(), houselint_rules.NestedDefRule()),
+    active, _ = checker.select_rules(
+        (DigitsRule(), rules.NestedDefRule()),
         select="digits nested-def",
         fix="",
         settings=["digits.min-digits=7"],
     )
 
-    assert active == (DigitsRule(min_digits=7), houselint_rules.NestedDefRule())
+    assert active == (DigitsRule(min_digits=7), rules.NestedDefRule())
 
 
 def test_a_setting_value_may_hold_an_equals_and_a_dot() -> None:
     """Split at the FIRST ``=`` and the FIRST ``.``: the value is free text."""
-    grouped = houselint._settings_by_rule(
+    grouped = checker._settings_by_rule(
         ["a.b=c=d.e", "a.f.g=1"],
         selected={"a"},
         known={"a"},
@@ -3772,7 +3770,7 @@ def test_a_setting_value_may_hold_an_equals_and_a_dot() -> None:
 
 def test_fixing_an_unfixable_rule_names_it() -> None:
     with pytest.raises(ValueError, match=r"^--fix: \['dataclass'\] cannot fix; "):
-        houselint.select_rules(
+        checker.select_rules(
             (DataclassRule(),),
             select="dataclass",
             fix="dataclass",
@@ -3781,7 +3779,7 @@ def test_fixing_an_unfixable_rule_names_it() -> None:
 
 
 def test_a_trailing_double_star_matches_only_below_its_directory() -> None:
-    regex = houselint.glob_regex("vendor/**")
+    regex = checker.glob_regex("vendor/**")
 
     assert regex.match("vendor/a/b.py")
     assert not regex.match("vendor")
@@ -3828,7 +3826,7 @@ def test_the_pool_starts_at_twenty_paths_and_splits_one_worker_per_ten(
             chunks.append(chunksize)
             return map(fn, *iterables)
 
-    monkeypatch.setattr(houselint, "ProcessPoolExecutor", _Recording)
+    monkeypatch.setattr(checker, "ProcessPoolExecutor", _Recording)
     paths = [_write(tmp_path, "BAD\n", name=f"m{n:02}.py") for n in range(48)]
 
     for count, workers in ((19, 24), (20, 24), (29, 24), (32, 24), (20, 1), (48, 2)):
@@ -3854,10 +3852,10 @@ def test_help_wraps_the_rule_list_at_79_columns_without_splitting_names(
         SimpleNamespace(name="a" * 57, fixable=False),
         SimpleNamespace(name="b", fixable=True),
     )
-    monkeypatch.setattr(houselint, "default_rules", lambda: rules)
-    monkeypatch.setattr(sys, "argv", ["houselint.py", "--help"])
+    monkeypatch.setattr(checker, "default_rules", lambda: rules)
+    monkeypatch.setattr(sys, "argv", ["checker.py", "--help"])
     with pytest.raises(SystemExit):
-        houselint.main()
+        checker.main()
 
     assert capsys.readouterr().out.endswith(
         "\n\nrules (* can fix): " + "a" * 57 + ",\n  b*\n",
@@ -3911,9 +3909,9 @@ def test_a_fixers_check_is_reused_for_the_report(tmp_path: Path) -> None:
 def test_parsing_never_sizes_the_pool(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every gate passes ``--workers``; probing the machine for a default is waste."""
     sized: list[int] = []
-    monkeypatch.setattr(houselint, "default_workers", lambda: sized.append(1) or 1)
+    monkeypatch.setattr(checker, "default_workers", lambda: sized.append(1) or 1)
     parser = argparse.ArgumentParser()
-    houselint._add_arguments(parser)
+    checker._add_arguments(parser)
 
     parser.parse_args(["--workers", "2"])
 

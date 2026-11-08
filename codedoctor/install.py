@@ -154,13 +154,14 @@ def hook_config(text: str) -> str:
       ValueError: Configuration is malformed or a hook ID conflicts.
 
     """
+    expected = _hook_repos()
+    text = _upgrade_hooks(text, expected=expected)
     document = from_plain(yaml.safe_load(text), dict[str, object], default={})
     repos = (
         from_plain(document["repos"], list[dict[str, object]])
         if "repos" in document
         else []
     )
-    expected = _hook_repos()
     wanted = [
         _hook_identity(repo, hook=hook)
         for repo in expected
@@ -192,6 +193,79 @@ def hook_config(text: str) -> str:
     if not missing:
         return text
     return _append_repos(text, repos=missing)
+
+
+def _upgrade_hooks(text: str, *, expected: list[dict[str, object]]) -> str:
+    commands: dict[str, str] = {}
+    for repo in expected:
+        for hook in from_plain(repo["hooks"], list[dict[str, object]]):
+            entry = from_plain(hook.get("entry", ""), str)
+            match = re.search(r" -m codedoctor ([\w-]+)", entry)
+            if match:
+                command = match[1]
+                module = {
+                    "codegraph-sync": "affected.codegraph_sync",
+                    "check-pr-text": "export_leaks.check_pr_text",
+                }.get(command, command.replace("-", "_"))
+                commands[module] = command
+    loader = yaml.SafeLoader(text)
+    try:
+        tree = loader.get_single_node()
+    finally:
+        loader.dispose()
+    changes: list[tuple[int, int, str]] = []
+    pending = [tree]
+    visited: set[int] = set()
+    while pending:
+        node = pending.pop()
+        if id(node) in visited:
+            continue
+        visited.add(id(node))
+        if isinstance(node, SequenceNode):
+            pending.extend(node.value)
+        elif isinstance(node, MappingNode):
+            fields = {
+                key.value: value
+                for key, value in node.value
+                if isinstance(key, ScalarNode)
+            }
+            identifier = fields.get("id")
+            entry = fields.get("entry")
+            if isinstance(identifier, ScalarNode) and isinstance(entry, ScalarNode):
+                match = re.match(r"(.*? -m )codedoctor\.([\w.]+)(?=\s|$)", entry.value)
+                if match and match[2] in commands:
+                    values = {
+                        "entry": match[1]
+                        + "codedoctor "
+                        + commands[match[2]]
+                        + entry.value[match.end() :],
+                    }
+                    if identifier.value == "houselint":
+                        values["id"] = "codedoctor-lint"
+                        name = fields.get("name")
+                        if isinstance(name, ScalarNode) and name.value == "houselint":
+                            values["name"] = "codedoctor lint"
+                    for key, value in values.items():
+                        scalar = fields[key]
+                        assert isinstance(scalar, ScalarNode)
+                        replacement = (
+                            yaml.safe_dump(value, default_flow_style=True)
+                            .removesuffix("...\n")
+                            .rstrip()
+                        )
+                        if scalar.style in {"|", ">"}:
+                            replacement += "\n" + " " * scalar.end_mark.column
+                        changes.append(
+                            (
+                                scalar.start_mark.index,
+                                scalar.end_mark.index,
+                                replacement,
+                            ),
+                        )
+            pending.extend(fields.values())
+    for start, end, replacement in sorted(changes, reverse=True):
+        text = text[:start] + replacement + text[end:]
+    return text
 
 
 def _hook_identity(

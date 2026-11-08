@@ -35,12 +35,12 @@ def test_project_config_creates_a_virtual_project() -> None:
     }
     assert document["dependency-groups"]["pre-commit"] == []
     assert document["tool"]["uv"]["package"] is False
-    assert document["tool"]["houselint"]["select"] == "ALL"
-    assert document["tool"]["houselint"]["fix"] == "ALL"
+    assert document["tool"]["codedoctor"]["lint"]["select"] == "ALL"
+    assert document["tool"]["codedoctor"]["lint"]["fix"] == "ALL"
     settings = from_plain(document, dict[str, MutablePlainTree])
     tools = policy.table(settings, key="tool")
-    houselint = policy.table(tools, key="houselint")
-    exclusions = from_plain(houselint["exclude"], list[str])
+    lint = policy.table(policy.table(tools, key="codedoctor"), key="lint")
+    exclusions = from_plain(lint["exclude"], list[str])
     assert any(
         "*_test.py" in spec and "assert" in spec.split("=")[1].split()
         for spec in exclusions
@@ -60,12 +60,12 @@ def test_project_config_preserves_policy_and_comments() -> None:
         '[tool.pytest.ini_options]\npython_files = ["*_test.py"]\n'
         '[tool.uv]\ndefault-groups = ["dev"]\n'
         '[tool.uv.dependency-groups]\npre-commit = {requires-python = ">=3.13"}\n'
-        '[tool.houselint]\nselect = "digits"\nfix = ""\nexclude = ["custom.py = digits"]\n'
+        '[tool.codedoctor.lint]\nselect = "digits"\nfix = ""\nexclude = ["custom.py = digits"]\n'
     )
     text = install.project_config(original, name="ignored")
     assert "# Keep Python 3.10 support." in text
     assert tomllib.loads(text)["tool"]["ruff"]["line-length"] == 100
-    assert tomllib.loads(text)["tool"]["houselint"]["select"] == "digits"
+    assert tomllib.loads(text)["tool"]["codedoctor"]["lint"]["select"] == "digits"
     assert tomllib.loads(text)["project"]["requires-python"] == ">=3.10"
     assert tomllib.loads(text)["tool"]["uv"]["dependency-groups"]["pre-commit"] == {
         "requires-python": ">=3.13",
@@ -147,7 +147,7 @@ def test_hook_config_creates_valid_empty_config() -> None:
         "check-toml",
         "actionlint",
         "uv-lock",
-        "houselint",
+        "codedoctor-lint",
         "codespell",
         "nbstripout",
         "jupytext-sync",
@@ -181,7 +181,7 @@ def test_hook_config_creates_valid_empty_config() -> None:
     assert ruff[1]["args"] == ["--fix", "--extend-select", "COM812"]
     checker = next(hook for hook in hooks if hook["id"] == "ty-check")
     assert checker["entry"] == (
-        "uv --quiet run --frozen --group pre-commit python -m codedoctor.typecheck ty-check"
+        "uv --quiet run --frozen --group pre-commit python -m codedoctor typecheck ty-check"
     )
     assert config["fail_fast"] is False
     assert config["default_stages"] == ["pre-commit"]
@@ -266,6 +266,61 @@ def test_hook_config_preserves_project_owned_arguments(
     assert install.hook_config(original) == original
 
 
+@pytest.mark.parametrize("flow", [False, True])
+def test_hook_config_upgrades_stage_commands_without_losing_custom_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    flow: bool,
+) -> None:
+    hooks: list[dict[str, object]] = [
+        {
+            "id": "codedoctor-lint",
+            "name": "codedoctor lint",
+            "entry": "uv run python -m codedoctor lint",
+            "language": "system",
+        },
+        {"id": "codegraph-sync", "entry": "uv run python -m codedoctor codegraph-sync"},
+        {"id": "pytest", "entry": "uv run python -m codedoctor testing pytest"},
+    ]
+    defaults: list[dict[str, object]] = [{"repo": "local", "hooks": hooks}]
+    monkeypatch.setattr(install, "_hook_repos", lambda: defaults)
+    original = (
+        "# Keep this comment.\nrepos:\n- repo: local\n  hooks:\n"
+        "  - &lint\n    id: houselint\n    name: houselint\n    language: system\n"
+        "    entry: uv run python -m codedoctor.lint\n"
+        "    args: [--fix, '']  # Report only.\n"
+        "  - *lint\n"
+        "  - id: codegraph-sync\n    entry: >-\n"
+        "      uv run python -m codedoctor.affected.codegraph_sync\n"
+        "  - id: pytest\n    entry: uv run python -m codedoctor.testing pytest\n"
+    )
+    if flow:
+        original = "# Keep this comment.\n" + yaml.safe_dump(
+            yaml.safe_load(original),
+            default_flow_style=True,
+        )
+    configured = install.hook_config(original)
+    expected = [
+        {
+            "repo": "local",
+            "hooks": [
+                {**hooks[0], "args": ["--fix", ""]},
+                {**hooks[0], "args": ["--fix", ""]},
+                *hooks[1:],
+            ],
+        },
+    ]
+    assert yaml.safe_load(configured) == {"repos": expected}
+    assert "# Keep this comment." in configured
+    if not flow:
+        assert "# Report only." in configured
+    assert install.hook_config(configured) == configured
+
+
+def test_hook_migration_visits_recursive_metadata_once() -> None:
+    original = "metadata: &metadata {self: *metadata}\n"
+    assert install._upgrade_hooks(original, expected=[]) == original
+
+
 def test_hook_config_rejects_conflicting_hook_before_writing() -> None:
     original = (
         "repos:\n  - repo: local\n    hooks:\n      - id: ty-check\n"
@@ -336,7 +391,9 @@ def test_install_locks_dependencies_then_installs_only_pre_commit(
     assert configured_ignore != original_ignore
     original_project = (tmp_path / "pyproject.toml").read_text()
     assert original_project.startswith(original_input)
-    assert tomllib.loads(original_project)["tool"]["houselint"]["select"] == "ALL"
+    assert (
+        tomllib.loads(original_project)["tool"]["codedoctor"]["lint"]["select"] == "ALL"
+    )
     original_hooks = (tmp_path / ".pre-commit-config.yaml").read_text()
     install.install(tmp_path)
     assert (tmp_path / "pyproject.toml").read_text() == original_project
@@ -545,12 +602,12 @@ def test_packaged_defaults_preserve_test_semantics(
 ) -> None:
     module = tmp_path / "install.py"
     module.with_name("install_defaults.toml").write_text(
-        '[tool.houselint]\nexclude = ["*_test.py **/tests/test*.py = assert globals", '
+        '[tool.codedoctor.lint]\nexclude = ["*_test.py **/tests/test*.py = assert globals", '
         '"conftest.py = module-side-effects", "private.py = globals"]\n',
     )
     monkeypatch.setattr(policy, "_THIS", module)
     configured = tomllib.loads(install.project_config("", name="demo"))
-    assert configured["tool"]["houselint"] == {
+    assert configured["tool"]["codedoctor"]["lint"] == {
         "select": "ALL",
         "fix": "ALL",
         "set": [
@@ -571,12 +628,12 @@ def test_a_checkout_without_the_packaged_defaults_reads_its_nearest_pyproject(
 ) -> None:
     """Only the wheel carries ``install_defaults.toml``; a source tree has none."""
     (tmp_path / "pyproject.toml").write_text(
-        '[tool.houselint]\nexclude = ["conftest.py = module-side-effects"]\n',
+        '[tool.codedoctor.lint]\nexclude = ["conftest.py = module-side-effects"]\n',
     )
     (tmp_path / "pkg" / "sub").mkdir(parents=True)
     # A test pattern named only after the ``=`` is a rule's argument, not its files.
     (tmp_path / "pkg" / "pyproject.toml").write_text(
-        "[tool.houselint]\nexclude = ["
+        "[tool.codedoctor.lint]\nexclude = ["
         '"*_test.py = assert", "**/tests/test*.py = globals", '
         '"private.py = conftest.py = globals"]\n',
     )
@@ -584,7 +641,7 @@ def test_a_checkout_without_the_packaged_defaults_reads_its_nearest_pyproject(
 
     configured = tomllib.loads(install.project_config("", name="demo"))
 
-    assert configured["tool"]["houselint"]["exclude"] == [
+    assert configured["tool"]["codedoctor"]["lint"]["exclude"] == [
         "*_test.py test_*.py = assert",
         "**/tests/test*.py = globals",
     ]
@@ -608,7 +665,8 @@ def test_checker_versions_follow_the_project_floor(supported: str) -> None:
     assert config["tool"]["pyrefly"]["python-version"] == version + ".0"
     assert config["tool"]["basedpyright"]["pythonVersion"] == version
     assert (
-        config["tool"]["houselint"]["set"][0] == "import-alias.first-party=my_project"
+        config["tool"]["codedoctor"]["lint"]["set"][0]
+        == "import-alias.first-party=my_project"
     )
     assert install.project_config(text, name="different-directory") == text
 

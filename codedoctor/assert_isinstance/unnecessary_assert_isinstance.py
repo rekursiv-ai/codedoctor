@@ -21,9 +21,9 @@ than ``--checker`` (default: pyrefly), run once over copies with every
 candidate replaced by ``pass``, report nothing new on those files. Those runs
 happen only when the checker flagged something, and a crash fails the run.
 
-Findings follow houselint's contract: each is rule ``unnecessary-assert-isinstance``,
+Findings follow checker's contract: each is rule ``unnecessary-assert-isinstance``,
 a ``house-ignore`` marker naming it suppresses it (and is reported once it
-suppresses nothing), and ``[tool.houselint] exclude`` entries naming it or every
+suppresses nothing), and ``[tool.codedoctor.lint] exclude`` entries naming it or every
 rule skip the file. Exits 1 on any diagnostic, as basedpyright does; with
 ``--fix`` the unnecessary asserts are deleted, and the run still fails so the
 fix gets reviewed.
@@ -56,8 +56,8 @@ from treekle import from_plain, json_loads
 from codedoctor.lib import pyproject_flags
 from codedoctor.lib.files import walk
 from codedoctor.lib.worker_count import default_workers, worker_count
-from codedoctor.lint import house_ignore, houselint
-from codedoctor.lint.houselint_types import Finding, Unit
+from codedoctor.lint import checker, house_ignore
+from codedoctor.lint.custom_types import Finding, Unit
 
 
 if TYPE_CHECKING:
@@ -511,8 +511,8 @@ def _unchanged(snapshots: dict[Path, str]) -> None:
             raise SourceChangedError(f"{path} changed during type checking; rerun.")
 
 
-# Read through houselint's own loader, so the excludes mean here what they mean
-# to every houselint rule: an entry naming this rule, or naming none, skips it.
+# Read through checker's own loader, so the excludes mean here what they mean
+# to every checker rule: an entry naming this rule, or naming none, skips it.
 def _honor_house_ignore(
     candidates: Sequence[Finding],
     *,
@@ -521,18 +521,18 @@ def _honor_house_ignore(
 ) -> list[Finding]:
     """Drop excluded and marker-suppressed findings; report markers that rotted."""
     parser = argparse.ArgumentParser()
-    houselint._add_arguments(parser)  # noqa: SLF001 -- one ``[tool.houselint]`` reader.
-    # From the cwd, as houselint itself reads it.
+    checker._add_arguments(parser)  # noqa: SLF001 -- one ``[tool.codedoctor.lint]`` reader.
+    # From the cwd, as checker itself reads it.
     namespace, config_root = pyproject_flags.parse_args(
         parser,
-        tool="houselint",
+        tool="codedoctor.lint",
         argv=[],
     )
-    known = {r.name for r in houselint.default_rules()} | {rule}
+    known = {r.name for r in checker.default_rules()} | {rule}
     exclude = [
         entry
         for spec in cast("list[str]", namespace.exclude)
-        if not (entry := houselint.parse_exclusion(spec, known=known)).rules
+        if not (entry := checker.parse_exclusion(spec, known=known)).rules
         or rule in entry.rules
     ]
     kept: list[Finding] = []
@@ -542,10 +542,10 @@ def _honor_house_ignore(
         # can yield a finding, and a marker names it literally.
         if path.absolute() not in flagged and rule not in path.read_text():
             continue
-        relative = houselint._relative(path, config_root)  # noqa: SLF001 -- same path view.
+        relative = checker._relative(path, config_root)  # noqa: SLF001 -- same path view.
         if any(entry.matches(relative) for entry in exclude):
             continue
-        unit = houselint.read_unit(path)
+        unit = checker.read_unit(path)
         if not isinstance(unit, Unit):
             continue
         absolute = path.absolute()
@@ -823,7 +823,7 @@ def _check(flags: Flags) -> int:
     for finding in findings:
         if finding.rule == rule:
             hits.setdefault(finding.path, []).append(finding.line)
-    # Repo-relative, as houselint prints a finding.
+    # Repo-relative, as checker prints a finding.
     sys.stdout.writelines(
         f"{dataclasses.replace(f, path=f.path.absolute().relative_to(root))}\n"
         for f in findings

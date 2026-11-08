@@ -21,7 +21,7 @@ uv run --group pre-commit pre-commit run --all-files
 ## Repository setup
 
 `codedoctor install` adds a locked `pre-commit` dependency group and installs
-pre-commit and pre-push Git hooks. It creates missing configuration and preserves
+the pre-commit Git hook. It creates missing configuration and preserves
 existing hooks, comments, hook arguments, and the project's Python support range.
 Running it again does not duplicate hooks.
 
@@ -34,15 +34,16 @@ settings remain overrides; installation reports their names.
 Codedoctor is development tooling, not an application dependency. Applications
 can use their own user-directory helpers or inline XDG handling. The installer
 uses the project name for `userdirs-namespace.namespace`; set it explicitly in
-`[tool.houselint]` to choose another namespace. `xdg-literal.helper` is unset
+`[tool.codedoctor.lint]` to choose another namespace. `xdg-literal.helper` is unset
 unless the project requires a shared helper.
 
 Setup uses the same hook configuration as this repository, without its
 package-export and Rust-only checks. Commits autofix whitespace, spelling,
 notebooks, house lint, and Ruff formatting; check types with ty, pyrefly, and
 basedpyright; and run paired tests, coverage checks, and sampled mutation tests.
-Pushes run repository-wide type checks and the fast, slow, smoke, and integration
-test tiers. Dependency-graph setup precedes affected-file checks.
+Pre-push checks are opt-in: install them with `pre-commit install --hook-type
+pre-push` to run repository-wide type checks and all test tiers.
+Dependency-graph setup precedes affected-file checks.
 
 Tests may use either `test_*.py` or `*_test.py`; existing discovery settings and
 coverage thresholds are preserved. Hooks that rewrite files abort that attempt;
@@ -103,14 +104,14 @@ repos:
         language: system
         require_serial: true
         types_or: [python, pyi]
-        entry: uv run python -m codedoctor.gate spool ty-check
+        entry: uv run codedoctor gate spool ty-check
       - id: ty-check
         name: ty-check
         language: system
         require_serial: true
         pass_filenames: false
         types_or: [python, pyi]
-        entry: uv run python -m codedoctor.typecheck ty-check
+        entry: uv run codedoctor typecheck ty-check
 ```
 
 This repository's own [`.pre-commit-config.yaml`](.pre-commit-config.yaml) wires
@@ -118,17 +119,21 @@ every gate and is the fullest example.
 
 ## Gates
 
-| Module | Runs |
+| Command | Runs |
 |---|---|
-| `codedoctor.gate` | `spool`, `run` and `threaded`: the shared machinery |
-| `codedoctor.typecheck` | `ty-check`, `pyrefly-check`, `basedpyright` |
-| `codedoctor.testing` | the tests paired with each changed file, whole-suite tiers, and the pytest plugin that selects and records node ids |
-| `codedoctor.coverage_floor` | each changed source's coverage by its own tests, read from the `pytest` gate's run |
-| `codedoctor.mutation` | mutation testing of the changed functions (`codedoctor[mutation]`) |
-| `codedoctor.lint` | `houselint`, AST rules configured in `[tool.houselint]` |
-| `codedoctor.assert_isinstance` | deletes each `assert isinstance` a checker proves redundant |
-| `codedoctor.affected` | the tests and files a change reaches, from a CodeGraph index |
-| `codedoctor.nbstripout` | notebook output stripping |
+| `codedoctor gate` | `spool`, `run` and `threaded`: the shared machinery |
+| `codedoctor typecheck` | `ty-check`, `pyrefly-check`, `basedpyright` |
+| `codedoctor testing` | paired tests and whole-suite tiers |
+| `codedoctor coverage-floor` | per-source coverage from the pytest gate |
+| `codedoctor mutation` | changed-function mutation tests (`codedoctor[mutation]`) |
+| `codedoctor lint` | AST rules configured in `[tool.codedoctor.lint]` |
+| `codedoctor assert-isinstance` | redundant `assert isinstance` removal |
+| `codedoctor affected` | files and tests reached through CodeGraph |
+| `codedoctor nbstripout` | notebook output stripping |
+| `codedoctor yamlcheck` | YAML validation, including Compose tags |
+| `codedoctor export-leaks` | exported-package leak checks |
+| `codedoctor codegraph-sync` | dependency-graph refresh |
+| `codedoctor check-pr-text` | pull-request text validation |
 
 Worker counts: `WORKERS_<HOOK_ID>` wins, then `WORKERS_DEFAULT`, then a count
 derived from the machine's cores and free memory.
