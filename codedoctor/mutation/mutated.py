@@ -1658,7 +1658,7 @@ def _normalize_sqlite_queries(tree: ast.Module, *, context: str) -> None:
             and isinstance(query.value, str)
             # Column names and quoted values have observable case; numeric projections do not.
             and re.fullmatch(
-                r"(?ai)select\s+[0-9]+\s+from\s+[a-z_][a-z_0-9]*\s+limit\s+[0-9]+",
+                r"(?ai)select\s+[0-9]+\s+from\s+[a-z_][a-z_0-9]*(?:\s+where\s+[a-z_][a-z_0-9]*\s*(?:<=|>=|<>|!=|==|=|<|>)\s*\?)?\s+limit\s+[0-9]+",
                 query.value,
             )
         ):
