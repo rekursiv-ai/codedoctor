@@ -1,4 +1,4 @@
-"""Tests for ``houselint_types``: the shared walk on ``Unit``."""
+"""Tests for ``custom_types``: the shared walk on ``Unit``."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 import ast
 import warnings
 
-from codedoctor.lint.houselint_types import Finding, Unit
+from codedoctor.lint.custom_types import Finding, Unit
 
 
 def _unit(source: str, kind: str = "python") -> Unit:

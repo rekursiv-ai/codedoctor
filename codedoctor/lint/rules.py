@@ -1,7 +1,7 @@
-"""Houselint rules beyond the four founding ones; see ``houselint``.
+"""Codedoctor lint rules beyond the four founding ones; see ``checker``.
 
-Every rule here follows ``houselint.Rule`` and is registered by
-``houselint.default_rules``. Split out of ``houselint`` only for size:
+Every rule here follows ``checker.Rule`` and is registered by
+``checker.default_rules``. Split out of ``codedoctor lint`` only for size:
 that module owns the dispatcher and protocol; this one owns rules that read
 shared Units and say what is wrong with them.
 
@@ -37,7 +37,7 @@ import tokenize
 from treekle import ReadError, from_plain, json_loads
 
 from codedoctor.lint import house_ignore
-from codedoctor.lint.houselint_types import Finding, Unit, _tokenize
+from codedoctor.lint.custom_types import Finding, Unit, _tokenize
 
 
 _USERDIRS_HELPERS = frozenset({"config_dir", "state_dir", "cache_dir", "data_dir"})
@@ -8276,7 +8276,7 @@ def _house_ignore(
     node: ast.Import | ast.ImportFrom,
     rule: str,
 ) -> bool:
-    """Whether a node carries a houselint suppression for ``rule``."""
+    """Whether a node carries a codedoctor lint suppression for ``rule``."""
     end_lineno = node.end_lineno or node.lineno
     lines = unit.lines[node.lineno - 1 : end_lineno]
     marker = f"house-ignore[{rule}]"
@@ -8306,7 +8306,7 @@ def _module_import_end(tree: ast.Module) -> int:
 
 
 # ``check`` and ``fix`` share this so a fix never rewrites a call the check
-# called clean: the fix gate in ``houselint._lint_path`` relies on it.
+# called clean: the fix gate in ``codedoctor lint._lint_path`` relies on it.
 def _unprefixed_tempfile_calls(unit: Unit, tree: ast.Module) -> Iterator[ast.Call]:
     """Yield each tempfile call, dotted or directly imported, without ``prefix=``."""
     imported = frozenset(

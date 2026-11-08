@@ -40,7 +40,7 @@ def test_defaults_use_the_canonical_checker_policy() -> None:
         "pathlib.Path.home"
         not in defaults["ruff"]["lint"]["flake8-tidy-imports"]["banned-api"]
     )
-    assert defaults["houselint"]["set"] == [
+    assert defaults["codedoctor"]["lint"]["set"] == [
         "import-alias.first-party=netv",
         "test-footer.runner=codedoctor.lib.testing.runner",
         "userdirs-namespace.namespace=netv",
@@ -183,6 +183,55 @@ def test_table_accepts_inline_toml_and_rejects_plain_scalars() -> None:
 def test_invalid_managed_configuration_is_rejected(text: str) -> None:
     with pytest.raises(TypeError):
         policy.apply(tomlkit.parse(text), defaults={"ruff": {"line-length": 88}})
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+def test_lint_schema_migration_preserves_overrides_and_deleted_settings(
+    deleted: bool,
+) -> None:
+    document = tomlkit.parse(
+        '# Project lint policy.\n[tool.houselint]\nselect = "digits"\n'
+        'fix = ""  # Report only.\nexclude = ["private.py"]\n'
+        '[tool.codedoctor.managed.houselint]\nselect = "ALL"\n'
+        'fix = "ALL"\nexclude = []\nset = ["old"]\n',
+    )
+    if deleted:
+        del document["tool"]["houselint"]
+    defaults: dict[str, MutablePlainTree] = {
+        "codedoctor": {
+            "lint": {"select": "ALL", "fix": "ALL", "exclude": [], "set": ["new"]},
+        },
+    }
+    policy.apply(document, defaults=defaults)
+    parsed = tomllib.loads(tomlkit.dumps(document))
+    assert "houselint" not in parsed["tool"]
+    assert parsed["tool"]["codedoctor"]["managed"] == defaults
+    if deleted:
+        assert "lint" not in parsed["tool"]["codedoctor"]
+    else:
+        assert parsed["tool"]["codedoctor"]["lint"] == {
+            "select": "digits",
+            "fix": "",
+            "exclude": ["private.py"],
+        }
+        assert "# Report only." in tomlkit.dumps(document)
+    assert policy.overrides(document) == tuple(
+        f"codedoctor.lint.{key}" for key in ("exclude", "fix", "select", "set")
+    )
+    once = tomlkit.dumps(document)
+    policy.apply(document, defaults=defaults)
+    assert tomlkit.dumps(document) == once
+
+
+def test_lint_schema_migration_rejects_competing_tables() -> None:
+    document = tomlkit.parse(
+        '[tool.houselint]\nselect = "digits"\n[tool.codedoctor.lint]\nselect = "ALL"\n',
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"^Cannot migrate both houselint and codedoctor\.lint\.$",
+    ):
+        policy.apply(document, defaults={"codedoctor": {"lint": {"select": "ALL"}}})
 
 
 if __name__ == "__main__":

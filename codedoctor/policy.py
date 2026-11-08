@@ -85,11 +85,11 @@ def defaults(*, name: str, python_version: str = "3.12") -> dict[str, MutablePla
     pyrefly.pop("python-interpreter-path", None)
     pyrefly.pop("python-platform", None)
     exclusions = from_plain(
-        table(tools, key="houselint").get("exclude"),
+        table(table(tools, key="codedoctor"), key="lint").get("exclude"),
         list[str],
         default=[],
     )
-    result["houselint"] = {
+    table(result, key="codedoctor")["lint"] = {
         "select": "ALL",
         "fix": "ALL",
         "exclude": [
@@ -117,6 +117,13 @@ def apply(document: TOMLDocument, *, defaults: Mapping[str, MutablePlainTree]) -
     """
     tools = table(document, key="tool")
     metadata = table(tools, key="codedoctor")
+    for parent in (tools, table(metadata, key="managed")):
+        if "houselint" in parent:
+            target = table(parent, key="codedoctor")
+            if "lint" in target:
+                raise ValueError("Cannot migrate both houselint and codedoctor.lint.")
+            target["lint"] = table(parent, key="houselint")
+            del parent["houselint"]
     previous = from_plain(
         table(metadata, key="managed").unwrap(),
         dict[str, MutablePlainTree],

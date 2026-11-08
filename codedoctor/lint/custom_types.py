@@ -1,4 +1,4 @@
-"""Shared values for the houselint dispatcher and rules."""
+"""Shared values for the codedoctor lint dispatcher and rules."""
 
 from __future__ import annotations
 

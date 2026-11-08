@@ -1,4 +1,4 @@
-"""Tests for ``houselint_rules``: one positive and one negative per rule."""
+"""Tests for ``rules``: one positive and one negative per rule."""
 
 from __future__ import annotations
 
@@ -13,8 +13,9 @@ from treekle import json_loads
 
 import pytest
 
-from codedoctor.lint import houselint, houselint_rules
-from codedoctor.lint.houselint_rules import (
+from codedoctor.lint import checker, rules
+from codedoctor.lint.custom_types import Finding, Unit, _tokenize
+from codedoctor.lint.rules import (
     AllReexportRule,
     AnnotationImportRule,
     ArgsSectionRule,
@@ -70,13 +71,12 @@ from codedoctor.lint.houselint_rules import (
     _sections,
     _target_name,
 )
-from codedoctor.lint.houselint_types import Finding, Unit, _tokenize
 
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from codedoctor.lint.houselint import Rule
+    from codedoctor.lint.checker import Rule
 
 
 def _findings(
@@ -89,9 +89,9 @@ def _findings(
     path = tmp_path / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
-    # The dispatcher sorts every finding (``houselint.run``), so order here
+    # The dispatcher sorts every finding (``checker.run``), so order here
     # is not part of a rule's contract; the result is sorted to compare stably.
     findings = tuple(sorted(rule.check(unit)))
     for finding in findings:
@@ -110,7 +110,7 @@ def _fixed(tmp_path: Path, rule: Rule, body: str, name: str = "mod.py") -> str |
     """Write ``body`` as ``name`` and return one rule's ``fix`` result."""
     path = tmp_path / name
     path.write_text(body, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     fixed = rule.fix(unit)
     if fixed is not None and fixed != body:
@@ -134,7 +134,7 @@ _UNREAD: Final = (
 
 
 def test_every_new_rule_is_registered_and_satisfies_the_protocol() -> None:
-    names = [rule.name for rule in houselint.default_rules()]
+    names = [rule.name for rule in checker.default_rules()]
     assert len(names) == len(set(names))
     assert "emdash" in names
     assert "module-side-effects" in names
@@ -144,8 +144,8 @@ def test_every_new_rule_is_registered_and_satisfies_the_protocol() -> None:
 @pytest.mark.parametrize("source", ["", "def broken(:\n"], ids=["empty", "unparsed"])
 @pytest.mark.parametrize(
     "rule",
-    houselint.default_rules(),
-    ids=[rule.name for rule in houselint.default_rules()],
+    checker.default_rules(),
+    ids=[rule.name for rule in checker.default_rules()],
 )
 def test_every_rule_passes_and_leaves_a_file_with_no_code(
     tmp_path: Path,
@@ -770,7 +770,7 @@ def test_tempfile_prefix_fix_handles_direct_imports_and_is_idempotent(
     )
     path = tmp_path / "some_file.py"
     path.write_text(fixed, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert TempfilePrefixRule().fix(unit) is None
 
@@ -1510,6 +1510,107 @@ def test_dotted_import_fix_binds_the_root_on_every_path_that_reads_it(
 ) -> None:
     """A rewrite holds only where the read can run after the rewritten import."""
     assert _fixed(tmp_path, DottedImportRule(), body) == fixed
+
+
+@pytest.mark.parametrize(
+    ("body", "reason", "alias"),
+    [
+        (
+            "import a.b  # house-ignore[dotted-import] -- Kept.\nx = a.b.X\n",
+            "it carries a house-ignore[dotted-import] marker",
+            False,
+        ),
+        ("class C:\n    import a.b\n    x = a.b.X\n", "it is in a class body", False),
+        (
+            "import a.b\ndef f():\n    global a\n    a = None\n",
+            "`a` is declared global or nonlocal",
+            False,
+        ),
+        (
+            "import a.b\na = None\n",
+            "`a` is also bound another way in this scope",
+            False,
+        ),
+        (
+            "import a.b\nb = None\nx = a.b.X\n",
+            "`b` already names something else where it would be read",
+            True,
+        ),
+        (
+            "import a.b\nimport c.b\nx = a.b.X\n",
+            "another import also ends in `b`",
+            True,
+        ),
+        ("import a.b\n", _UNREAD.format("a.b"), False),
+        ("import a.b\na.b = None\n", "`a.b` itself is assigned or deleted", False),
+        (
+            "import a.b.c\nx = a.b.c.X\npatch('a.b.c', fake)\n",
+            "`a.b.c` is swapped on `a.b` at runtime (setattr or patch), which a bound `c` would not see",
+            False,
+        ),
+        (
+            "import a\nx = a.b.X\nimport a.b\n",
+            "a read of `a.b` can run where this import has not",
+            False,
+        ),
+        (
+            "import a.b\nasync def f(xs):\n    async for b in xs:\n        pass\nx = a.b.X\n",
+            "`b` already names something else where it would be read",
+            True,
+        ),
+        ("def f():\n    import a.b\n    return a.b.X\nb = None\n", "", False),
+    ],
+)
+def test_dotted_import_verdict_names_the_remedy(
+    body: str,
+    reason: str,
+    alias: bool,
+) -> None:
+    indexed = rules._DottedImports.build(
+        Unit(path=Path("mod.py"), source=body, kind="python"),
+    )
+    assert indexed is not None
+    assert indexed.verdicts()[0][2:] == (reason, alias)
+
+
+def test_dotted_import_checks_the_root_read_for_scope_and_dominance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = Unit(
+        path=Path("mod.py"),
+        source="import a\nimport a.b\nx = a.b.X\n",
+        kind="python",
+    )
+    indexed = rules._DottedImports.build(unit)
+    assert indexed is not None
+    seen: list[ast.AST] = []
+
+    def shadowed(
+        self: rules._DottedImports,
+        name: str,
+        *,
+        node: ast.AST,
+        scope: ast.AST,
+    ) -> bool:
+        del self, name, scope
+        seen.append(node)
+        return False
+
+    def runs_after(
+        self: rules._DottedImports,
+        node: ast.Import,
+        *,
+        read: ast.AST,
+    ) -> bool:
+        del self, node
+        seen.append(read)
+        return True
+
+    monkeypatch.setattr(rules._DottedImports, "_shadowed", shadowed)
+    monkeypatch.setattr(rules._DottedImports, "_runs_after", runs_after)
+    assert indexed.verdicts()[0][2:] == ("", False)
+    (root,) = [node for node in unit.nodes(ast.Name) if node.id == "a"]
+    assert seen == [root, root]
 
 
 def test_dotted_import_suggests_an_alias_for_a_taken_name(tmp_path: Path) -> None:
@@ -2252,9 +2353,9 @@ def test_misplaced_privates_move_verbatim_without_a_main_guard(
 def test_type_checking_import_is_not_nested(tmp_path: Path) -> None:
     path = tmp_path / "mod.py"
     path.write_text("if TYPE_CHECKING:\n    import a\n", encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
-    assert houselint_rules._nested_imports(unit) == ()
+    assert rules._nested_imports(unit) == ()
 
 
 # -- module-side-effects -----------------------------------------------------
@@ -2324,7 +2425,7 @@ def test_declarative_module_scope_is_clean(tmp_path: Path) -> None:
 
 
 def test_all_shape_rules_are_registered() -> None:
-    names = {r.name for r in houselint.default_rules()}
+    names = {r.name for r in checker.default_rules()}
     assert {"underscore-param", "cli-shape", "comment-sentence", "mkdir-mode"} <= names
 
 
@@ -3300,7 +3401,7 @@ def test_conforming_library_module_is_clean(tmp_path: Path) -> None:
         '    parser.add_argument("--x")\n',
         encoding="utf-8",
     )
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert not CliShapeRule().check(unit)
 
@@ -3313,7 +3414,7 @@ def test_conforming_polyglot_main_is_clean(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     path.chmod(0o755)
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert not CliShapeRule().check(unit)
 
@@ -3505,7 +3606,7 @@ def test_cli_shape_reports_and_fixes_a_polyglot_noqa_without_a_reason(
     path = tmp_path / "tool.py"
     path.write_text(body, encoding="utf-8")
     path.chmod(0o755)
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert [f.message for f in CliShapeRule().check(unit)] == [
         "(a) line 2 must be `# ruff: noqa: EXE003, D300, D205[, CODE...]`",
@@ -3685,8 +3786,30 @@ def test_fmt_directive_ignores_mentions_and_clean_files(
     assert not _findings(tmp_path, FmtDirectiveRule(), body)
 
 
+@pytest.mark.parametrize(
+    ("tail", "expected"),
+    [
+        ([], {2}),
+        (["exec uv bad"], {2}),
+        (["'''"], {2}),
+        (["'''", "x = 1"], {2}),
+        (["'''", "# fmt: on"], {2, 5}),
+    ],
+)
+def test_polyglot_formatter_exemptions_stop_at_the_header(
+    tail: list[str],
+    expected: set[int],
+) -> None:
+    assert (
+        rules._polyglot_header_rows(
+            ["#!/bin/sh", "# fmt: off", "'''' 2>/dev/null #", *tail],
+        )
+        == expected
+    )
+
+
 def test_fmt_directive_has_no_fix(tmp_path: Path) -> None:
-    """Dropping the directive reflows the code; ruff, not houselint, does that."""
+    """Dropping the directive reflows the code; ruff, not checker, does that."""
     assert _fixed(tmp_path, FmtDirectiveRule(), "x = [1,   2]  # fmt: skip\n") is None
 
 
@@ -4795,7 +4918,7 @@ def test_lazy_import_cost_findings_and_boundaries(tmp_path: Path) -> None:
         "def d():\n    return isinstance(1, int)\n"
     )
     findings = _findings(tmp_path, LazyImportCostRule(threshold_ms=10), body)
-    costs = houselint_rules._IMPORT_COSTS_MS
+    costs = rules._IMPORT_COSTS_MS
     tail = "defs reach it; bind it with `lazy_import` (STYLE.md Code Organization)"
     assert [(f.line, f.message) for f in findings] == [
         (
@@ -5479,7 +5602,7 @@ def test_digits_leaves_a_grouped_notebook_alone(tmp_path: Path) -> None:
 def test_digits_reports_one_finding_per_file(tmp_path: Path) -> None:
     path = tmp_path / "mod.py"
     path.write_text("x = 12345\ny = 67890\n")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
 
     assert DigitsRule(min_digits=5).check(unit) == (
@@ -6135,7 +6258,7 @@ def _cli(
     path = tmp_path / "tool.py"
     path.write_text(body, encoding="utf-8")
     path.chmod(mode)
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     rule = CliShapeRule()
     return [(f.line, f.message) for f in rule.check(unit)], rule.fix(unit)
@@ -6263,19 +6386,19 @@ def test_cli_header_noqa_keeps_extra_codes_and_drops_duplicates(tmp_path: Path) 
 def test_cli_header_keeps_crlf_line_endings() -> None:
     body = (_HEAD + _PINNED + _EXEC + "\n'''\n").replace("\n", "\r\n")
     lines = [str(line) for line in body.splitlines(keepends=True)]
-    houselint_rules._fix_polyglot_header(lines)
+    rules._fix_polyglot_header(lines)
     assert "".join(lines) == body
 
 
 def test_cli_header_on_a_one_line_file_is_left_alone() -> None:
     lines = ["#!/bin/sh\n"]
-    houselint_rules._fix_polyglot_header(lines)
+    rules._fix_polyglot_header(lines)
     assert lines == ["#!/bin/sh\n"]
 
 
 def test_cli_header_two_line_file_gets_the_pinned_lines() -> None:
     lines = ["#!/bin/sh\n", "# ruff: noqa: EXE003, D300, D205 -- W.\n"]
-    houselint_rules._fix_polyglot_header(lines)
+    rules._fix_polyglot_header(lines)
     assert "".join(lines) == _HEAD + _PINNED + _EXEC + "\n"
 
 
@@ -6334,7 +6457,7 @@ def test_cli_main_annotation_is_rewritten_on_its_header_line(
     body = header + "    return 0\n"
     path = tmp_path / "tool.py"
     path.write_bytes(body.encode())
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert CliShapeRule().fix(unit) == fixed + "    return 0\n"
 
@@ -6384,7 +6507,7 @@ def test_the_polyglot_description_fix_is_total(
         node
         for node in ast.walk(ast.parse(fixed))
         if isinstance(node, ast.Call)
-        and houselint_rules._call_text(node).endswith("ArgumentParser")
+        and rules._call_text(node).endswith("ArgumentParser")
     ]
     [keyword] = call.keywords
     expression = ast.Expression(body=keyword.value)
@@ -6505,15 +6628,15 @@ def test_falls_through_follows_each_compound_shape(
     tree = ast.parse("def main() -> int:\n" + tail)
     main = tree.body[0]
     assert isinstance(main, ast.FunctionDef)
-    assert houselint_rules._falls_through(main.body, noreturn=frozenset()) is falls
+    assert rules._falls_through(main.body, noreturn=frozenset()) is falls
 
 
 def test_falls_through_honours_this_modules_noreturn_defs() -> None:
     tree = ast.parse("def main() -> int:\n    bail()\n")
     main = tree.body[0]
     assert isinstance(main, ast.FunctionDef)
-    assert not houselint_rules._falls_through(main.body, noreturn=frozenset({"bail"}))
-    assert houselint_rules._falls_through(main.body, noreturn=frozenset({"other"}))
+    assert not rules._falls_through(main.body, noreturn=frozenset({"bail"}))
+    assert rules._falls_through(main.body, noreturn=frozenset({"other"}))
 
 
 def test_cli_header_fix_handles_noqa_crlf_and_extra_noqa_lines() -> None:
@@ -6525,7 +6648,7 @@ def test_cli_header_fix_handles_noqa_crlf_and_extra_noqa_lines() -> None:
         "'''' 2>/dev/null #\r\n",
         _EXEC + "\r\n",
     ]
-    houselint_rules._fix_polyglot_header(lines)
+    rules._fix_polyglot_header(lines)
     assert (
         lines[1]
         == "# ruff: noqa: EXE003, D300, D205, D300, N999 -- Polyglot shell/Python script.\n"
@@ -6540,7 +6663,7 @@ def test_cli_header_fix_handles_noqa_crlf_and_extra_noqa_lines() -> None:
 
 def test_cli_header_fix_drops_the_pinned_codes_from_the_extras() -> None:
     lines = ["#!/bin/sh\n", "# ruff: noqa: D205, N999, D300, EXE003\n"]
-    houselint_rules._fix_polyglot_header(lines)
+    rules._fix_polyglot_header(lines)
     assert (
         lines[1]
         == "# ruff: noqa: EXE003, D300, D205, N999 -- Polyglot shell/Python script.\n"
@@ -6558,7 +6681,7 @@ def test_cli_header_fix_stops_the_exec_search_at_the_docstring() -> None:
         "'''\n",
         _EXEC + "\n",
     ]
-    houselint_rules._fix_polyglot_header(lines)
+    rules._fix_polyglot_header(lines)
     assert lines[4] == _EXEC + "\n"
     assert lines[5:] == ["echo fast\n", "'''\n", _EXEC + "\n"]
 
@@ -6574,7 +6697,7 @@ def test_cli_header_fix_keeps_a_custom_exec_two_lines_down() -> None:
         "'''\n",
     ]
     before = list(lines)
-    houselint_rules._fix_polyglot_header(lines)
+    rules._fix_polyglot_header(lines)
     assert lines == before
 
 
@@ -6588,7 +6711,7 @@ def test_cli_header_fix_skips_comment_lines_after_extra_noqa() -> None:
         "x\n",
         "y\n",
     ]
-    houselint_rules._fix_polyglot_header(lines)
+    rules._fix_polyglot_header(lines)
     assert lines[5:] == [
         "# fmt: off\n",
         "'''' 2>/dev/null #\n",
@@ -6679,16 +6802,16 @@ def test_cli_header_fix_replaces_a_launcher_below_a_shell_prelude() -> None:
         "Summary.\n",
         "'''\n",
     ]
-    houselint_rules._fix_polyglot_header(lines)
+    rules._fix_polyglot_header(lines)
     assert lines[4:] == ["[ -x v ] && exec v\n", _EXEC + "\n", "Summary.\n", "'''\n"]
 
 
 def test_cli_trailer_terminates_the_last_line_only() -> None:
     lines = ["a\n", "b"]
-    houselint_rules._fix_polyglot_trailer(lines)
+    rules._fix_polyglot_trailer(lines)
     assert lines == ["a\n", "b\n", "# vim: ft=python\n"]
     lines = ["a", "b\n"]
-    houselint_rules._fix_polyglot_trailer(lines)
+    rules._fix_polyglot_trailer(lines)
     assert lines == ["a", "b\n", "# vim: ft=python\n"]
 
 
@@ -6696,7 +6819,7 @@ def test_cli_main_module_reports_extra_statements(tmp_path: Path) -> None:
     body = 'from m import main\nx = 1\nif __name__ == "__main__":\n    raise SystemExit(main())\n'
     path = tmp_path / "__main__.py"
     path.write_text(body, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert [(f.line, f.message) for f in CliShapeRule().check(unit)] == [
         (1, "(c) __main__.py holds more than `from X import main` + the guard"),
@@ -6808,7 +6931,7 @@ def test_falls_through_threads_noreturn_into_every_branch() -> None:
     for body in bodies:
         main = ast.parse("def main() -> int:\n" + body).body[0]
         assert isinstance(main, ast.FunctionDef)
-        assert not houselint_rules._falls_through(
+        assert not rules._falls_through(
             main.body,
             noreturn=frozenset({"bail"}),
         )
@@ -6817,7 +6940,7 @@ def test_falls_through_threads_noreturn_into_every_branch() -> None:
 def test_falls_through_matches_exit_on_the_last_attribute() -> None:
     main = ast.parse("def main() -> int:\n    exit_codes.log(1)\n").body[0]
     assert isinstance(main, ast.FunctionDef)
-    assert houselint_rules._falls_through(main.body, noreturn=frozenset())
+    assert rules._falls_through(main.body, noreturn=frozenset())
 
 
 # -- mutation coverage: mkdir-mode, side effects, globals, returns, digits -------
@@ -7066,7 +7189,7 @@ def test_returns_section_wants_yields_for_a_generator(tmp_path: Path) -> None:
     ],
 )
 def test_group_leaves_non_decimal_and_non_integer_literals(literal: str) -> None:
-    assert houselint_rules._group(literal) == literal
+    assert rules._group(literal) == literal
 
 
 @pytest.mark.parametrize(
@@ -7077,12 +7200,12 @@ def test_group_inserts_separators_every_three_digits(
     literal: str,
     grouped: str,
 ) -> None:
-    assert houselint_rules._group(literal) == grouped
+    assert rules._group(literal) == grouped
 
 
 def test_cli_trailer_on_a_single_unterminated_line() -> None:
     lines = ["x = 1"]
-    houselint_rules._fix_polyglot_trailer(lines)
+    rules._fix_polyglot_trailer(lines)
     assert lines == ["x = 1\n", "# vim: ft=python\n"]
 
 
@@ -7097,7 +7220,7 @@ def test_cli_header_fix_keeps_an_exec_line_right_after_the_pinned_lines() -> Non
         "'''\n",
     ]
     before = list(lines)
-    houselint_rules._fix_polyglot_header(lines)
+    rules._fix_polyglot_header(lines)
     assert lines == before
 
 
@@ -7109,7 +7232,7 @@ def test_cli_header_fix_rewrites_a_pinned_line_with_trailing_space() -> None:
         "'''' 2>/dev/null #\n",
         _EXEC + "\n",
     ]
-    houselint_rules._fix_polyglot_header(lines)
+    rules._fix_polyglot_header(lines)
     assert lines[2] == "# fmt: off  \n"
 
 
@@ -7158,7 +7281,7 @@ def test_cli_main_annotation_stops_before_the_body(tmp_path: Path) -> None:
 def test_falls_through_reads_the_callees_last_attribute() -> None:
     main = ast.parse("def main() -> int:\n    os.path.exit(1)\n").body[0]
     assert isinstance(main, ast.FunctionDef)
-    assert not houselint_rules._falls_through(main.body, noreturn=frozenset())
+    assert not rules._falls_through(main.body, noreturn=frozenset())
 
 
 @pytest.mark.parametrize(
@@ -7176,7 +7299,7 @@ def test_module_import_end_is_the_line_after_the_leading_imports(
     source: str,
     end: int,
 ) -> None:
-    assert houselint_rules._module_import_end(ast.parse(source)) == end
+    assert rules._module_import_end(ast.parse(source)) == end
 
 
 @pytest.mark.parametrize(
@@ -7212,7 +7335,7 @@ def test_bind_arguments_maps_each_parameter_or_refuses(
     assert isinstance(node, ast.FunctionDef)
     expr = ast.parse(call, mode="eval").body
     assert isinstance(expr, ast.Call)
-    got = houselint_rules._bind_arguments(node, expr)
+    got = rules._bind_arguments(node, expr)
     texts = None if got is None else {name: ast.unparse(e) for name, e in got.items()}
     assert texts == bound
 
@@ -7258,7 +7381,7 @@ def test_split_private_docstring_wraps_summary_and_rationale(
     summary: str,
     rest: list[str],
 ) -> None:
-    assert houselint_rules._split_private_docstring(
+    assert rules._split_private_docstring(
         text,
         summary_width=20 if "Sum." not in text else 40,
         comment_width=20,
@@ -7362,9 +7485,7 @@ def test_insert_cwd_bindings_places_missing_bindings_after_the_imports(
     needs_this: bool,
     expected: str,
 ) -> None:
-    assert houselint_rules._insert_cwd_bindings(source, needs_this=needs_this) == (
-        expected
-    )
+    assert rules._insert_cwd_bindings(source, needs_this=needs_this) == (expected)
 
 
 @pytest.mark.parametrize(
@@ -7385,7 +7506,7 @@ def test_def_span_takes_decorators_and_the_comment_block_above(
     span: tuple[int, int],
 ) -> None:
     stmt = ast.parse(source).body[-1]
-    assert houselint_rules._def_span(stmt, source.splitlines()) == span
+    assert rules._def_span(stmt, source.splitlines()) == span
 
 
 @pytest.mark.parametrize(
@@ -7409,7 +7530,7 @@ def test_has_leading_comment_scans_the_run_above(
     *,
     commented: bool,
 ) -> None:
-    assert houselint_rules._has_leading_comment(lines, lineno) is commented
+    assert rules._has_leading_comment(lines, lineno) is commented
 
 
 @pytest.mark.parametrize(
@@ -7457,12 +7578,12 @@ def test_logging_fstring_fix_carries_each_spec(
 def test_negated_spells_not_test(test: str, expected: str) -> None:
     source = f"({test})"
     node = ast.parse(source, mode="eval").body
-    assert houselint_rules._negated(node, source) == expected
+    assert rules._negated(node, source) == expected
 
 
 def test_segment_falls_back_to_unparse_without_a_span() -> None:
     node = ast.Name(id="x")
-    assert houselint_rules._segment("y", node) == "x"
+    assert rules._segment("y", node) == "x"
 
 
 def _inline(tmp_path: Path, helper: str, call: str) -> str | None:
@@ -7472,7 +7593,7 @@ def _inline(tmp_path: Path, helper: str, call: str) -> str | None:
         f"def f(a, k, x):\n    return {call}\n\n\n{helper}",
         encoding="utf-8",
     )
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert unit.tree is not None
     node = unit.tree.body[-1]
@@ -7482,7 +7603,7 @@ def _inline(tmp_path: Path, helper: str, call: str) -> str | None:
         for n in unit.nodes(ast.Call)
         if isinstance(n.func, ast.Name) and n.func.id == "_h"
     )
-    return houselint_rules._inline_call(node, site, unit)
+    return rules._inline_call(node, site, unit)
 
 
 @pytest.mark.parametrize(
@@ -7630,7 +7751,7 @@ def test_inline_call_evaluates_each_argument_as_the_call_did(
 )
 def test_atomic_parenthesizes_loose_expressions(expr: str, atomic: str) -> None:
     node = ast.parse(expr, mode="eval").body
-    assert houselint_rules._atomic(node) == atomic
+    assert rules._atomic(node) == atomic
 
 
 @pytest.mark.parametrize(
@@ -7648,7 +7769,7 @@ def test_name_usage_tallies_annotation_and_runtime_uses(
     source: str,
     usage: dict[str, tuple[int, int]],
 ) -> None:
-    got = houselint_rules._name_usage(ast.parse(source))
+    got = rules._name_usage(ast.parse(source))
     assert {k: (v.annotation, v.runtime) for k, v in got.items()} == usage
 
 
@@ -7665,7 +7786,7 @@ def test_name_usage_tallies_annotation_and_runtime_uses(
 )
 def test_is_type_checking_test(test: str, *, expected: bool) -> None:
     node = ast.parse(test, mode="eval").body
-    assert houselint_rules._is_type_checking_test(node) is expected
+    assert rules._is_type_checking_test(node) is expected
 
 
 @pytest.mark.parametrize(
@@ -7686,7 +7807,7 @@ def test_eager_imports_skip_type_checking_blocks(
     source: str,
     imports: list[str],
 ) -> None:
-    got = houselint_rules._eager_imports(ast.parse(source))
+    got = rules._eager_imports(ast.parse(source))
     assert [ast.unparse(node) for node in got] == imports
 
 
@@ -7705,7 +7826,7 @@ def test_imported_modules_skip_relative_imports(
 ) -> None:
     node = ast.parse(source).body[0]
     assert isinstance(node, ast.Import | ast.ImportFrom)
-    assert list(houselint_rules._imported_modules(node)) == modules
+    assert list(rules._imported_modules(node)) == modules
 
 
 @pytest.mark.parametrize(
@@ -7719,7 +7840,7 @@ def test_imported_modules_skip_relative_imports(
 def test_import_locals_binds_roots_and_aliases(source: str, names: list[str]) -> None:
     node = ast.parse(source).body[0]
     assert isinstance(node, ast.Import | ast.ImportFrom)
-    assert list(houselint_rules._import_locals(node)) == names
+    assert list(rules._import_locals(node)) == names
 
 
 def test_names_reached_by_siblings(tmp_path: Path) -> None:
@@ -7731,7 +7852,7 @@ def test_names_reached_by_siblings(tmp_path: Path) -> None:
     (tmp_path / "e.py").write_bytes(b"\xff_g\n")
     (tmp_path / "f.txt").write_text("_h\n", encoding="utf-8")
     names = {"_a", "_b", "_c", "_d", "_e", "_f", "_g", "_h", "_i"}
-    assert houselint_rules._names_reached_by_siblings(tmp_path / "mod.py", names) == {
+    assert rules._names_reached_by_siblings(tmp_path / "mod.py", names) == {
         "_a",
         "_b",
         "_c",
@@ -7745,7 +7866,7 @@ def test_names_reached_by_siblings_reads_every_sibling(tmp_path: Path) -> None:
     (tmp_path / "b_test.py").write_text("_a\n", encoding="utf-8")
     (tmp_path / "c.py").write_text("x._b\n", encoding="utf-8")
     (tmp_path / "z.py").write_text("from q import _c\n", encoding="utf-8")
-    assert houselint_rules._names_reached_by_siblings(
+    assert rules._names_reached_by_siblings(
         tmp_path / "mod.py",
         {"_a", "_b", "_c"},
     ) == {"_a", "_b", "_c"}
@@ -7754,7 +7875,7 @@ def test_names_reached_by_siblings_reads_every_sibling(tmp_path: Path) -> None:
 def test_names_reached_by_siblings_skips_itself(tmp_path: Path) -> None:
     (tmp_path / "mod.py").write_text("from x import _a\n", encoding="utf-8")
     (tmp_path / "mod_test.py").write_text("\n", encoding="utf-8")
-    assert houselint_rules._names_reached_by_siblings(tmp_path / "mod.py", {"_a"}) == (
+    assert rules._names_reached_by_siblings(tmp_path / "mod.py", {"_a"}) == (
         frozenset()
     )
 
@@ -7781,7 +7902,7 @@ def test_names_reached_by_siblings_skips_itself(tmp_path: Path) -> None:
 def test_is_super_only(source: str, *, forwarding: bool) -> None:
     node = ast.parse(source).body[0]
     assert isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-    assert houselint_rules._is_super_only(node) is forwarding
+    assert rules._is_super_only(node) is forwarding
 
 
 @pytest.mark.parametrize(
@@ -7804,17 +7925,17 @@ def test_is_super_only(source: str, *, forwarding: bool) -> None:
 )
 def test_is_type_test(test: str, *, expected: bool) -> None:
     node = ast.parse(test, mode="eval").body
-    assert houselint_rules._is_type_test(node) is expected
+    assert rules._is_type_test(node) is expected
 
 
 def _dataclass_class(
     source: str,
-) -> tuple[ast.ClassDef, houselint_rules._DataclassBindings]:
+) -> tuple[ast.ClassDef, rules._DataclassBindings]:
     """Parse ``source`` and return its last class with its dataclass bindings."""
     tree = ast.parse(source)
     node = tree.body[-1]
     assert isinstance(node, ast.ClassDef)
-    return node, houselint_rules._dataclass_bindings(tree)
+    return node, rules._dataclass_bindings(tree)
 
 
 @pytest.mark.parametrize(
@@ -7849,10 +7970,10 @@ def test_dataclass_kwargs_and_slots(
     got = tuple(
         key
         for dec in node.decorator_list
-        for key in houselint_rules._missing_kwargs(dec, ("kw_only", "slots"), bound)
+        for key in rules._missing_kwargs(dec, ("kw_only", "slots"), bound)
     )
     assert got == missing
-    assert houselint_rules._is_slotted(node, bound) is slotted
+    assert rules._is_slotted(node, bound) is slotted
 
 
 def test_dataclass_bindings_collect_each_spelling() -> None:
@@ -7860,9 +7981,9 @@ def test_dataclass_bindings_collect_each_spelling() -> None:
         "from dataclasses import dataclass as dc, field\nimport dataclasses, os\n"
         "import dataclasses as d2\nif x:\n    from dataclasses import dataclass\n",
     )
-    assert houselint_rules._dataclass_bindings(
+    assert rules._dataclass_bindings(
         tree,
-    ) == houselint_rules._DataclassBindings(
+    ) == rules._DataclassBindings(
         direct=frozenset({"dc", "dataclass"}),
         modules=frozenset({"dataclasses", "d2"}),
     )
@@ -7882,7 +8003,7 @@ def test_dataclass_bindings_collect_each_spelling() -> None:
     ],
 )
 def test_is_test_file(tmp_path: Path, name: str, *, expected: bool) -> None:
-    assert houselint_rules._is_test_file(tmp_path / name) is expected
+    assert rules._is_test_file(tmp_path / name) is expected
 
 
 @pytest.mark.parametrize(
@@ -7900,7 +8021,7 @@ def test_body_lines_spans_the_body_without_its_docstring(
 ) -> None:
     node = ast.parse(source).body[0]
     assert isinstance(node, ast.FunctionDef)
-    assert houselint_rules._body_lines(node) == lines
+    assert rules._body_lines(node) == lines
 
 
 @pytest.mark.parametrize(
@@ -7923,10 +8044,10 @@ def test_house_ignore_reads_only_the_statement_lines(
 ) -> None:
     path = tmp_path / "mod.py"
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     node = next(iter(unit.nodes(ast.Import, ast.ImportFrom)))
-    assert houselint_rules._house_ignore(unit, node, rule) is ignored
+    assert rules._house_ignore(unit, node, rule) is ignored
 
 
 @pytest.mark.parametrize(
@@ -7951,10 +8072,10 @@ def test_noqa_plc0415_reads_only_the_statement_lines(
 ) -> None:
     path = tmp_path / "mod.py"
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     node = next(iter(unit.nodes(ast.Import, ast.ImportFrom)))
-    assert houselint_rules._noqa_plc0415(unit, node) is suppressed
+    assert rules._noqa_plc0415(unit, node) is suppressed
 
 
 @pytest.mark.parametrize(
@@ -7993,9 +8114,9 @@ def test_nested_imports_exempt_guards_and_optional_imports(
 ) -> None:
     path = tmp_path / "mod.py"
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
-    assert [node.lineno for node in houselint_rules._nested_imports(unit)] == nested
+    assert [node.lineno for node in rules._nested_imports(unit)] == nested
 
 
 @pytest.mark.parametrize(
@@ -8014,7 +8135,7 @@ def test_nested_imports_exempt_guards_and_optional_imports(
 def test_is_knob_exempts_type_expressions(value: str, *, knob: bool) -> None:
     stmt = ast.parse(f"X = {value}\n").body[0]
     assert isinstance(stmt, ast.Assign)
-    assert houselint_rules._is_knob(stmt) is knob
+    assert rules._is_knob(stmt) is knob
 
 
 @pytest.mark.parametrize(
@@ -8034,7 +8155,7 @@ def test_is_knob_exempts_type_expressions(value: str, *, knob: bool) -> None:
 def test_is_knob_exempts_dunders_and_aliases(source: str, *, knob: bool) -> None:
     stmt = ast.parse(source).body[0]
     assert isinstance(stmt, ast.Assign | ast.AnnAssign)
-    assert houselint_rules._is_knob(stmt) is knob
+    assert rules._is_knob(stmt) is knob
 
 
 @pytest.mark.parametrize(
@@ -8054,7 +8175,7 @@ def test_constant_default_names_an_all_caps_reference(
 ) -> None:
     field = ast.parse(f"x: int = {value}\n").body[0]
     assert isinstance(field, ast.AnnAssign)
-    assert houselint_rules._constant_default(field) == constant
+    assert rules._constant_default(field) == constant
 
 
 @pytest.mark.parametrize(
@@ -8076,7 +8197,7 @@ def test_constant_default_names_an_all_caps_reference(
 )
 def test_inlineable_binding(source: str, binding: tuple[str, str] | None) -> None:
     stmt = ast.parse(source).body[0]
-    assert houselint_rules._inlineable_binding(stmt) == binding
+    assert rules._inlineable_binding(stmt) == binding
 
 
 @pytest.mark.parametrize(
@@ -8095,7 +8216,7 @@ def test_inlineable_binding(source: str, binding: tuple[str, str] | None) -> Non
     ],
 )
 def test_is_exempt_comment(text: str, *, exempt: bool) -> None:
-    assert houselint_rules._is_exempt_comment(text) is exempt
+    assert rules._is_exempt_comment(text) is exempt
 
 
 @pytest.mark.parametrize(
@@ -8104,7 +8225,7 @@ def test_is_exempt_comment(text: str, *, exempt: bool) -> None:
 )
 def test_comment_text_strips_hashes_and_space(source: str, text: str) -> None:
     tok = next(t for t in _tokenize(source) if t.string[:1] == "#")
-    assert houselint_rules._comment_text(tok) == text
+    assert rules._comment_text(tok) == text
 
 
 @pytest.mark.parametrize(
@@ -8123,7 +8244,7 @@ def test_comment_blocks_group_adjacent_full_line_comments(
     source: str,
     blocks: list[list[str]],
 ) -> None:
-    got = houselint_rules._comment_blocks(tuple(_tokenize(source)))
+    got = rules._comment_blocks(tuple(_tokenize(source)))
     assert [[tok.string for tok in block] for block in got] == blocks
 
 
@@ -8134,9 +8255,9 @@ def test_bound_names_cover_every_binding_kind(tmp_path: Path) -> None:
         "def f(p):\n    return q.r\nasync def g():\n    pass\n",
         encoding="utf-8",
     )
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
-    assert houselint_rules._bound_names(unit) == {
+    assert rules._bound_names(unit) == {
         "a",
         "e",
         "K",
@@ -8162,7 +8283,7 @@ def test_longest_import_prefers_the_longest_prefix(
     longest: tuple[str, ...] | None,
 ) -> None:
     dotted = {("a",), ("a", "b")}
-    assert houselint_rules._longest_import(chain, dotted=dotted) == longest
+    assert rules._longest_import(chain, dotted=dotted) == longest
 
 
 def test_import_alias_fix_splits_each_statement_at_its_indent(
@@ -8205,7 +8326,7 @@ def test_dotted_import_fix_splits_each_statement_at_its_indent(
     [("_x", True), ("_", False), ("__x__", False), ("__x", True), ("x", False)],
 )
 def test_is_underscored(name: str, *, underscored: bool) -> None:
-    assert houselint_rules._is_underscored(name) is underscored
+    assert rules._is_underscored(name) is underscored
 
 
 @pytest.mark.parametrize(
@@ -8223,7 +8344,7 @@ def test_is_underscored(name: str, *, underscored: bool) -> None:
 def test_is_triton_kernel(decorator: str, *, kernel: bool) -> None:
     node = ast.parse(f"{decorator}\ndef f():\n    pass\n").body[0]
     assert isinstance(node, ast.FunctionDef)
-    assert houselint_rules._is_triton_kernel(node) is kernel
+    assert rules._is_triton_kernel(node) is kernel
 
 
 @pytest.mark.parametrize(
@@ -8244,7 +8365,7 @@ def test_has_decorator_matches_the_last_segment(
 ) -> None:
     node = ast.parse(f"{decorators}\ndef f():\n    pass\n").body[0]
     assert isinstance(node, ast.FunctionDef)
-    assert houselint_rules._has_decorator(node, name) is has
+    assert rules._has_decorator(node, name) is has
 
 
 @pytest.mark.parametrize(
@@ -8263,7 +8384,7 @@ def test_escapes_when_used_as_a_value(source: str, *, escapes: bool) -> None:
     assert isinstance(outer, ast.FunctionDef)
     inner = outer.body[0]
     assert isinstance(inner, ast.FunctionDef)
-    assert houselint_rules._escapes(inner, outer) is escapes
+    assert rules._escapes(inner, outer) is escapes
 
 
 def test_direct_nested_defs_keep_walking_past_a_class() -> None:
@@ -8271,7 +8392,7 @@ def test_direct_nested_defs_keep_walking_past_a_class() -> None:
         "def o():\n    def a():\n        pass\n    class K:\n        pass\n",
     ).body[0]
     assert isinstance(outer, ast.FunctionDef)
-    assert [d.name for d in houselint_rules._direct_nested_defs(outer)] == ["a"]
+    assert [d.name for d in rules._direct_nested_defs(outer)] == ["a"]
 
 
 def test_direct_nested_defs_skip_classes_but_not_later_defs() -> None:
@@ -8281,7 +8402,7 @@ def test_direct_nested_defs_skip_classes_but_not_later_defs() -> None:
         "    def b():\n        def c():\n            pass\n",
     ).body[0]
     assert isinstance(outer, ast.FunctionDef)
-    names = sorted(d.name for d in houselint_rules._direct_nested_defs(outer))
+    names = sorted(d.name for d in rules._direct_nested_defs(outer))
     assert names == ["a", "b"]
 
 
@@ -8304,7 +8425,7 @@ def test_direct_nested_defs_skip_classes_but_not_later_defs() -> None:
     ],
 )
 def test_misplaced_privates(source: str, misplaced: list[tuple[str, str]]) -> None:
-    got = houselint_rules._misplaced_privates(ast.parse(source))
+    got = rules._misplaced_privates(ast.parse(source))
     assert [(node.name, public) for node, public in got] == misplaced
 
 
@@ -8332,7 +8453,7 @@ def test_cli_trailer_strips_only_newlines(
     lines: list[str],
     expected: list[str],
 ) -> None:
-    houselint_rules._fix_polyglot_trailer(lines)
+    rules._fix_polyglot_trailer(lines)
     assert lines == expected
 
 
@@ -8357,7 +8478,7 @@ def test_fix_main_returns_annotates_only_the_signature(
     main = tree.body[-1]
     assert isinstance(main, ast.FunctionDef)
     lines = source.splitlines(keepends=True)
-    houselint_rules._fix_main_returns(main, lines, noreturn=frozenset())
+    rules._fix_main_returns(main, lines, noreturn=frozenset())
     assert "".join(lines) == expected
 
 
@@ -8381,7 +8502,7 @@ def test_module_side_effects_strips_only_underscores_from_a_class_head(
 )
 def test_is_file_path_call(expr: str, *, matches: bool) -> None:
     node = ast.parse(expr, mode="eval").body
-    assert houselint_rules._is_file_path_call(node) is matches
+    assert rules._is_file_path_call(node) is matches
 
 
 @pytest.mark.parametrize(
@@ -8398,7 +8519,7 @@ def test_module_scope_loads_skip_only_function_bodies(
     source: str,
     loads: set[str],
 ) -> None:
-    assert houselint_rules._module_scope_loads(ast.parse(source)) == loads
+    assert rules._module_scope_loads(ast.parse(source)) == loads
 
 
 @pytest.mark.parametrize(
@@ -8413,7 +8534,7 @@ def test_module_scope_loads_skip_only_function_bodies(
 )
 def test_annotation_is_final(annotation: str, *, final: bool) -> None:
     node = ast.parse(annotation, mode="eval").body
-    assert houselint_rules._annotation_is_final(node) is final
+    assert rules._annotation_is_final(node) is final
 
 
 @pytest.mark.parametrize(
@@ -8422,7 +8543,7 @@ def test_annotation_is_final(annotation: str, *, final: bool) -> None:
 )
 def test_base_name_is_the_head_name(base: str, name: str) -> None:
     node = ast.parse(base, mode="eval").body
-    assert houselint_rules._base_name(node) == name
+    assert rules._base_name(node) == name
 
 
 @pytest.mark.parametrize(
@@ -8431,7 +8552,7 @@ def test_base_name_is_the_head_name(base: str, name: str) -> None:
 )
 def test_call_text_spells_the_dotted_callee(expr: str, text: str) -> None:
     node = ast.parse(expr, mode="eval").body
-    assert houselint_rules._call_text(node) == text
+    assert rules._call_text(node) == text
 
 
 # -- hlr_g01_test ----------------------------------------------------------
@@ -8440,7 +8561,7 @@ def test_call_text_spells_the_dotted_callee(expr: str, text: str) -> None:
 def _footer_messages(tmp_path: Path, source: str) -> list[tuple[int, str]]:
     path = tmp_path / "sample_test.py"
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     return [
         (finding.line, finding.message) for finding in PytestFooterRule().check(unit)
@@ -8455,7 +8576,7 @@ def _footer_fixed(
 ) -> str | None:
     path = tmp_path / name
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     return PytestFooterRule().fix(unit)
 
@@ -8553,9 +8674,7 @@ def test_single_use_helper_scans_past_non_function_statements() -> None:
         source="VALUE = 1\ndef _helper(x):\n    return x + 1\ndef run():\n    return _helper(2)\n",
         kind="python",
     )
-    assert [
-        helper.node.name for helper in houselint_rules._single_use_helpers(unit)
-    ] == [
+    assert [helper.node.name for helper in rules._single_use_helpers(unit)] == [
         "_helper",
     ]
 
@@ -8573,16 +8692,14 @@ def test_single_use_helper_name_filter_and_signature_exclusions() -> None:
     )
     ast.parse(source)
     unit = Unit(path=Path("mod.py"), source=source, kind="python")
-    assert [
-        helper.node.name for helper in houselint_rules._single_use_helpers(unit)
-    ] == [
+    assert [helper.node.name for helper in rules._single_use_helpers(unit)] == [
         "_single",
     ]
 
 
 def test_single_call_returns_none_when_name_is_absent() -> None:
     unit = Unit(path=Path("mod.py"), source="def run():\n    return 1\n", kind="python")
-    assert houselint_rules._single_call(unit, "_missing") is None
+    assert rules._single_call(unit, "_missing") is None
 
 
 def test_single_call_rejects_name_not_used_as_direct_callee() -> None:
@@ -8591,7 +8708,7 @@ def test_single_call_rejects_name_not_used_as_direct_callee() -> None:
         source="def _helper():\n    return 1\nvalue = _helper\n",
         kind="python",
     )
-    assert houselint_rules._single_call(unit, "_helper") is None
+    assert rules._single_call(unit, "_helper") is None
 
 
 def test_single_use_helper_fix_skips_bad_site_and_continues(tmp_path: Path) -> None:
@@ -8603,7 +8720,7 @@ def test_single_use_helper_fix_skips_bad_site_and_continues(tmp_path: Path) -> N
     path = tmp_path / "mod.py"
     path.write_text(source, encoding="utf-8")
     unit = Unit(path=path, source=source, kind="python")
-    fixed = houselint_rules.SingleUseHelperRule().fix(unit)
+    fixed = rules.SingleUseHelperRule().fix(unit)
     assert (
         fixed
         == "def f(a, items):\n    _unsafe(*items)\n    return a * 2\n\n\ndef _unsafe(x):\n    return x + 1\n"
@@ -8619,9 +8736,7 @@ def test_single_use_helper_fix_uses_exact_output_and_preserves_trailing_newline(
     path = tmp_path / "mod.py"
     path.write_text(source, encoding="utf-8")
     unit = Unit(path=path, source=source, kind="python")
-    assert houselint_rules.SingleUseHelperRule().fix(unit) == (
-        "def f(x):\n    return x * 2\n"
-    )
+    assert rules.SingleUseHelperRule().fix(unit) == ("def f(x):\n    return x * 2\n")
 
 
 def test_single_use_helper_skips_each_ineligible_signature_and_body(
@@ -8642,7 +8757,7 @@ def test_single_use_helper_skips_each_ineligible_signature_and_body(
     )
     path = tmp_path / "mod.py"
     path.write_text(source, encoding="utf-8")
-    helpers = houselint_rules._single_use_helpers(
+    helpers = rules._single_use_helpers(
         Unit(path=path, source=source, kind="python"),
     )
     assert [helper.node.name for helper in helpers] == ["_after"]
@@ -8658,7 +8773,7 @@ def test_single_use_helper_fix_keeps_later_independent_edit(tmp_path: Path) -> N
     path = tmp_path / "mod.py"
     path.write_text(source, encoding="utf-8")
     unit = Unit(path=path, source=source, kind="python")
-    assert houselint_rules.SingleUseHelperRule().fix(unit) == (
+    assert rules.SingleUseHelperRule().fix(unit) == (
         "def f(x):\n    return x * 2\n\n\ndef g(x):\n    return x + 1\n"
     )
 
@@ -8669,7 +8784,7 @@ def test_single_call_ignores_other_names_before_requested_name() -> None:
         source="def _first():\n    return 1\ndef run():\n    return _second()\n",
         kind="python",
     )
-    call = houselint_rules._single_call(unit, "_second")
+    call = rules._single_call(unit, "_second")
     assert call is not None
     assert ast.unparse(call) == "_second()"
 
@@ -8680,7 +8795,7 @@ def test_single_use_helper_without_a_definition_is_clean() -> None:
         source="value = 2\n",
         kind="python",
     )
-    assert houselint_rules._single_use_helpers(unit) == []
+    assert rules._single_use_helpers(unit) == []
 
 
 def test_single_use_helper_rejects_empty_body_after_docstring() -> None:
@@ -8690,9 +8805,7 @@ def test_single_use_helper_rejects_empty_body_after_docstring() -> None:
         "def run():\n    _empty()\n    return _value()\n"
     )
     unit = Unit(path=Path("mod.py"), source=source, kind="python")
-    assert [
-        helper.node.name for helper in houselint_rules._single_use_helpers(unit)
-    ] == [
+    assert [helper.node.name for helper in rules._single_use_helpers(unit)] == [
         "_value",
     ]
 
@@ -8702,7 +8815,7 @@ def test_single_use_helper_fix_preserves_trailing_spaces(tmp_path: Path) -> None
     path = tmp_path / "mod.py"
     path.write_text(source, encoding="utf-8")
     assert (
-        houselint_rules.SingleUseHelperRule().fix(
+        rules.SingleUseHelperRule().fix(
             Unit(path=path, source=source, kind="python"),
         )
         == "def f():\n    return 1\n\n\n# tail   \n"
@@ -8714,7 +8827,7 @@ def test_single_use_helper_fix_preserves_trailing_marker(tmp_path: Path) -> None
     path = tmp_path / "mod.py"
     path.write_text(source, encoding="utf-8")
     assert (
-        houselint_rules.SingleUseHelperRule().fix(
+        rules.SingleUseHelperRule().fix(
             Unit(path=path, source=source, kind="python"),
         )
         == "def f():\n    return 1\n\n\n# X\n"
@@ -8726,7 +8839,7 @@ def test_single_use_helper_fix_allows_abutting_edits(tmp_path: Path) -> None:
     path = tmp_path / "mod.py"
     path.write_text(source, encoding="utf-8")
     assert (
-        houselint_rules.SingleUseHelperRule().fix(
+        rules.SingleUseHelperRule().fix(
             Unit(path=path, source=source, kind="python"),
         )
         == "2\nprint(1)\n"
@@ -8745,7 +8858,7 @@ def test_single_use_helper_fix_continues_after_overlapping_edits(
     )
     path = tmp_path / "mod.py"
     path.write_text(source, encoding="utf-8")
-    assert houselint_rules.SingleUseHelperRule().fix(
+    assert rules.SingleUseHelperRule().fix(
         Unit(path=path, source=source, kind="python"),
     ) == (
         "def run(x):\n    return _inner(x) - 1\n\n\n"
@@ -8759,7 +8872,7 @@ def test_single_use_helper_fix_continues_after_overlapping_edits(
 
 def test_private_docstring_splits_at_the_first_sentence() -> None:
     text = "First sentence is deliberately long. Second sentence. Third sentence."
-    assert houselint_rules._split_private_docstring(
+    assert rules._split_private_docstring(
         text,
         summary_width=20,
         comment_width=88,
@@ -8780,7 +8893,7 @@ def test_private_docstring_skips_sections_and_keeps_following_prose() -> None:
         "\n"
         "  Indented prose survives after rationale.\n"
     )
-    assert houselint_rules._split_private_docstring(
+    assert rules._split_private_docstring(
         text,
         summary_width=88,
         comment_width=88,
@@ -8796,7 +8909,7 @@ def test_private_docstring_skips_sections_and_keeps_following_prose() -> None:
 
 def test_private_docstring_section_detection_uses_the_whole_head_line() -> None:
     text = "Summary.\n\nArgs: explanatory prose\n\nRationale survives."
-    assert houselint_rules._split_private_docstring(
+    assert rules._split_private_docstring(
         text,
         summary_width=88,
         comment_width=88,
@@ -8805,7 +8918,7 @@ def test_private_docstring_section_detection_uses_the_whole_head_line() -> None:
 
 def test_private_docstring_section_detection_uses_the_first_line() -> None:
     text = "Summary.\n\nOpening prose\nArgs:\n  x: ignored\n\nRationale survives."
-    assert houselint_rules._split_private_docstring(
+    assert rules._split_private_docstring(
         text,
         summary_width=88,
         comment_width=88,
@@ -8820,7 +8933,7 @@ def test_private_oneliner_wraps_summary_at_its_actual_column(tmp_path: Path) -> 
     source = f'def _f():\n    """{summary}\n\n    """\n'
     path = tmp_path / "module.py"
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert PrivateOnelinerRule().fix(unit) == (
         'def _f():\n    """A sentence that has enough words to overflow the summary width."""\n'
@@ -8829,7 +8942,7 @@ def test_private_oneliner_wraps_summary_at_its_actual_column(tmp_path: Path) -> 
 
 def test_private_docstring_keeps_indented_prose_before_a_later_section() -> None:
     text = "Summary.\n\n    Rationale.\n\nLater prose."
-    assert houselint_rules._split_private_docstring(
+    assert rules._split_private_docstring(
         text,
         summary_width=88,
         comment_width=88,
@@ -8838,7 +8951,7 @@ def test_private_docstring_keeps_indented_prose_before_a_later_section() -> None
 
 def test_private_docstring_section_detection_ignores_later_lines() -> None:
     text = "Summary.\n\nArgs:\n  x: ignored\n  y: ignored\n\nRationale."
-    assert houselint_rules._split_private_docstring(
+    assert rules._split_private_docstring(
         text,
         summary_width=88,
         comment_width=88,
@@ -8856,7 +8969,7 @@ def test_private_oneliner_comment_width_boundaries(tmp_path: Path) -> None:
     )
     path = tmp_path / "module.py"
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert PrivateOnelinerRule().fix(unit) == (
         f"# {rationale_86}\n"
@@ -8871,7 +8984,7 @@ def test_private_oneliner_summary_width_tracks_docstring_column(tmp_path: Path) 
     source = f'def _outer():\n    def _f():\n        """{summary}\n\n        """\n'
     path = tmp_path / "module.py"
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert PrivateOnelinerRule().fix(unit) == (
         f'def _outer():\n    # Tail.\n    def _f():\n        """{"A" * 68}"""\n'
@@ -8882,7 +8995,7 @@ def test_private_oneliner_uses_docstring_line_indentation(tmp_path: Path) -> Non
     source = 'def _f():\n    """Summary.\n\n        Rationale.\n  """\n'
     path = tmp_path / "module.py"
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert PrivateOnelinerRule().fix(unit) == (
         '# Rationale.\ndef _f():\n    """Summary."""\n'
@@ -8895,7 +9008,7 @@ def test_private_oneliner_uses_docstring_line_indentation(tmp_path: Path) -> Non
 def test_assert_check_message_is_exact(tmp_path: Path) -> None:
     path = tmp_path / "mod.py"
     path.write_text("assert ready\n", encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert [
         (finding.line, finding.message) for finding in AssertRule().check(unit)
@@ -8920,7 +9033,7 @@ def test_assert_fix_continues_after_a_narrowing_assert(tmp_path: Path) -> None:
         "assert done\n"
     )
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert AssertRule().fix(unit) == (
         "assert isinstance(value, int)\n"
@@ -8946,7 +9059,7 @@ def test_assert_fix_skips_unrewritable_sites_and_keeps_later_sites(
         "assert later\n"
     )
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert AssertRule().fix(unit) == (
         "header = 1\n"
@@ -8966,7 +9079,7 @@ def test_assert_fix_uses_the_original_text_for_single_line_tests(
     path = tmp_path / "mod.py"
     source = "header = 1\nassert (left + right)\n"
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert AssertRule().fix(unit) == (
         "header = 1\n"
@@ -8979,7 +9092,7 @@ def test_assert_fix_quotes_expected_messages_with_embedded_quotes(
 ) -> None:
     path = tmp_path / "mod.py"
     path.write_text('assert value == "ready"\n', encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert AssertRule().fix(unit) == (
         "if value != 'ready':\n    raise ValueError('Expected value == \"ready\".')\n"
@@ -8996,7 +9109,7 @@ def _annotation_messages(
 ) -> list[tuple[int, str]]:
     path = tmp_path / "mod.py"
     path.write_text(body, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     return [(finding.line, finding.message) for finding in rule.check(unit)]
 
@@ -9112,7 +9225,7 @@ def test_annotation_import_skips_an_unparseable_import_file(tmp_path: Path) -> N
     body = "import \\\n"
     path = tmp_path / "mod.py"
     path.write_text(body, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert unit.tree is None
     assert AnnotationImportRule().check(unit) == ()
@@ -9128,7 +9241,7 @@ def test_name_usage_separates_annotation_and_runtime_contexts() -> None:
         "else:\n"
         "    I\n",
     )
-    usage = houselint_rules._name_usage(tree)
+    usage = rules._name_usage(tree)
     assert {
         name: (counts.annotation, counts.runtime) for name, counts in usage.items()
     } == {
@@ -9148,7 +9261,7 @@ def test_name_usage_separates_annotation_and_runtime_contexts() -> None:
 
 def test_usage_walk_adds_repeated_name_counts() -> None:
     tree = ast.parse("x + x")
-    walker = houselint_rules._UsageWalk()
+    walker = rules._UsageWalk()
     walker.visit(tree)
     assert walker.runtime == {"x": 2}
     assert walker.annotation == {}
@@ -9156,7 +9269,7 @@ def test_usage_walk_adds_repeated_name_counts() -> None:
 
 def test_type_checking_else_preserves_annotation_context() -> None:
     tree = ast.parse("if TYPE_CHECKING:\n    pass\nelse:\n    fallback\n")
-    walker = houselint_rules._UsageWalk()
+    walker = rules._UsageWalk()
     walker.visit(tree, in_annotation=True)
     assert walker.annotation == {"fallback": 1}
     assert walker.runtime == {}
@@ -9185,7 +9298,7 @@ def test_runtime_imports_distinguishes_roots_aliases_and_wildcards() -> None:
         "from package.typing_extensions import value\n"
         "from package.submodule import *\n",
     )
-    assert houselint_rules._runtime_imports(tree) == {
+    assert rules._runtime_imports(tree) == {
         "foo": (2, "foo.typing_extensions"),
         "package": (3, "package.submodule"),
         "value": (4, "package.typing_extensions.value"),
@@ -9194,7 +9307,7 @@ def test_runtime_imports_distinguishes_roots_aliases_and_wildcards() -> None:
 
 def test_runtime_imports_skips_only_annotation_aliases() -> None:
     tree = ast.parse("import typing_extensions, package\n")
-    assert houselint_rules._runtime_imports(tree) == {"package": (1, "package")}
+    assert rules._runtime_imports(tree) == {"package": (1, "package")}
 
 
 def test_runtime_imports_skips_annotation_module_roots() -> None:
@@ -9202,7 +9315,7 @@ def test_runtime_imports_skips_annotation_module_roots() -> None:
         "from typing_extensions.foo.bar import annotation\n"
         "from package.typing_extensions import value\n",
     )
-    assert houselint_rules._runtime_imports(tree) == {
+    assert rules._runtime_imports(tree) == {
         "value": (2, "package.typing_extensions.value"),
     }
 
@@ -9212,13 +9325,13 @@ def test_runtime_imports_continues_after_wildcard_alias() -> None:
     node = tree.body[0]
     assert isinstance(node, ast.ImportFrom)
     node.names.append(ast.alias(name="value"))
-    assert houselint_rules._runtime_imports(tree) == {"value": (1, "package.value")}
+    assert rules._runtime_imports(tree) == {"value": (1, "package.value")}
 
 
 def test_import_alias_claims_keep_each_module_path_segment(tmp_path: Path) -> None:
     path = tmp_path / "mod.py"
     path.write_text("from loop.pkg import item as renamed\n", encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     tree = unit.tree
     assert tree is not None
@@ -9257,7 +9370,7 @@ def test_import_alias_first_party_uses_first_module_segment() -> None:
 def test_import_alias_uses_top_level_first_party_package(tmp_path: Path) -> None:
     path = tmp_path / "mod.py"
     path.write_text("import loop.subpackage.module as local\n", encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     rule = ImportAliasRule()
     tree = unit.tree
@@ -9296,14 +9409,14 @@ def _cost_messages(
 ) -> list[tuple[int, str]]:
     path = tmp_path / "module.py"
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     return [(finding.line, finding.message) for finding in rule.check(unit)]
 
 
 def test_regroup_continues_after_short_and_nondecimal_tokens() -> None:
     assert (
-        houselint_rules._regroup(
+        rules._regroup(
             "a = 1234 + 12345 + 0x12345\nb = 67890\n",
             tuple(_tokenize("a = 1234 + 12345 + 0x12345\nb = 67890\n")),
             5,
@@ -9314,7 +9427,7 @@ def test_regroup_continues_after_short_and_nondecimal_tokens() -> None:
 
 def test_regroup_does_not_rewrite_underscored_numbers() -> None:
     assert (
-        houselint_rules._regroup(
+        rules._regroup(
             "a = 12_345\nb = 67890\n",
             tuple(_tokenize("a = 12_345\nb = 67890\n")),
             5,
@@ -9459,7 +9572,7 @@ def test_fixes_preserve_exact_text(
 ) -> None:
     path = tmp_path / "mod.py"
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert rule.fix(unit) == expected
 
@@ -9470,7 +9583,7 @@ def test_logging_fstring_skips_a_call_with_extra_args_and_continues(
     source = 'logger.info(f"first {x}", other)\nlogger.info(f"second {y}")\n'
     path = tmp_path / "mod.py"
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert LoggingFstringRule().fix(unit) == (
         'logger.info(f"first {x}", other)\nlogger.info("second %s", y)\n'
@@ -9483,7 +9596,7 @@ def test_logging_fstring_edits_multiple_calls_from_right_to_left(
     source = 'logger.info(f"first {x}")\nlogger.info(f"second {y}")\n'
     path = tmp_path / "mod.py"
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert LoggingFstringRule().fix(unit) == (
         'logger.info("first %s", x)\nlogger.info("second %s", y)\n'
@@ -9706,7 +9819,7 @@ def _unit(tmp_path: Path, source: str, *, name: str = "mod.py") -> Unit:
     """Build a Unit from source saved below ``tmp_path``."""
     path = tmp_path / name
     path.write_text(source, encoding="utf-8")
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     return unit
 
@@ -9897,7 +10010,7 @@ class Example:
     following = 4
 '''
 
-    fixed = houselint_rules.AttrBlankLineRule().fix(_unit(tmp_path, source))
+    fixed = rules.AttrBlankLineRule().fix(_unit(tmp_path, source))
 
     assert (
         fixed
@@ -10159,7 +10272,7 @@ def test_insert_cls_starts_at_the_def_line_not_the_line_above() -> None:
     assert isinstance(node, ast.FunctionDef)
     lines = [str(line) for line in source.splitlines(keepends=True)]
 
-    houselint_rules._insert_cls(lines, node)
+    rules._insert_cls(lines, node)
 
     assert "".join(lines) == "x = f(1)\ndef g(cls, *a):\n    return a\n"
 
@@ -10338,7 +10451,7 @@ def test_zero_arg_super_ignores_nested_class_calls() -> None:
     )
     outer = tree.body[0]
     assert isinstance(outer, ast.ClassDef)
-    assert houselint_rules._zero_arg_supers(outer) == (3,)
+    assert rules._zero_arg_supers(outer) == (3,)
 
 
 def test_dataclass_message_lists_each_missing_kwarg(tmp_path: Path) -> None:
@@ -10378,7 +10491,7 @@ def test_wrong_parser_descriptions_continue_past_nonparser_call() -> None:
     )
     assert [
         call.lineno
-        for call, _ in houselint_rules._wrong_descriptions(
+        for call, _ in rules._wrong_descriptions(
             unit,
             polyglot=False,
         )
@@ -10437,7 +10550,7 @@ def test_cwd_final_fix_requires_the_exact_path_import(tmp_path: Path) -> None:
         "value = Path(__file__).resolve().parent\n",
         encoding="utf-8",
     )
-    unit = houselint.read_unit(path)
+    unit = checker.read_unit(path)
     assert isinstance(unit, Unit)
     assert CwdFinalRule().fix(unit) is None
 
@@ -10747,13 +10860,13 @@ def test_dotted_import_beside_another_binder_rewrites_reads_it_precedes(
 
 def test_a_node_outside_every_statement_is_not_an_annotation() -> None:
     tree = ast.parse("x: int = 1\n")
-    assert not houselint_rules._in_annotation(tree, parents={})
+    assert not rules._in_annotation(tree, parents={})
 
 
 def test_the_module_itself_is_not_at_module_scope() -> None:
     """Only a node the module holds is at its scope; the module has no parent."""
     tree = ast.parse("x = 1\n")
-    assert not houselint_rules._is_module_scope(tree, {})
+    assert not rules._is_module_scope(tree, {})
 
 
 if __name__ == "__main__":

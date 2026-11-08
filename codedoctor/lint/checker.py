@@ -4,15 +4,15 @@
 Paths work as in ruff: none means the current directory, a directory means
 every .py, .pyi, and .ipynb file under it outside hidden directories and
 .gitignore patterns, and a named file is linted as given. Flag defaults come
-from [tool.houselint] in the nearest pyproject.toml; flags override them, and
+from [tool.codedoctor.lint] in the nearest pyproject.toml; flags override them, and
 --exclude and --set add to them.
 
 Examples:
-  houselint                                 lint the working tree
-  houselint --fix ''                        report only, rewrite nothing
-  houselint --select digits pkg/lib         one rule, one directory
-  houselint --set digits.min-digits=6       change a rule setting
-  houselint --exclude '*_test.py = globals nested-def'
+  codedoctor lint                                 lint the working tree
+  codedoctor lint --fix ''                        report only, rewrite nothing
+  codedoctor lint --select digits pkg/lib         one rule, one directory
+  codedoctor lint --set digits.min-digits=6       change a rule setting
+  codedoctor lint --exclude '*_test.py = globals nested-def'
 
 Exit status: 0 clean, 1 findings remain, 2 usage error.
 
@@ -46,8 +46,8 @@ from treekle import from_plain
 from codedoctor.lib import pyproject_flags
 from codedoctor.lib.files import walk
 from codedoctor.lib.worker_count import capped_workers, default_workers, worker_count
-from codedoctor.lint import house_ignore, houselint_rules
-from codedoctor.lint.houselint_types import Finding, Unit
+from codedoctor.lint import house_ignore, rules
+from codedoctor.lint.custom_types import Finding, Unit
 
 
 _DESCRIPTION: Final = (__doc__ or "").strip()
@@ -82,12 +82,12 @@ class Exclusion:
 
 
 class FixError(RuntimeError):
-    """A rule's ``fix`` returned source that no longer parses: a houselint bug."""
+    """A rule's ``fix`` returned source that no longer parses: a codedoctor lint bug."""
 
 
 @runtime_checkable
 class Rule(Protocol):
-    """A configurable houselint rule. Every member is required.
+    """A configurable codedoctor lint rule. Every member is required.
 
     Settings are the implementing dataclass's own fields, so they are typed,
     defaulted, and documented in one place. The four ClassVars below are
@@ -143,7 +143,7 @@ class Rule(Protocol):
 
         Must be idempotent -- feeding its own output back returns None.
         ``run`` relies on that to be a single pass rather than a fixpoint
-        loop, and ``houselint_test`` asserts it per rule. Output that no
+        loop, and ``checker_test`` asserts it per rule. Output that no
         longer parses raises ``FixError`` and is never written.
 
         Args:
@@ -164,10 +164,10 @@ def default_rules() -> tuple[Rule, ...]:
     without monkeypatching an attribute.
 
     The order is not a fix-application order: ``run`` applies fixes in
-    ``active`` order, which ``houselint_test`` pins with two fixers of its
+    ``active`` order, which ``checker_test`` pins with two fixers of its
     own -- the guarantee lives there, where it can be checked.
 
-    ``houselint_rules`` owns the registered rule implementations; importing
+    ``rules`` owns the registered rule implementations; importing
     it at module load time is safe because shared types live below both modules.
 
     Returns:
@@ -178,57 +178,57 @@ def default_rules() -> tuple[Rule, ...]:
     return cast(
         tuple[Rule, ...],
         (
-            houselint_rules.DataclassRule(),
-            houselint_rules.StaticMethodRule(),
-            houselint_rules.ConfigGlobalsRule(),
-            houselint_rules.DigitsRule(),
-            houselint_rules.EmDashRule(),
-            houselint_rules.PytestFooterRule(),
-            houselint_rules.PytestNamingRule(),
-            houselint_rules.XdgLiteralRule(),
-            houselint_rules.UserdirsNamespaceRule(),
-            houselint_rules.UserdirsWrapperRule(),
-            houselint_rules.CacheKwargRule(),
-            houselint_rules.LazyImportBindingRule(),
-            houselint_rules.TmpLiteralRule(),
-            houselint_rules.TempfilePrefixRule(),
-            houselint_rules.CwdFinalRule(),
-            houselint_rules.ImportAliasRule(),
-            houselint_rules.ImportHoistRule(),
-            houselint_rules.DottedImportRule(),
-            houselint_rules.NestedDefRule(),
-            houselint_rules.GetLoggerNameRule(),
-            houselint_rules.NestedTryRule(),
-            houselint_rules.NegativeBoolParamRule(),
-            houselint_rules.FluentNameRule(),
-            houselint_rules.AllReexportRule(),
-            houselint_rules.InitFacadeRule(),
-            houselint_rules.DefOrderRule(),
-            houselint_rules.ModuleSideEffectsRule(),
-            houselint_rules.UnderscoreParamRule(),
-            houselint_rules.NegatedCompareRule(),
-            houselint_rules.NegatedTernaryRule(),
-            houselint_rules.SuperOnlyRule(),
-            houselint_rules.TensorValueGuardRule(),
-            houselint_rules.MkdirModeRule(),
-            houselint_rules.ReturnsNamedRule(),
-            houselint_rules.ArgsSectionRule(),
-            houselint_rules.ReturnsSectionRule(),
-            houselint_rules.PrivateOnelinerRule(),
-            houselint_rules.AttrBlankLineRule(),
-            houselint_rules.AttrDocFormRule(),
-            houselint_rules.CommentSentenceRule(),
-            houselint_rules.CliShapeRule(),
-            houselint_rules.SuppressionFormRule(),
-            houselint_rules.FmtDirectiveRule(),
-            houselint_rules.AnnotationImportRule(),
-            houselint_rules.FinalInlineRule(),
-            houselint_rules.SingleUseHelperRule(),
-            houselint_rules.ForwarderHelperRule(),
-            houselint_rules.LazyImportCostRule(),
-            houselint_rules.AssertRule(),
-            houselint_rules.TreekleTorchLoadRule(),
-            houselint_rules.LoggingFstringRule(),
+            rules.DataclassRule(),
+            rules.StaticMethodRule(),
+            rules.ConfigGlobalsRule(),
+            rules.DigitsRule(),
+            rules.EmDashRule(),
+            rules.PytestFooterRule(),
+            rules.PytestNamingRule(),
+            rules.XdgLiteralRule(),
+            rules.UserdirsNamespaceRule(),
+            rules.UserdirsWrapperRule(),
+            rules.CacheKwargRule(),
+            rules.LazyImportBindingRule(),
+            rules.TmpLiteralRule(),
+            rules.TempfilePrefixRule(),
+            rules.CwdFinalRule(),
+            rules.ImportAliasRule(),
+            rules.ImportHoistRule(),
+            rules.DottedImportRule(),
+            rules.NestedDefRule(),
+            rules.GetLoggerNameRule(),
+            rules.NestedTryRule(),
+            rules.NegativeBoolParamRule(),
+            rules.FluentNameRule(),
+            rules.AllReexportRule(),
+            rules.InitFacadeRule(),
+            rules.DefOrderRule(),
+            rules.ModuleSideEffectsRule(),
+            rules.UnderscoreParamRule(),
+            rules.NegatedCompareRule(),
+            rules.NegatedTernaryRule(),
+            rules.SuperOnlyRule(),
+            rules.TensorValueGuardRule(),
+            rules.MkdirModeRule(),
+            rules.ReturnsNamedRule(),
+            rules.ArgsSectionRule(),
+            rules.ReturnsSectionRule(),
+            rules.PrivateOnelinerRule(),
+            rules.AttrBlankLineRule(),
+            rules.AttrDocFormRule(),
+            rules.CommentSentenceRule(),
+            rules.CliShapeRule(),
+            rules.SuppressionFormRule(),
+            rules.FmtDirectiveRule(),
+            rules.AnnotationImportRule(),
+            rules.FinalInlineRule(),
+            rules.SingleUseHelperRule(),
+            rules.ForwarderHelperRule(),
+            rules.LazyImportCostRule(),
+            rules.AssertRule(),
+            rules.TreekleTorchLoadRule(),
+            rules.LoggingFstringRule(),
         ),
     )
     # pragma: no mutate end
@@ -307,7 +307,12 @@ def run(
     return tuple(findings), tuple(compress(paths, (wrote for _, wrote in results)))
 
 
-def read_unit(path: Path, /, *, reporter: str = "houselint") -> Unit | Finding | None:
+def read_unit(
+    path: Path,
+    /,
+    *,
+    reporter: str = "codedoctor lint",
+) -> Unit | Finding | None:
     """Build a Unit carrying every view its kind admits, or say why it could not.
 
     Takes no view selection. A ``.py`` or ``.pyi`` file gets all three views;
@@ -384,7 +389,7 @@ def main() -> int:
     )
     # pragma: no mutate end
     _add_arguments(parser)
-    namespace, root = pyproject_flags.parse_args(parser, tool="houselint")
+    namespace, root = pyproject_flags.parse_args(parser, tool="codedoctor.lint")
     # pragma: no mutate start -- a cast is a no-op at runtime.
     flags = cast(_Flags, namespace)
     # pragma: no mutate end
@@ -742,7 +747,7 @@ def _lint_path(
                 Finding(
                     path=path,
                     line=1,
-                    rule="houselint",
+                    rule="codedoctor lint",
                     message=f"cannot write: {err.strerror or err}",
                 ),
             )
@@ -784,7 +789,7 @@ def _raise_fix_error(rule: str, path: Path, rewritten: str) -> NoReturn:
     except SyntaxError as err:
         raise FixError(
             f"{rule} fix produced unparseable source for {path}; "
-            f"fix the rule in houselint_rules.py ({err.msg}, line {err.lineno})",
+            f"fix the rule in rules.py ({err.msg}, line {err.lineno})",
         ) from err
     raise AssertionError(rewritten)
 

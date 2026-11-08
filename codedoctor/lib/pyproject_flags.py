@@ -121,10 +121,13 @@ def _find_table(
             tools = from_plain(document.get("tool"), dict[str, object], default={})
         except ReadError:
             parser.error(f"{path} [tool]: expected a table")
-        if tool not in tools:
-            continue
-        try:
-            return from_plain(tools[tool], dict[str, object]), path
-        except ReadError:
-            parser.error(f"{path} [tool.{tool}]: expected a table")
+        for segment in tool.split("."):
+            if segment not in tools:
+                break
+            try:
+                tools = from_plain(tools[segment], dict[str, object])
+            except ReadError:
+                parser.error(f"{path} [tool.{tool}]: expected a table")
+        else:
+            return tools, path
     return None

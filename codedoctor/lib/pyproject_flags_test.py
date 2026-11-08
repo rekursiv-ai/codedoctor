@@ -308,6 +308,44 @@ def test_an_int_is_not_accepted_for_a_bool_flag(
     assert "strict: expected bool, got int" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("body", ["", "[tool.codedoctor]\nmanaged = {}\n"])
+def test_nested_table_defaults_survive_nearer_unrelated_configuration(
+    tmp_path: Path,
+    body: str,
+) -> None:
+    _pyproject(tmp_path, '[tool.codedoctor.lint]\nselect = "outer"\n')
+    _pyproject(tmp_path / "inner", body)
+    flags, root = pyproject_flags.parse_args(
+        _parser(),
+        tool="codedoctor.lint",
+        argv=[],
+        start=tmp_path / "inner",
+    )
+    assert vars(flags)["select"] == "outer"
+    assert root == tmp_path
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["[tool]\ncodedoctor = 1\n", "[tool.codedoctor]\nlint = 1\n"],
+)
+def test_nested_non_table_configuration_is_rejected(
+    tmp_path: Path,
+    body: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _pyproject(tmp_path, body)
+    with pytest.raises(SystemExit) as result:
+        pyproject_flags.parse_args(
+            _parser(),
+            tool="codedoctor.lint",
+            argv=[],
+            start=tmp_path,
+        )
+    assert result.value.code == 2
+    assert "expected a table" in capsys.readouterr().err
+
+
 if __name__ == "__main__":
     from codedoctor.lib.testing.runner import test_main
 

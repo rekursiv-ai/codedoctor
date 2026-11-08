@@ -1,4 +1,4 @@
-"""Tests for the ``house-ignore`` marker shared by houselint and the hooks."""
+"""Tests for the ``house-ignore`` marker shared by codedoctor lint and the hooks."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import ast
 import pytest
 
 from codedoctor.lint import house_ignore
-from codedoctor.lint.houselint_types import Finding, Unit
+from codedoctor.lint.custom_types import Finding, Unit
 
 
 def test_empty_match_header_has_a_single_line_range() -> None:
@@ -98,13 +98,13 @@ def test_a_malformed_marker_names_the_unit_and_says_what_is_missing() -> None:
         Finding(
             path=unit.path,
             line=1,
-            rule="houselint",
+            rule="codedoctor lint",
             message="house-ignore[...] names no rule; a bare marker suppresses nothing",
         ),
         Finding(
             path=unit.path,
             line=1,
-            rule="houselint",
+            rule="codedoctor lint",
             message="house-ignore[...] needs a trailing `-- Reason.`",
         ),
     ]
@@ -218,7 +218,7 @@ def test_a_marker_suppressing_nothing_is_reported_once_its_rule_ran(
 ) -> None:
     unit = _unit(source)
     assert house_ignore.apply(unit, [], active=frozenset({"r"})) == [
-        Finding(path=Path("mod.py"), line=1, rule="houselint", message=message),
+        Finding(path=Path("mod.py"), line=1, rule="codedoctor lint", message=message),
     ]
     assert house_ignore.apply(unit, [], active=frozenset({"other"})) == []
 

@@ -1,4 +1,4 @@
-"""The ``house-ignore`` marker every house check honors, houselint's and the hooks'.
+"""The ``house-ignore`` marker every house check honors, codedoctor lint's and the hooks'.
 
 One marker for every rule. Its POSITION decides its scope, as ruff's ``noqa`` vs
 ``ruff: noqa`` does: a marker trailing code covers that statement; one on a line
@@ -18,13 +18,13 @@ import ast
 import re
 import tokenize
 
-from codedoctor.lint.houselint_types import Finding
+from codedoctor.lint.custom_types import Finding
 
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping, Sequence
 
-    from codedoctor.lint.houselint_types import Unit
+    from codedoctor.lint.custom_types import Unit
 
 
 IGNORE = re.compile(r"#\s*house-ignore\[([^\]]*)\](.*)$")
@@ -69,13 +69,13 @@ def apply(
         else:
             kept.append(finding)
     # A marker naming a rule that reports nothing there has rotted -- the code
-    # was fixed and the marker outlived it. Reported as ``houselint`` so the
+    # was fixed and the marker outlived it. Reported as ``codedoctor lint`` so the
     # marker cannot silence the complaint about itself.
     kept.extend(
         Finding(
             path=unit.path,
             line=line,
-            rule="houselint",
+            rule="codedoctor lint",
             message=(
                 f"superfluous file-level ignore: {name!r} reports nothing here; "
                 "remove it from the own-line house-ignore[...]"
@@ -89,7 +89,7 @@ def apply(
         Finding(
             path=unit.path,
             line=line,
-            rule="houselint",
+            rule="codedoctor lint",
             message=(
                 f"superfluous inline ignore: {name!r} reports nothing on this "
                 "statement; remove it from house-ignore[...]"
@@ -135,7 +135,7 @@ def rule_names(listing: str) -> frozenset[str]:
 
 # One grammar, one failure mode: a bare marker with no rules suppresses nothing
 # and reads as if it did, and a marker with no reason leaves the next reader to
-# rediscover why. Both are findings, not warnings. Only houselint reports them,
+# rediscover why. Both are findings, not warnings. Only codedoctor lint reports them,
 # so a marker is complained about once however many tools read it.
 def marker_findings(unit: Unit) -> list[Finding]:
     """Report each ``house-ignore`` marker missing its rule list or ``-- Reason.``.
@@ -144,7 +144,7 @@ def marker_findings(unit: Unit) -> list[Finding]:
       unit: The file to scan.
 
     Returns:
-      findings: One per malformed marker, as rule ``houselint``.
+      findings: One per malformed marker, as rule ``codedoctor lint``.
 
     """
     findings: list[Finding] = []
@@ -154,7 +154,7 @@ def marker_findings(unit: Unit) -> list[Finding]:
                 Finding(
                     path=unit.path,
                     line=lineno,
-                    rule="houselint",
+                    rule="codedoctor lint",
                     message="house-ignore[...] names no rule; a bare marker suppresses nothing",
                 ),
             )
@@ -163,7 +163,7 @@ def marker_findings(unit: Unit) -> list[Finding]:
                 Finding(
                     path=unit.path,
                     line=lineno,
-                    rule="houselint",
+                    rule="codedoctor lint",
                     message="house-ignore[...] needs a trailing `-- Reason.`",
                 ),
             )

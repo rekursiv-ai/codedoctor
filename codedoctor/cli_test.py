@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import shutil
@@ -185,6 +186,87 @@ def test_install_reports_preserved_overrides(
         capsys.readouterr().err
         == "Codedoctor preserved project overrides: ruff.line-length, ty.rules.all\n"
     )
+
+
+@pytest.mark.parametrize(
+    ("command", "module"),
+    [
+        ("lint", "codedoctor.lint.__main__"),
+        ("typecheck", "codedoctor.typecheck.__main__"),
+        ("testing", "codedoctor.testing.__main__"),
+        ("mutation", "codedoctor.mutation.__main__"),
+        ("gate", "codedoctor.gate.__main__"),
+        ("affected", "codedoctor.affected.__main__"),
+        ("coverage-floor", "codedoctor.coverage_floor.__main__"),
+        ("assert-isinstance", "codedoctor.assert_isinstance.__main__"),
+        ("nbstripout", "codedoctor.nbstripout.__main__"),
+        ("yamlcheck", "codedoctor.yamlcheck.__main__"),
+        ("export-leaks", "codedoctor.export_leaks.__main__"),
+        ("codegraph-sync", "codedoctor.affected.codegraph_sync"),
+        ("check-pr-text", "codedoctor.export_leaks.check_pr_text"),
+    ],
+)
+@pytest.mark.parametrize("arguments", [["--help"], ["--fix", "", "a.py", "--", "b.py"]])
+def test_stage_dispatch_preserves_arguments_and_exit_code(
+    command: str,
+    module: str,
+    arguments: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = ["codedoctor", command, *arguments]
+    monkeypatch.setattr(sys, "argv", original)
+    calls: list[list[str]] = []
+
+    def run() -> int:
+        calls.append(sys.argv.copy())
+        return 7
+
+    def load(name: str) -> SimpleNamespace:
+        assert name == module
+        return SimpleNamespace(main=run)
+
+    monkeypatch.setattr(cli, "import_module", load, raising=False)
+    assert cli.main() == 7
+    assert calls == [[f"codedoctor {command}", *arguments]]
+    assert sys.argv is original
+
+
+def test_stage_dispatch_restores_arguments_after_system_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = ["codedoctor", "lint", "--help"]
+    monkeypatch.setattr(sys, "argv", original)
+
+    def run() -> int:
+        raise SystemExit(2)
+
+    def load(name: str) -> SimpleNamespace:
+        assert name == "codedoctor.lint.__main__"
+        return SimpleNamespace(main=run)
+
+    monkeypatch.setattr(cli, "import_module", load, raising=False)
+    with pytest.raises(SystemExit) as result:
+        cli.main()
+    assert result.value.code == 2
+    assert sys.argv is original
+
+
+@pytest.mark.parametrize("command", ["install", "check", "unknown"])
+def test_setup_and_unknown_commands_reject_extra_arguments(
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["codedoctor", command, "--unknown", "value"])
+    with pytest.raises(SystemExit) as result:
+        cli.main()
+    assert result.value.code == 2
+    error = capsys.readouterr().err
+    assert (
+        "invalid choice: 'unknown'"
+        if command == "unknown"
+        else "unrecognized arguments: --unknown value"
+    ) in error
 
 
 if __name__ == "__main__":

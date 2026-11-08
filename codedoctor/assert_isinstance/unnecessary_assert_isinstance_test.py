@@ -499,7 +499,7 @@ def test_a_marker_that_suppresses_nothing_is_reported(
     assert _main(monkeypatch, "m.py") == 1
 
     assert capsys.readouterr().out == (
-        "m.py:1: [houselint] superfluous inline ignore: "
+        "m.py:1: [codedoctor lint] superfluous inline ignore: "
         "'unnecessary-assert-isinstance' reports nothing on this statement; "
         "remove it from house-ignore[...]\n" + _SUMMARY
     )
@@ -514,14 +514,14 @@ def test_a_marker_that_suppresses_nothing_is_reported(
     ],
     ids=["names-rule", "every-rule", "other-rule"],
 )
-def test_houselint_excludes_skip_the_file(
+def test_lint_excludes_skip_the_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     entry: str,
     skipped: bool,
 ) -> None:
-    _project(tmp_path, monkeypatch=monkeypatch, houselint=f"exclude = [{entry}]\n")
+    _project(tmp_path, monkeypatch=monkeypatch, lint=f"exclude = [{entry}]\n")
     _replay(monkeypatch, flagged=True)
 
     assert _main(monkeypatch, "m.py") == int(not skipped)
@@ -881,7 +881,7 @@ def test_excluded_and_unlintable_sources_do_not_end_the_scan(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _project(tmp_path, monkeypatch=monkeypatch, houselint='exclude = ["a.py"]\n')
+    _project(tmp_path, monkeypatch=monkeypatch, lint='exclude = ["a.py"]\n')
     (tmp_path / "a.py").write_text("x = 1\n")
     (tmp_path / "notes.txt").write_text("x\n")
     _replay(monkeypatch, flagged=True)
@@ -1695,12 +1695,12 @@ def _project(
     root: Path,
     *,
     monkeypatch: pytest.MonkeyPatch,
-    houselint: str = "",
+    lint: str = "",
 ) -> None:
     """Make ``root`` the cwd: a basedpyright project holding ``m.py``."""
     (root / "pyproject.toml").write_text(
         '[tool.basedpyright]\ntypeCheckingMode = "recommended"\n'
-        + (f"[tool.houselint]\n{houselint}" if houselint else ""),
+        + (f"[tool.codedoctor.lint]\n{lint}" if lint else ""),
     )
     (root / "m.py").write_text(_SOURCE)
     monkeypatch.chdir(root)
@@ -1988,7 +1988,7 @@ def test_marker_prefilter_does_not_end_the_scan_before_later_asserts(
     monkeypatch: pytest.MonkeyPatch,
     first: str,
 ) -> None:
-    _project(tmp_path, monkeypatch=monkeypatch, houselint='exclude = ["a.py"]\n')
+    _project(tmp_path, monkeypatch=monkeypatch, lint='exclude = ["a.py"]\n')
     marker = "x = 1  # house-ignore[unnecessary-assert-isinstance] -- Kept.\n"
     (tmp_path / first).write_text(marker)
     _replay(monkeypatch, flagged=True)
