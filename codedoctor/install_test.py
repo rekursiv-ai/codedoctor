@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tomllib
 
+from ruamel.yaml import YAML
 from treekle import from_plain
 
 import pytest
@@ -162,6 +163,7 @@ def test_hook_config_creates_valid_empty_config() -> None:
     assert checker["entry"] == (
         "uv --quiet run --frozen --group pre-commit python -m codedoctor.typecheck ty-check"
     )
+    assert config["fail_fast"] is False
     assert config["default_stages"] == ["pre-commit"]
     assert config["default_install_hook_types"] == ["pre-commit", "pre-push"]
     assert install.hook_config(text) == text
@@ -178,12 +180,20 @@ def test_hook_config_creates_valid_empty_config() -> None:
         "repos: [{repo: local, hooks: []},]\n",
         "repos: [{repo: local, hooks: [{id: custom, entry: custom, language: system, name: custom}]}]\n",
         "repos:\n- repo: local\n  hooks: []\nfail_fast: true\n",
+        "repos: [{repo: local}]\n",
+        "\n# Keep the leading blank line.\nfail_fast: true\n\n",
+        "\n# Keep the leading blank line.\nrepos:\n- repo: local\n  hooks: []\n\n",
     ],
 )
 def test_hook_config_accepts_empty_repositories(original: str) -> None:
     text = install.hook_config(original)
+    configured = from_plain(YAML(typ="safe", pure=True).load(text), dict[str, object])
+    assert "repos" in configured
     assert install.hook_config(text) == text
     assert "ty-check-spool" in text
+    if original.startswith("\n"):
+        assert text.startswith(original.rstrip() + "\n")
+        assert "\n\n\n" not in text
 
 
 @pytest.mark.parametrize(
@@ -193,6 +203,29 @@ def test_hook_config_accepts_empty_repositories(original: str) -> None:
 def test_hook_config_rejects_invalid_config(original: str) -> None:
     with pytest.raises((ValueError, yaml.YAMLError)):
         install.hook_config(original)
+
+
+@pytest.mark.parametrize(
+    ("original", "expected"),
+    [
+        (
+            "\nfail_fast: true\n\n",
+            "\nfail_fast: true\nrepos:\n  - hooks: []\n    repo: local\n",
+        ),
+        (
+            "\nrepos:\n- repo: old\n  hooks: []\n\n",
+            "\nrepos:\n- repo: old\n  hooks: []\n- hooks: []\n  repo: local\n",
+        ),
+    ],
+)
+def test_appending_repositories_preserves_leading_whitespace(
+    original: str,
+    expected: str,
+) -> None:
+    assert (
+        install._append_repos(original, repos=[{"repo": "local", "hooks": []}])
+        == expected
+    )
 
 
 def test_hook_config_rejects_conflicting_hook_before_writing() -> None:
@@ -232,7 +265,7 @@ def test_install_locks_dependencies_then_installs_both_git_hooks(
         assert cwd == tmp_path
         assert check
         calls.append(list(argv))
-        if "rev-parse" in argv:
+        if argv[0] == git:
             assert list(argv) == [git, "rev-parse", "--git-common-dir"]
             assert capture_output
             assert text
@@ -240,7 +273,8 @@ def test_install_locks_dependencies_then_installs_both_git_hooks(
             for name in ("pre-commit", "pre-push"):
                 path = hook_dir / name
                 path.write_text(
-                    "#!/bin/sh\n# pre-commit identity\n# start templated\nold runner\n",
+                    "#!/bin/sh\n# pre-commit identity\n# start templated\n"
+                    "old runner\n# start templated\nlegacy runner\n",
                 )
                 path.chmod(0o755)
         return subprocess.CompletedProcess(argv, 0, stdout=str(tmp_path / ".git"))
