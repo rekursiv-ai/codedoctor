@@ -3,6 +3,22 @@
 All notable codedoctor changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.1.5 - 2026-11-08
+
+### Changed
+
+- Run every stage through `codedoctor <stage>`.
+- Rename houselint to `codedoctor lint` and migrate its configuration.
+- Require `codedoctor install --notebooks` to add notebook tooling.
+- Install only the pre-commit Git hook by default; pre-push remains opt-in.
+- Let OpenBLAS detect the host's usable CPU instructions.
+
+### Fixed
+
+- Preserve long hook commands, block scalars, arguments, and YAML aliases
+  during command migration.
+- Cover projects with dynamic names when generating checker policy.
+
 ## 0.1.4 - 2026-11-07
 
 ### Changed
