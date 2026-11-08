@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1671,6 +1672,72 @@ def test_only_unobservable_mutants_are_dropped(
             False,
             False,
         ),
+        (
+            "SELECT 1 FROM programs WHERE stop_ts > ? LIMIT 1",
+            "select 1 from programs where stop_ts > ? limit 1",
+            True,
+            True,
+        ),
+        (
+            "SELECT 1 FROM programs WHERE stop_ts > ? LIMIT 1",
+            "SELECT 1 FROM PROGRAMS WHERE STOP_TS > ? LIMIT 1",
+            True,
+            True,
+        ),
+        (
+            "SELECT 1 FROM programs WHERE stop_ts > ? LIMIT 1",
+            "select 1 from programs where stop_ts > ? limit 1",
+            False,
+            False,
+        ),
+        (
+            "SELECT 1 FROM programs WHERE stop_ts > ? LIMIT 1",
+            "SELECT 1 FROM programs WHERE stop_ts >= ? LIMIT 1",
+            True,
+            False,
+        ),
+        (
+            "SELECT 1 FROM programs WHERE stop_ts > ? LIMIT 1",
+            "SELECT 1 FROM programs WHERE start_ts > ? LIMIT 1",
+            True,
+            False,
+        ),
+        (
+            "SELECT 1 FROM programs WHERE title = 'News' LIMIT 1",
+            "SELECT 1 FROM programs WHERE title = 'NEWS' LIMIT 1",
+            True,
+            False,
+        ),
+        (
+            "SELECT 1 FROM programs WHERE title = :name LIMIT 1",
+            "SELECT 1 FROM PROGRAMS WHERE TITLE = :NAME LIMIT 1",
+            True,
+            False,
+        ),
+        (
+            "SELECT 1 FROM programs WHERE title = ? COLLATE custom LIMIT 1",
+            "SELECT 1 FROM PROGRAMS WHERE TITLE = ? COLLATE CUSTOM LIMIT 1",
+            True,
+            False,
+        ),
+        (
+            "SELECT 1 FROM programs WHERE custom(title) = ? LIMIT 1",
+            "SELECT 1 FROM PROGRAMS WHERE CUSTOM(TITLE) = ? LIMIT 1",
+            True,
+            False,
+        ),
+        (
+            'SELECT 1 FROM programs WHERE "stop_ts" > ? LIMIT 1',
+            'SELECT 1 FROM PROGRAMS WHERE "STOP_TS" > ? LIMIT 1',
+            True,
+            False,
+        ),
+        (
+            "SELECT title FROM programs WHERE stop_ts > ? LIMIT 1",
+            "SELECT TITLE FROM PROGRAMS WHERE STOP_TS > ? LIMIT 1",
+            True,
+            False,
+        ),
     ],
 )
 def test_sqlite_numeric_projection_case_mutants(
@@ -1689,6 +1756,40 @@ def test_sqlite_numeric_projection_case_mutants(
     after = before.replace(repr(query), repr(replacement))
     assert _only_unobservable(before, after, context=module) is expected
     assert _only_unobservable(after, before, context=module) is expected
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT 1 FROM programs WHERE stop_ts < ? LIMIT 1",
+        "SELECT 1 FROM programs WHERE stop_ts <= ? LIMIT 1",
+        "SELECT 1 FROM programs WHERE stop_ts > ? LIMIT 1",
+        "SELECT 1 FROM programs WHERE stop_ts >= ? LIMIT 1",
+        "SELECT 1 FROM programs WHERE stop_ts = ? LIMIT 1",
+        "SELECT 1 FROM programs WHERE stop_ts == ? LIMIT 1",
+        "SELECT 1 FROM programs WHERE stop_ts != ? LIMIT 1",
+        "SELECT 1 FROM programs WHERE stop_ts <> ? LIMIT 1",
+    ],
+)
+def test_sqlite_parameter_comparison_case_preserves_rows_and_column_names(
+    query: str,
+) -> None:
+    context = "import sqlite3\ndef _get_conn() -> sqlite3.Connection:\n    pass\n"
+    before = f"def f():\n    conn = _get_conn()\n    return conn.execute({query!r}, (20,)).fetchone()\n"
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE programs (stop_ts INTEGER)")
+        conn.executemany("INSERT INTO programs VALUES (?)", [(10,), (20,), (30,)])
+        cursor = conn.execute(query, (20,))
+        expected = cursor.fetchall(), cursor.description
+        for replacement in (query.lower(), query.upper()):
+            cursor = conn.execute(replacement, (20,))
+            assert (cursor.fetchall(), cursor.description) == expected
+            after = before.replace(repr(query), repr(replacement))
+            assert _only_unobservable(before, after, context=context)
+            assert _only_unobservable(after, before, context=context)
+    finally:
+        conn.close()
 
 
 @pytest.mark.parametrize(
