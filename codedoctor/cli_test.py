@@ -27,17 +27,23 @@ def test_help_without_docstring(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("git", ["/usr/bin/git", None])
+@pytest.mark.parametrize("notebooks", [False, True])
 def test_install_from_nested_directory(
     git: str | None,
+    notebooks: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    installed: list[Path] = []
-    monkeypatch.setattr(sys, "argv", ["codedoctor", "install"])
+    installed: list[tuple[Path, bool]] = []
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["codedoctor", "install", *(["--notebooks"] if notebooks else [])],
+    )
 
-    def configure(root: Path) -> tuple[str, ...]:
-        installed.append(root)
+    def configure(root: Path, *, notebooks: bool = False) -> tuple[str, ...]:
+        installed.append((root, notebooks))
         return ()
 
     monkeypatch.setattr(install, "install", configure)
@@ -62,7 +68,7 @@ def test_install_from_nested_directory(
     monkeypatch.setattr(subprocess, "run", root)
     monkeypatch.setattr(shutil, "which", which)
     assert cli.main() == 0
-    assert installed == [tmp_path]
+    assert installed == [(tmp_path, notebooks)]
     assert capsys.readouterr().out == (
         "Codedoctor installed: development tools and pre-commit Git hook.\n"
         "Check existing files: uv run --group pre-commit pre-commit run --all-files\n"
@@ -85,8 +91,9 @@ def test_install_reports_failure(
 ) -> None:
     monkeypatch.setattr(sys, "argv", ["codedoctor", "install"])
 
-    def fail(root: Path) -> None:
+    def fail(root: Path, *, notebooks: bool = False) -> None:
         assert root == tmp_path
+        assert not notebooks
         raise failure
 
     def root(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -175,8 +182,9 @@ def test_install_reports_preserved_overrides(
         del args, kwargs
         return subprocess.CompletedProcess([], 0, stdout=str(tmp_path))
 
-    def configure(path: Path) -> tuple[str, ...]:
+    def configure(path: Path, *, notebooks: bool = False) -> tuple[str, ...]:
         assert path == tmp_path
+        assert not notebooks
         return ("ruff.line-length", "ty.rules.all")
 
     monkeypatch.setattr(subprocess, "run", root)

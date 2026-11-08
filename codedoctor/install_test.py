@@ -122,8 +122,9 @@ def test_hook_config_preserves_existing_hooks_and_comments() -> None:
     assert install.hook_config(configured) == configured
 
 
-def test_hook_config_creates_valid_empty_config() -> None:
-    text = install.hook_config("")
+@pytest.mark.parametrize("notebooks", [False, True])
+def test_hook_config_creates_valid_empty_config(notebooks: bool) -> None:
+    text = install.hook_config("", notebooks=notebooks)
     assert "repos:" in text
     assert "uv --quiet run --frozen --group pre-commit" in text
     assert "loop." not in text
@@ -138,6 +139,9 @@ def test_hook_config_creates_valid_empty_config() -> None:
         for hook in from_plain(repo["hooks"], list[dict[str, object]])
     ]
     ids = {hook["id"] for hook in hooks}
+    assert ids & {"nbstripout", "jupytext-sync"} == (
+        {"nbstripout", "jupytext-sync"} if notebooks else set()
+    )
     assert {
         "end-of-file-fixer",
         "trailing-whitespace",
@@ -149,8 +153,6 @@ def test_hook_config_creates_valid_empty_config() -> None:
         "uv-lock",
         "codedoctor-lint",
         "codespell",
-        "nbstripout",
-        "jupytext-sync",
         "ruff-check",
         "ruff-format",
         "codegraph-sync",
@@ -186,7 +188,7 @@ def test_hook_config_creates_valid_empty_config() -> None:
     assert config["fail_fast"] is False
     assert config["default_stages"] == ["pre-commit"]
     assert config["default_install_hook_types"] == ["pre-commit"]
-    assert install.hook_config(text) == text
+    assert install.hook_config(text, notebooks=notebooks) == text
 
 
 @pytest.mark.parametrize(
@@ -267,9 +269,14 @@ def test_hook_config_preserves_project_owned_arguments(
 
 
 @pytest.mark.parametrize("flow", [False, True])
+@pytest.mark.parametrize(
+    "prefix",
+    ["uv run", "uv --quiet run --frozen --group pre-commit"],
+)
 def test_hook_config_upgrades_stage_commands_without_losing_custom_arguments(
     monkeypatch: pytest.MonkeyPatch,
     flow: bool,
+    prefix: str,
 ) -> None:
     hooks: list[dict[str, object]] = [
         {
@@ -281,6 +288,8 @@ def test_hook_config_upgrades_stage_commands_without_losing_custom_arguments(
         {"id": "codegraph-sync", "entry": "uv run python -m codedoctor codegraph-sync"},
         {"id": "pytest", "entry": "uv run python -m codedoctor testing pytest"},
     ]
+    for hook in hooks:
+        hook["entry"] = from_plain(hook["entry"], str).replace("uv run", prefix)
     defaults: list[dict[str, object]] = [{"repo": "local", "hooks": hooks}]
     monkeypatch.setattr(install, "_hook_repos", lambda: defaults)
     original = (
@@ -292,7 +301,7 @@ def test_hook_config_upgrades_stage_commands_without_losing_custom_arguments(
         "  - id: codegraph-sync\n    entry: >-\n"
         "      uv run python -m codedoctor.affected.codegraph_sync\n"
         "  - id: pytest\n    entry: uv run python -m codedoctor.testing pytest\n"
-    )
+    ).replace("uv run", prefix)
     if flow:
         original = "# Keep this comment.\n" + yaml.safe_dump(
             yaml.safe_load(original),
@@ -316,6 +325,77 @@ def test_hook_config_upgrades_stage_commands_without_losing_custom_arguments(
     assert install.hook_config(configured) == configured
 
 
+@pytest.mark.parametrize("style", ["|-", ">-"])
+@pytest.mark.parametrize("name", ["", "    name: Project lint\n"])
+@pytest.mark.parametrize(
+    ("module", "command"),
+    [
+        ("export_leaks.check_pr_text", "check-pr-text"),
+        ("assert_isinstance", "assert-isinstance"),
+    ],
+)
+def test_hook_migration_preserves_scalar_boundaries_and_custom_names(
+    style: str,
+    name: str,
+    module: str,
+    command: str,
+) -> None:
+    expected: list[dict[str, object]] = [
+        {
+            "hooks": [
+                {"id": "unrelated"},
+                {"entry": "uv run python -m codedoctor lint"},
+                {"entry": f"uv run python -m codedoctor {command}"},
+            ],
+        },
+    ]
+    original = (
+        f"repos:\n- hooks:\n  - id: houselint\n{name}    entry: {style}\n"
+        "      uv run python -m codedoctor.lint\n"
+        "    args: [--fix, '', --plugin, codedoctor.testing.listing]\n"
+        f"  - id: custom\n    entry: uv run python -m codedoctor.{module}\n"
+    )
+    migrated = from_plain(
+        yaml.safe_load(install._upgrade_hooks(original, expected=expected)),
+        dict[str, object],
+    )
+    repos = from_plain(migrated["repos"], list[dict[str, object]])
+    hooks = from_plain(repos[0]["hooks"], list[dict[str, object]])
+    assert hooks[0] == {
+        "id": "codedoctor-lint",
+        "entry": "uv run python -m codedoctor lint",
+        "args": ["--fix", "", "--plugin", "codedoctor.testing.listing"],
+        **({"name": "Project lint"} if name else {}),
+    }
+    assert hooks[1] == {
+        "id": "custom",
+        "entry": f"uv run python -m codedoctor {command}",
+    }
+
+
+def test_hook_migration_continues_after_a_shared_node() -> None:
+    expected: list[dict[str, object]] = [
+        {
+            "hooks": [
+                {"entry": "uv run python -m codedoctor lint"},
+                {"entry": "uv run python -m codedoctor testing"},
+            ],
+        },
+    ]
+    original = (
+        "hooks:\n- {id: pytest, entry: uv run python -m codedoctor.testing}\n"
+        "- &lint {id: houselint, entry: uv run python -m codedoctor.lint}\n- *lint\n"
+    )
+    migrated = install._upgrade_hooks(original, expected=expected)
+    assert yaml.safe_load(migrated) == {
+        "hooks": [
+            {"id": "pytest", "entry": "uv run python -m codedoctor testing"},
+            {"id": "codedoctor-lint", "entry": "uv run python -m codedoctor lint"},
+            {"id": "codedoctor-lint", "entry": "uv run python -m codedoctor lint"},
+        ],
+    }
+
+
 def test_hook_migration_visits_recursive_metadata_once() -> None:
     original = "metadata: &metadata {self: *metadata}\n"
     assert install._upgrade_hooks(original, expected=[]) == original
@@ -332,11 +412,13 @@ def test_hook_config_rejects_conflicting_hook_before_writing() -> None:
 
 @pytest.mark.parametrize("found_executables", [True, False])
 @pytest.mark.parametrize("existing_pre_push", [True, False])
+@pytest.mark.parametrize("notebooks", [False, True])
 def test_install_locks_dependencies_then_installs_only_pre_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     found_executables: bool,
     existing_pre_push: bool,
+    notebooks: bool,
 ) -> None:
     calls: list[list[str]] = []
     uv = "/tools/uv" if found_executables else "uv"
@@ -384,7 +466,7 @@ def test_install_locks_dependencies_then_installs_only_pre_commit(
     monkeypatch.setattr(codegraph, "install", lambda: ensured.append("codegraph"))
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(shutil, "which", which)
-    install.install(tmp_path)
+    install.install(tmp_path, notebooks=notebooks)
     assert ignored.is_file()
     configured_ignore = ignored.read_text()
     assert configured_ignore.startswith(original_ignore)
@@ -395,7 +477,9 @@ def test_install_locks_dependencies_then_installs_only_pre_commit(
         tomllib.loads(original_project)["tool"]["codedoctor"]["lint"]["select"] == "ALL"
     )
     original_hooks = (tmp_path / ".pre-commit-config.yaml").read_text()
-    install.install(tmp_path)
+    assert ("id: nbstripout" in original_hooks) == notebooks
+    assert ("id: jupytext-sync" in original_hooks) == notebooks
+    install.install(tmp_path, notebooks=notebooks)
     assert (tmp_path / "pyproject.toml").read_text() == original_project
     assert (tmp_path / ".pre-commit-config.yaml").read_text() == original_hooks
     assert ignored.read_text() == configured_ignore
@@ -405,7 +489,9 @@ def test_install_locks_dependencies_then_installs_only_pre_commit(
         "--group",
         "pre-commit",
         "--no-sync",
-        "codedoctor[coverage,mutation,notebook]",
+        "codedoctor[coverage,mutation,notebook]"
+        if notebooks
+        else "codedoctor[coverage,mutation]",
         "pre-commit",
         "ruff",
         "codespell",

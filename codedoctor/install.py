@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Final
 
+import json
 import re
 import shutil
 import subprocess
@@ -23,11 +24,12 @@ _THIS: Final = Path(__file__).resolve()
 _CWD: Final = _THIS.parent
 
 
-def install(root: Path) -> tuple[str, ...]:
+def install(root: Path, *, notebooks: bool = False) -> tuple[str, ...]:
     """Configure and activate Codedoctor in a Git repository.
 
     Args:
       root: Repository root; explicit project overrides are preserved.
+      notebooks: Install notebook dependencies and output-stripping/sync hooks.
 
     Returns:
       overrides: Native settings differing from the canonical policy.
@@ -43,7 +45,10 @@ def install(root: Path) -> tuple[str, ...]:
         project.read_text() if project.exists() else "",
         name=root.name,
     )
-    configured_hooks = hook_config(hooks.read_text() if hooks.exists() else "")
+    configured_hooks = hook_config(
+        hooks.read_text() if hooks.exists() else "",
+        notebooks=notebooks,
+    )
     project.write_text(configured_project)
     subprocess.run(  # noqa: S603 -- Fixed uv command and package names.
         [
@@ -52,7 +57,9 @@ def install(root: Path) -> tuple[str, ...]:
             "--group",
             "pre-commit",
             "--no-sync",
-            "codedoctor[coverage,mutation,notebook]",
+            "codedoctor[coverage,mutation,notebook]"
+            if notebooks
+            else "codedoctor[coverage,mutation]",
             "pre-commit",
             "ruff",
             "codespell",
@@ -141,11 +148,12 @@ def project_config(text: str, *, name: str) -> str:
     return tomlkit.dumps(document)
 
 
-def hook_config(text: str) -> str:
+def hook_config(text: str, *, notebooks: bool = False) -> str:
     """Return YAML with missing Codedoctor hooks, preserving existing entries.
 
     Args:
       text: Existing pre-commit configuration, or empty for a new project.
+      notebooks: Include notebook output stripping and paired-file synchronization.
 
     Returns:
       configured: Hook configuration, unchanged when already installed.
@@ -154,7 +162,17 @@ def hook_config(text: str) -> str:
       ValueError: Configuration is malformed or a hook ID conflicts.
 
     """
-    expected = _hook_repos()
+    expected = [
+        {
+            **repo,
+            "hooks": [
+                hook
+                for hook in from_plain(repo["hooks"], list[dict[str, object]])
+                if notebooks or hook["id"] not in {"nbstripout", "jupytext-sync"}
+            ],
+        }
+        for repo in _hook_repos()
+    ]
     text = _upgrade_hooks(text, expected=expected)
     document = from_plain(yaml.safe_load(text), dict[str, object], default={})
     repos = (
@@ -199,7 +217,9 @@ def _upgrade_hooks(text: str, *, expected: list[dict[str, object]]) -> str:
     commands: dict[str, str] = {}
     for repo in expected:
         for hook in from_plain(repo["hooks"], list[dict[str, object]]):
-            entry = from_plain(hook.get("entry", ""), str)
+            if "entry" not in hook:
+                continue
+            entry = from_plain(hook["entry"], str)
             match = re.search(r" -m codedoctor ([\w-]+)", entry)
             if match:
                 command = match[1]
@@ -248,13 +268,10 @@ def _upgrade_hooks(text: str, *, expected: list[dict[str, object]]) -> str:
                     for key, value in values.items():
                         scalar = fields[key]
                         assert isinstance(scalar, ScalarNode)
-                        replacement = (
-                            yaml.safe_dump(value, default_flow_style=True)
-                            .removesuffix("...\n")
-                            .rstrip()
-                        )
+                        # JSON strings are YAML scalars without line wrapping.
+                        replacement = json.dumps(value)
                         if scalar.style in {"|", ">"}:
-                            replacement += "\n" + " " * scalar.end_mark.column
+                            replacement += "\n"
                         changes.append(
                             (
                                 scalar.start_mark.index,
