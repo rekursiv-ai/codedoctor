@@ -13,4 +13,5 @@ from __future__ import annotations
 
 def kernel_pins() -> dict[str, str]:
     """Return each pinned variable's name and value, for a child's environment."""
-    return {"MKL_CBWR": "COMPATIBLE", "OPENBLAS_CORETYPE": "Haswell"}
+    # OpenBLAS detects usable CPU instructions; a fixed core can cause SIGILL.
+    return {"MKL_CBWR": "COMPATIBLE"}
