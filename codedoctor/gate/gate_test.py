@@ -562,10 +562,12 @@ def test_a_walk_that_is_off_runs_nothing(
     [("x.py\ny_test.py::t\n", ["x.py", "y_test.py::t"]), (None, [])],
     ids=["found", "failed"],
 )
+@pytest.mark.parametrize("hops", [1, 2])
 def test_a_walk_asks_the_module_for_what_lies_hops_away(
     tmp_path: Path,
     output: str | None,
     found: list[str],
+    hops: int,
 ) -> None:
     tools = fakes.Recorder(output=output)
 
@@ -574,7 +576,7 @@ def test_a_walk_asks_the_module_for_what_lies_hops_away(
             fakes.context(tmp_path, tools),
             files=["a.py", "b.py"],
             dependents="pkg.deps",
-            hops=2,
+            hops=hops,
             emit="nodeids",
             workers=3,
         )
@@ -588,13 +590,30 @@ def test_a_walk_asks_the_module_for_what_lies_hops_away(
         "--emit",
         "nodeids",
         "--depth",
-        "2",
+        str(hops),
         "--workers",
         "3",
         "--",
     ]
     assert named.startswith("@")
     assert tools.argfiles == [["a.py", "b.py"]]
+
+
+def test_a_skipped_dependency_harvest_never_walks(tmp_path: Path) -> None:
+    tools = fakes.Recorder(output="b.py\n")
+
+    assert (
+        gate.walk(
+            fakes.context(tmp_path, tools, SKIP="ruff-check, harvest-affected "),
+            files=["a.py"],
+            dependents="pkg.deps",
+            hops=1,
+            emit="files",
+            workers=1,
+        )
+        == []
+    )
+    assert tools.calls == []
 
 
 class _Dependents(argparse.Namespace):

@@ -174,10 +174,11 @@ def test_a_hand_run_suite_is_a_test_by_what_it_defines(
 @pytest.mark.parametrize(
     "named",
     [
-        "pkg/mod.py",
-        "pkg/mod_test.py",
-        "pkg/tests/test_mod_extra.py",
-        "tests/mod_test.py",
+        "pkg/sub/mod_extra.py",
+        "pkg/sub/mod_extra_test.py",
+        "pkg/sub/test_mod_extra.py",
+        "pkg/sub/tests/test_mod_extra_more.py",
+        "tests/sub/mod_extra_test.py",
     ],
 )
 def test_related_finds_source_and_all_its_test_pairs(
@@ -185,12 +186,13 @@ def test_related_finds_source_and_all_its_test_pairs(
     named: str,
 ) -> None:
     files = [
-        "pkg/mod.py",
-        "pkg/mod_test.py",
-        "pkg/tests/test_mod_extra.py",
-        "tests/mod_test.py",
+        "pkg/sub/mod_extra.py",
+        "pkg/sub/mod_extra_test.py",
+        "pkg/sub/test_mod_extra.py",
+        "pkg/sub/tests/test_mod_extra_more.py",
+        "tests/sub/mod_extra_test.py",
     ]
-    for name in [*files, "pkg/unrelated.py", "pkg/unrelated_test.py"]:
+    for name in [*files, "pkg/sub/mod.py", "pkg/sub/mod_test.py"]:
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()

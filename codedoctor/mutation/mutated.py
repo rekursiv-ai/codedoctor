@@ -2027,7 +2027,9 @@ def _mutable_paths(
         if path.endswith(".py")
         and not sidecars.is_test(root / path)
         and not any(
-            part in {"third_party", "typings", ".export"} for part in Path(path).parts
+            parent.name in {"third_party", ".export"}
+            or parent.parts[-2:] == ("typings", "stubs")
+            for parent in Path(path).parents
         )
         and any(Path(path).is_relative_to(Path(source)) for source in sources)
         and (root / path).is_file()
