@@ -52,7 +52,7 @@ def main() -> int:
             "Codedoctor preserved project overrides: " + ", ".join(overrides) + "\n",
         )
     sys.stdout.write(
-        "Codedoctor installed: Ruff, ty, paired tests, and pre-push checks.\n"
+        "Codedoctor installed: development tools and pre-commit Git hook.\n"
         "Check existing files: uv run --group pre-commit pre-commit run --all-files\n",
     )
     return 0

@@ -81,8 +81,6 @@ def install(root: Path) -> tuple[str, ...]:
             "install",
             "--hook-type",
             "pre-commit",
-            "--hook-type",
-            "pre-push",
         ],
         cwd=root,
         check=True,
@@ -248,7 +246,7 @@ def _append_repos(text: str, *, repos: list[dict[str, object]]) -> str:
                 {
                     "fail_fast": False,
                     "default_stages": ["pre-commit"],
-                    "default_install_hook_types": ["pre-commit", "pre-push"],
+                    "default_install_hook_types": ["pre-commit"],
                     "repos": repos,
                 },
             )
@@ -309,18 +307,16 @@ def _bootstrap_hooks(root: Path) -> None:
         capture_output=True,
         text=True,
     )
-    directory = root / git.stdout.strip() / "hooks"
-    for name in ("pre-commit", "pre-push"):
-        path = directory / name
-        content = path.read_text()
-        # Retain pre-commit's identity so reinstall/uninstall preserves legacy hooks.
-        header = content[: content.index("# start templated\n")]
-        path.write_text(
-            header
-            + "exec uv run --frozen --group pre-commit pre-commit hook-impl "
-            + f"--config=.pre-commit-config.yaml --hook-type={name} "
-            + '--hook-dir="$(dirname "$0")" -- "$@"\n',
-        )
+    path = root / git.stdout.strip() / "hooks" / "pre-commit"
+    content = path.read_text()
+    # Retain pre-commit's identity so reinstall/uninstall preserves legacy hooks.
+    header = content[: content.index("# start templated\n")]
+    path.write_text(
+        header
+        + "exec uv run --frozen --group pre-commit pre-commit hook-impl "
+        + "--config=.pre-commit-config.yaml --hook-type=pre-commit "
+        + '--hook-dir="$(dirname "$0")" -- "$@"\n',
+    )
 
 
 def _update_gitignore(root: Path) -> None:

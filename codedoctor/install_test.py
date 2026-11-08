@@ -185,7 +185,7 @@ def test_hook_config_creates_valid_empty_config() -> None:
     )
     assert config["fail_fast"] is False
     assert config["default_stages"] == ["pre-commit"]
-    assert config["default_install_hook_types"] == ["pre-commit", "pre-push"]
+    assert config["default_install_hook_types"] == ["pre-commit"]
     assert install.hook_config(text) == text
 
 
@@ -276,16 +276,21 @@ def test_hook_config_rejects_conflicting_hook_before_writing() -> None:
 
 
 @pytest.mark.parametrize("found_executables", [True, False])
-def test_install_locks_dependencies_then_installs_both_git_hooks(
+@pytest.mark.parametrize("existing_pre_push", [True, False])
+def test_install_locks_dependencies_then_installs_only_pre_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     found_executables: bool,
+    existing_pre_push: bool,
 ) -> None:
     calls: list[list[str]] = []
     uv = "/tools/uv" if found_executables else "uv"
     git = "/tools/git" if found_executables else "git"
     hook_dir = tmp_path / ".git" / "hooks"
     hook_dir.mkdir(parents=True)
+    pre_push = hook_dir / "pre-push"
+    if existing_pre_push:
+        pre_push.write_text("custom pre-push hook\n")
     ignored = tmp_path / ".gitignore"
     original_ignore = "# Keep existing rules.\ncustom/"
     ignored.write_text(original_ignore)
@@ -308,7 +313,7 @@ def test_install_locks_dependencies_then_installs_both_git_hooks(
             assert capture_output
             assert text
         elif "install" in argv:
-            for name in ("pre-commit", "pre-push"):
+            for name in argv[argv.index("install") + 2 :: 2]:
                 path = hook_dir / name
                 path.write_text(
                     "#!/bin/sh\n# pre-commit identity\n# start templated\n"
@@ -367,22 +372,23 @@ def test_install_locks_dependencies_then_installs_both_git_hooks(
         "install",
         "--hook-type",
         "pre-commit",
-        "--hook-type",
-        "pre-push",
     ]
     assert calls[2] == [git, "rev-parse", "--git-common-dir"]
     assert ensured == ["codegraph", "codegraph"]
     assert (tmp_path / "pyproject.toml").is_file()
     assert (tmp_path / ".pre-commit-config.yaml").is_file()
-    for name in ("pre-commit", "pre-push"):
-        path = hook_dir / name
-        assert path.read_text() == (
-            "#!/bin/sh\n# pre-commit identity\n"
-            "exec uv run --frozen --group pre-commit pre-commit hook-impl "
-            f"--config=.pre-commit-config.yaml --hook-type={name} "
-            '--hook-dir="$(dirname "$0")" -- "$@"\n'
-        )
-        assert path.stat().st_mode & 0o111
+    if existing_pre_push:
+        assert pre_push.read_text() == "custom pre-push hook\n"
+    else:
+        assert not pre_push.exists()
+    path = hook_dir / "pre-commit"
+    assert path.read_text() == (
+        "#!/bin/sh\n# pre-commit identity\n"
+        "exec uv run --frozen --group pre-commit pre-commit hook-impl "
+        "--config=.pre-commit-config.yaml --hook-type=pre-commit "
+        '--hook-dir="$(dirname "$0")" -- "$@"\n'
+    )
+    assert path.stat().st_mode & 0o111
 
 
 @pytest.mark.parametrize(
