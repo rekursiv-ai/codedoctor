@@ -244,18 +244,18 @@ def test_a_fix_error_is_never_raised_for_a_rewrite_that_parses(tmp_path: Path) -
 
 
 def test_a_reported_finding_its_fix_cannot_rewrite_is_kept(tmp_path: Path) -> None:
-    """The check opens the fix gate; a fix returning None leaves the finding."""
-    path = _write(tmp_path, "BAD\n")
+    """A fix returning None keeps its finding and permits later fixers."""
+    path = _write(tmp_path, "BAD\nx = 1z\n")
 
     findings, written = run(
         [path],
-        active=(_Counting(),),
-        fixing=frozenset({"counting"}),
+        active=(_Counting(), _Trim()),
+        fixing=frozenset({"counting", "trim"}),
     )
 
     assert [(f.line, f.rule) for f in findings] == [(1, "counting")]
-    assert written == ()
-    assert path.read_text() == "BAD\n"
+    assert written == (path,)
+    assert path.read_text() == "BAD\nx = 1\n"
 
 
 def test_shipped_kinds_are_python_pyi_and_jupyter(tmp_path: Path) -> None:
