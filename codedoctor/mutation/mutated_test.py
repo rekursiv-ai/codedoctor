@@ -1657,6 +1657,17 @@ def test_only_unobservable_mutants_are_dropped(
         ("np.full(dtype=np.float32)", "np.full(dtype=np.float64)", False),
         ("np.zeros(3, dtype=np.float64, **options)", "np.zeros(3, **options)", False),
         ("np.zeros(*args, dtype=np.float64)", "np.zeros(*args)", False),
+        ("np.zeros(3, np.float64, dtype=None)", "np.zeros(3, np.float64)", False),
+        ("np.ones(3, np.float64, dtype=None)", "np.ones(3, np.float64)", False),
+        ("np.empty(3, np.float64, dtype=None)", "np.empty(3, np.float64)", False),
+        ("x.astype(np.float64, dtype=np.float64)", "x.astype(None)", False),
+        (
+            "np.full(3, np.nan, np.float32, dtype=np.float32)",
+            "np.full(3, None, np.float32)",
+            False,
+        ),
+        ("np.zeros(3, dtype=None, dtype=None)", "np.zeros(3)", False),
+        ("np.arange(3, dtype=None)", "np.arange(3)", True),
     ],
 )
 def test_only_equivalent_numpy_defaults_are_dropped(
@@ -1668,13 +1679,30 @@ def test_only_equivalent_numpy_defaults_are_dropped(
 
 
 @pytest.mark.parametrize(
+    "source",
+    [
+        "np.zeros(3, shape=3, dtype=np.float64)",
+        "np.zeros(3, np.float64, dtype=np.float64)",
+        "np.full(3, np.nan, shape=3, dtype=np.float32)",
+        "np.full(3, np.nan, fill_value=np.nan, dtype=np.float32)",
+        "np.full(3, np.nan, np.float32, dtype=np.float32)",
+        "x.astype(np.float64, dtype=np.float64)",
+    ],
+)
+def test_duplicate_numpy_bindings_preserve_the_original_ast(source: str) -> None:
+    assert mutated._erase_unobservable(source, context="") == ast.dump(
+        ast.parse(source),
+    )
+
+
+@pytest.mark.parametrize(
     ("bounds", "setup", "expected"),
     [
         ("3", "", True),
         ("-3, 7, 2", "", True),
         ("len(rows)", "", True),
         ("size", "    size = len(rows)\n", True),
-        ("window.start, len(rows)", "    window = self.window()\n", True),
+        ("window.start, len(rows)", "    window = self.window()\n", False),
         ("window.stop, len(rows)", "    window = self.window()\n", False),
         ("unknown, len(rows)", "", False),
         ("0.5, len(rows)", "", False),
@@ -1691,6 +1719,19 @@ def test_only_equivalent_numpy_defaults_are_dropped(
         ("0, 3, 1, 2", "", False),
         ("3 + unknown", "", False),
         ("unknown + 3", "", False),
+        ("len(rows) + 1", "", False),
+        ("size", "    size = 9223372036854775808\n", False),
+        ("size", "    size = 3\n", True),
+        ("int(3)", "", True),
+        ("int(value)", "", False),
+        ("9223372036854775807", "", True),
+        ("9223372036854775808", "", False),
+        ("-9223372036854775808", "", True),
+        ("-9223372036854775809", "", False),
+        ("True", "", False),
+        ("2 * len(rows)", "", False),
+        ("len(rows) - len(rows)", "", True),
+        ("3 // 2", "", False),
     ],
 )
 def test_integer_arange_defaults_require_proven_integer_bounds(
@@ -1718,7 +1759,7 @@ class Builder:
 @pytest.mark.parametrize(
     ("source", "expressions"),
     [
-        ("def f(n: int):\n    return n\n", ("n",)),
+        ("def f(n: int):\n    return n\n", ()),
         ("def f(n: float):\n    return n\n", ()),
         (
             "def f(n: int):\n    def inner(n: int):\n        return n\n    return n\n",
@@ -1731,8 +1772,8 @@ class Builder:
         ("def f():\n    import n\n    import n\n    n = 3\n    return n\n", ()),
         ("def f(n: int):\n    n = 0.5\n    return n\n", ()),
         ("def f(n: int):\n    n = 3\n    return n\n", ()),
-        ("def f(rows):\n    n = len(rows)\n    m = n + 1\n    return m\n", ("n", "m")),
-        ("def f(rows):\n    rows.size = 0\n    n = int(3.5)\n    return n\n", ("n",)),
+        ("def f(rows):\n    n = len(rows)\n    m = n + 1\n    return m\n", ("n",)),
+        ("def f(rows):\n    rows.size = 0\n    n = int(3.5)\n    return n\n", ()),
         (
             "def f(rows):\n    n = 0.5\n    n = 2\n    m = len(rows)\n    return m\n",
             ("m",),
@@ -1744,7 +1785,7 @@ def test_integer_facts_preserve_single_assignment_and_load_context(
     expressions: tuple[str, ...],
 ) -> None:
     known = mutated._integer_expressions(ast.parse(source), context="")
-    assert known == {
+    assert set(known) == {
         "len",
         "int",
         *(ast.dump(ast.parse(value, mode="eval").body) for value in expressions),
@@ -1767,6 +1808,113 @@ def test_imports_shadow_integer_builtins(source: str, builtin: str) -> None:
     assert builtin not in mutated._integer_expressions(tree, context="")
 
 
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "def len(rows):\n    return 3.5\n",
+        "len = custom_length\n",
+        "from custom import len\n",
+        "import custom as len\n",
+        "from custom import *\n",
+    ],
+)
+def test_arange_equivalence_respects_module_builtin_bindings(binding: str) -> None:
+    before = "def f(rows):\n    return np.arange(len(rows), dtype=np.int64)\n"
+    after = before.replace(", dtype=np.int64", "")
+    context = binding + before
+    assert not _only_unobservable(before, after, context=context)
+    assert not _only_unobservable(after, before, context=context)
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    ["*args", "0, 3, 1, np.int64", "3, dtype=None"],
+)
+def test_arange_default_removal_preserves_positional_dtype_binding(bounds: str) -> None:
+    assert not _only_unobservable(
+        f"np.arange({bounds}, dtype=None)",
+        f"np.arange({bounds})",
+    )
+
+
+def test_arange_equivalence_preserves_out_of_range_integer_behavior() -> None:
+    assert np.arange(2**63, 2**63 + 2).dtype != np.dtype(np.int64)
+    with pytest.raises(OverflowError):
+        np.arange(2**63, 2**63 + 2, dtype=np.int64)
+    assert not _only_unobservable(
+        "np.arange(9223372036854775808, 9223372036854775810, dtype=np.int64)",
+        "np.arange(9223372036854775808, 9223372036854775810)",
+    )
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("3", (3, 3)),
+        ("True", None),
+        ("len(rows)", (0, sys.maxsize)),
+        ("len(rows, other)", None),
+        ("len(rows=rows)", None),
+        ("int(3)", (3, 3)),
+        ("int(value)", None),
+        ("int()", None),
+        ("+len(rows)", (0, sys.maxsize)),
+        ("-len(rows)", (-sys.maxsize, 0)),
+        ("~len(rows)", (~sys.maxsize, -1)),
+        ("not 3", None),
+        ("len(rows) + 2", (2, sys.maxsize + 2)),
+        ("3 - len(rows)", (3 - sys.maxsize, 3)),
+        ("-3 * len(rows)", (-3 * sys.maxsize, 0)),
+        ("unknown + 3", None),
+        ("3 + unknown", None),
+        ("3 // 2", None),
+        ("obj.length()", None),
+        ("len(rows) + len(other)", (0, 2 * sys.maxsize)),
+        ("len(rows) - 3", (-3, sys.maxsize - 3)),
+        ("len(rows) * len(other)", (0, sys.maxsize * sys.maxsize)),
+    ],
+)
+def test_integer_ranges_preserve_arithmetic_limits(
+    expression: str,
+    expected: tuple[int, int] | None,
+) -> None:
+    tree = ast.parse(expression)
+    known = mutated._integer_expressions(tree, context="")
+    assert (
+        mutated._integer_range(
+            ast.parse(expression, mode="eval").body,
+            known=known,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("-9223372036854775808", (-(1 << 63), -(1 << 63))),
+        ("-9223372036854775809", None),
+        ("9223372036854775807", ((1 << 63) - 1, (1 << 63) - 1)),
+        ("9223372036854775808", None),
+        ("-len(rows) - 2", None),
+    ],
+)
+def test_assigned_integer_ranges_observe_int64_boundaries(
+    expression: str,
+    expected: tuple[int, int] | None,
+) -> None:
+    source = f"def f(rows):\n    n = {expression}\n    return n\n"
+    known = mutated._integer_expressions(ast.parse(source), context="")
+    assert known.get(ast.dump(ast.parse("n", mode="eval").body)) == expected
+    assert known["len"] == (0, sys.maxsize)
+    assert known["int"] == (0, sys.maxsize)
+
+
+def test_arange_integer_ranges_check_the_lower_bound() -> None:
+    before = "np.arange(-len(rows) - 2, 0, dtype=np.int64)"
+    assert not _only_unobservable(before, before.replace(", dtype=np.int64", ""))
+
+
 def test_unobservable_comparison_defaults_to_no_module_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1777,25 +1925,11 @@ def test_unobservable_comparison_defaults_to_no_module_context(
     assert [call.kwargs for call in erase.call_args_list] == [
         {"context": ""},
         {"context": ""},
-        {"context": ""},
-        {"context": ""},
     ]
 
 
-@pytest.mark.parametrize(
-    "statement",
-    ["pass", "return 1", "value = 1", "1", "None", "call()", "value.attr"],
-)
-def test_function_matching_preserves_executable_statements(statement: str) -> None:
-    function = ast.parse(f'def f():\n    """Contract."""\n    {statement}\n').body[0]
-    assert isinstance(function, ast.FunctionDef)
-    assert mutated._function_statements(function) == (
-        ast.dump(ast.parse(statement).body[0]),
-    )
-
-
 @pytest.mark.parametrize("docstring", ["", '    """Contract."""\n'])
-def test_record_integer_facts_match_only_the_owning_class(docstring: str) -> None:
+def test_record_integer_annotations_do_not_prove_int64_bounds(docstring: str) -> None:
     source = (
         f"def f(self, rows):\n{docstring}"
         "    window = self.window()\n"
@@ -1808,13 +1942,9 @@ def test_record_integer_facts_match_only_the_owning_class(docstring: str) -> Non
         + textwrap.indent(source, "    ")
     )
     known = mutated._integer_expressions(ast.parse(source), context=context)
-    assert known == {
-        "len",
-        "int",
-        ast.dump(ast.parse("window.start", mode="eval").body),
-    }
+    assert set(known) == {"len", "int"}
     after = source.replace("dtype=np.int64", "dtype=None")
-    assert _only_unobservable(source, after, context=context)
+    assert not _only_unobservable(source, after, context=context)
     cast_source = source.replace(
         "return np.arange",
         "return cast(object, np.arange",
@@ -3579,10 +3709,9 @@ def _recorded_results(snapshot: Path, *, indexed: bool) -> None:
     original = snapshot / "pkg/mod.py"
     original.parent.mkdir(parents=True, exist_ok=True)
     original.write_text(
-        "class Window:\n    start: int\n\n"
-        "class Builder:\n    def window(self) -> Window: ...\n"
-        "    def g(self):\n        window = self.window()\n"
-        "        return np.arange(window.start, dtype=np.int64)\n",
+        "class Builder:\n"
+        "    def g(self):\n        size = len(self.rows)\n"
+        "        return np.arange(size, dtype=np.int64)\n",
     )
     path = snapshot / "mutants/pkg/mod.py"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -3590,10 +3719,10 @@ def _recorded_results(snapshot: Path, *, indexed: bool) -> None:
         "def x_f__mutmut_orig():\n    return cast(int, value)\n\n"
         "def x_f__mutmut_1():\n    return cast(None, value)\n\n"
         "def x_f__mutmut_2():\n    return cast(int, value) + 1\n\n"
-        "def x_g__mutmut_orig(self):\n    window = self.window()\n"
-        "    return np.arange(window.start, dtype=np.int64)\n\n"
-        "def x_g__mutmut_1(self):\n    window = self.window()\n"
-        "    return np.arange(window.start)\n\n"
+        "def x_g__mutmut_orig(self):\n    size = len(self.rows)\n"
+        "    return np.arange(size, dtype=np.int64)\n\n"
+        "def x_g__mutmut_1(self):\n    size = len(self.rows)\n"
+        "    return np.arange(size)\n\n"
         "def x_other__mutmut_orig():\n    return 1\n\n"
         "def x_other__mutmut_1():\n    return 2\n",
     )

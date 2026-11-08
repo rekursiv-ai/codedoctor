@@ -1447,11 +1447,6 @@ def _only_unobservable(original: str, mutant: str, *, context: str = "") -> bool
     """Return whether ``mutant`` differs only in proven unobservable expressions."""
     if original == mutant:
         return False
-    if _erase_unobservable(original, context="") == _erase_unobservable(
-        mutant,
-        context="",
-    ):
-        return True
     return _erase_unobservable(original, context=context) == _erase_unobservable(
         mutant,
         context=context,
@@ -1500,31 +1495,49 @@ def _erase_unobservable(code: str, *, context: str) -> str:
             and not node.keywords
         ) and _numpy_member(node.args[0]) == "nan":
             node.args[0] = ast.Constant(value=None)
-        if name == "arange" and all(k.arg == "dtype" for k in node.keywords):
-            for keyword in tuple(node.keywords):
-                default = (
-                    isinstance(keyword.value, ast.Constant)
-                    and keyword.value.value is None
+        if (
+            name == "arange"
+            and 1 <= len(node.args) <= 3
+            and not any(isinstance(arg, ast.Starred) for arg in node.args)
+            and len(node.keywords) == 1
+            and node.keywords[0].arg == "dtype"
+        ):
+            keyword = node.keywords[0]
+            default = (
+                isinstance(keyword.value, ast.Constant) and keyword.value.value is None
+            )
+            integer = (
+                _numpy_member(keyword.value) == "int64"
+                and all(
+                    (bounds := _integer_range(arg, known=integers)) is not None
+                    and -(1 << 63) <= bounds[0] <= bounds[1] < (1 << 63)
+                    for arg in node.args
                 )
-                integer = (
-                    _numpy_member(keyword.value) == "int64"
-                    and 1 <= len(node.args) <= 3
-                    and all(
-                        _integer_expression(arg, known=integers) for arg in node.args
-                    )
-                    and np.dtype(np.intp) == np.dtype(np.int64)
-                )
-                if default or integer:
-                    node.keywords.remove(keyword)
+                and np.dtype(np.intp) == np.dtype(np.int64)
+            )
+            if default or integer:
+                node.keywords.remove(keyword)
         allocation = name in {"zeros", "ones", "empty"}
         full = name == "full"
         astype = isinstance(node.func, ast.Attribute) and node.func.attr == "astype"
+        position = 2 if full else 0 if astype else 1
         if (
             (allocation or full or astype)
             and all(k.arg is not None for k in node.keywords)
+            and len({k.arg for k in node.keywords}) == len(node.keywords)
             and not any(isinstance(a, ast.Starred) for a in node.args)
+            and not any(
+                k.arg
+                in (
+                    ("shape", "fill_value", "dtype")
+                    if full
+                    else ("dtype",)
+                    if astype
+                    else ("shape", "dtype")
+                )[: len(node.args)]
+                for k in node.keywords
+            )
         ):
-            position = 2 if full else 0 if astype else 1
             dtype_keyword = next((k for k in node.keywords if k.arg == "dtype"), None)
             dtype = (
                 dtype_keyword.value
@@ -1597,23 +1610,29 @@ def _erase_unobservable(code: str, *, context: str) -> str:
     return ast.dump(tree)
 
 
-def _integer_expressions(tree: ast.Module, *, context: str) -> set[str]:
-    """Find integer bounds without assuming the type of an arbitrary array input."""
+def _integer_expressions(
+    tree: ast.Module,
+    *,
+    context: str,
+) -> dict[str, tuple[int, int]]:
+    """Find bounded integer facts without trusting annotations as range proofs."""
     writes: dict[str, int] = defaultdict(int)
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
             writes[node.id] += 1
-        elif isinstance(node, ast.arg):
-            writes[node.arg] += 1
+    module = ast.parse(context)
     imported = {
         node.asname or node.name.split(".")[0]
-        for node in ast.walk(tree)
+        for source in (tree, module)
+        for node in ast.walk(source)
         if isinstance(node, ast.alias)
     }
-    module = ast.parse(context)
+    unavailable = imported | {
+        node.arg for node in ast.walk(tree) if isinstance(node, ast.arg)
+    }
     globals_bound = {
         node.name
-        for node in module.body
+        for node in ast.walk(module)
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
     }
     globals_bound.update(
@@ -1622,56 +1641,13 @@ def _integer_expressions(tree: ast.Module, *, context: str) -> set[str]:
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
     )
     known = {
-        name
+        name: (0, sys.maxsize)
         for name in ("len", "int")
-        if name not in writes and name not in globals_bound and name not in imported
+        if name not in writes
+        and name not in globals_bound
+        and name not in unavailable
+        and "*" not in imported
     }
-    records = {
-        node.name: {
-            field.target.id
-            for field in node.body
-            if isinstance(field, ast.AnnAssign)
-            and isinstance(field.target, ast.Name)
-            and isinstance(field.annotation, ast.Name)
-            and field.annotation.id == "int"
-        }
-        for node in module.body
-        if isinstance(node, ast.ClassDef)
-    }
-    functions = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-    ]
-    owners = [
-        node
-        for node in module.body
-        if isinstance(node, ast.ClassDef)
-        and any(
-            isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef)
-            and _function_statements(method) == _function_statements(function)
-            for method in node.body
-            for function in functions
-        )
-    ]
-    methods = {
-        method.name: method.returns.id
-        for owner in owners
-        for method in owner.body
-        if len(owners) == 1
-        and isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef)
-        and isinstance(method.returns, ast.Name)
-        and method.returns.id in records
-    }
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.arg)
-            and writes[node.arg] == 1
-            and node.arg not in imported
-            and isinstance(node.annotation, ast.Name)
-            and node.annotation.id == "int"
-        ):
-            known.add(ast.dump(ast.parse(node.arg, mode="eval").body))
     while True:
         previous = known.copy()
         for node in ast.walk(tree):
@@ -1681,74 +1657,60 @@ def _integer_expressions(tree: ast.Module, *, context: str) -> set[str]:
             if (
                 not isinstance(target, ast.Name)
                 or writes[target.id] != 1
-                or target.id in imported
+                or target.id in unavailable
             ):
                 continue
-            if _integer_expression(node.value, known=known):
-                known.add(ast.dump(ast.parse(target.id, mode="eval").body))
-            value = node.value
-            if (
-                isinstance(value, ast.Call)
-                and isinstance(value.func, ast.Attribute)
-                and isinstance(value.func.value, ast.Name)
-                and value.func.value.id == "self"
-                and value.func.attr in methods
-            ):
-                for field in records[methods[value.func.attr]]:
-                    known.add(
-                        ast.dump(ast.parse(f"{target.id}.{field}", mode="eval").body),
-                    )
+            bounds = _integer_range(node.value, known=known)
+            if bounds is not None and -(1 << 63) <= bounds[0] <= bounds[1] < (1 << 63):
+                known[ast.dump(ast.parse(target.id, mode="eval").body)] = bounds
         if known == previous:
-            break
-    return known
+            return known
 
 
-def _function_statements(
-    node: ast.FunctionDef | ast.AsyncFunctionDef,
-) -> tuple[str, ...]:
-    """Return a function body independent of its docstring and generated name."""
-    return tuple(
-        ast.dump(statement)
-        for statement in node.body
-        if not (
-            isinstance(statement, ast.Expr)
-            and isinstance(statement.value, ast.Constant)
-            and isinstance(statement.value.value, str)
-        )
-    )
-
-
-def _integer_expression(node: ast.expr, *, known: set[str]) -> bool:
-    """Prove a scalar integer through literals, builtins, or single-assignment facts."""
-    if ast.dump(node) in known:
-        return True
+def _integer_range(
+    node: ast.expr,
+    *,
+    known: dict[str, tuple[int, int]],
+) -> tuple[int, int] | None:
+    """Bound Python integer arithmetic conservatively, without machine overflow."""
+    if (bounds := known.get(ast.dump(node))) is not None:
+        return bounds
     if isinstance(node, ast.Constant):
-        return type(node.value) is int
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-        return node.func.id in known and node.func.id in {"len", "int"}
-    if isinstance(node, ast.UnaryOp) and isinstance(
-        node.op,
-        ast.UAdd | ast.USub | ast.Invert,
+        if isinstance(node.value, int) and not isinstance(node.value, bool):
+            return node.value, node.value
+        return None
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in known
+        and len(node.args) == 1
+        and not node.keywords
     ):
-        return _integer_expression(node.operand, known=known)
-    if isinstance(node, ast.BinOp) and isinstance(
-        node.op,
-        ast.Add
-        | ast.Sub
-        | ast.Mult
-        | ast.FloorDiv
-        | ast.Mod
-        | ast.LShift
-        | ast.RShift
-        | ast.BitAnd
-        | ast.BitOr
-        | ast.BitXor,
-    ):
-        return _integer_expression(node.left, known=known) and _integer_expression(
-            node.right,
-            known=known,
-        )
-    return False
+        if node.func.id == "len":
+            return 0, sys.maxsize
+        if node.func.id == "int":
+            return _integer_range(node.args[0], known=known)
+    if isinstance(node, ast.UnaryOp):
+        bounds = _integer_range(node.operand, known=known)
+        if bounds is not None:
+            if isinstance(node.op, ast.UAdd):
+                return bounds
+            if isinstance(node.op, ast.USub):
+                return -bounds[1], -bounds[0]
+            if isinstance(node.op, ast.Invert):
+                return ~bounds[1], ~bounds[0]
+    if isinstance(node, ast.BinOp):
+        left = _integer_range(node.left, known=known)
+        right = _integer_range(node.right, known=known)
+        if left is not None and right is not None:
+            if isinstance(node.op, ast.Add):
+                return left[0] + right[0], left[1] + right[1]
+            if isinstance(node.op, ast.Sub):
+                return left[0] - right[1], left[1] - right[0]
+            if isinstance(node.op, ast.Mult):
+                products = tuple(a * b for a in left for b in right)
+                return min(products), max(products)
+    return None
 
 
 def _numpy_member(node: ast.expr) -> str:
