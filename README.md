@@ -24,6 +24,10 @@ uv run --group pre-commit pre-commit run --all-files
 the pre-commit Git hook. It creates missing configuration and preserves
 existing hooks, comments, hook arguments, and the project's Python support range.
 Running it again does not duplicate hooks.
+Notebook tooling is opt-in: `codedoctor install --notebooks` adds the notebook
+extra and the `nbstripout` and `jupytext-sync` hooks. Default installs add
+neither. Existing hooks are preserved, including previously added notebook
+hooks.
 
 The installer writes Ruff, ty, basedpyright, and pyrefly settings from the
 package's bundled policy into `pyproject.toml`. It also configures pytest,
@@ -39,7 +43,7 @@ unless the project requires a shared helper.
 
 Setup uses the same hook configuration as this repository, without its
 package-export and Rust-only checks. Commits autofix whitespace, spelling,
-notebooks, house lint, and Ruff formatting; check types with ty, pyrefly, and
+Codedoctor lint, and Ruff formatting; check types with ty, pyrefly, and
 basedpyright; and run paired tests, coverage checks, and sampled mutation tests.
 Pre-push checks are opt-in: install them with `pre-commit install --hook-type
 pre-push` to run repository-wide type checks and all test tiers.

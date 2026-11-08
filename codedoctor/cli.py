@@ -62,7 +62,10 @@ def main() -> int:
                 "Codedoctor configuration is stale; run `codedoctor install`.\n",
             )
             return 1
-        overrides = install.install(Path(root.stdout.strip()))
+        overrides = install.install(
+            Path(root.stdout.strip()),
+            notebooks=flags.notebooks,
+        )
     except subprocess.CalledProcessError as error:
         sys.stderr.write(f"codedoctor: {cast(object, error.stderr) or error}\n")
         return error.returncode
@@ -84,12 +87,21 @@ class Flags(Protocol):
     """Parsed Codedoctor command."""
 
     command: str
+    notebooks: bool
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
     """Register setup commands and stage dispatchers."""
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("install", help="Configure tools and install Git hooks.")
+    setup = commands.add_parser(
+        "install",
+        help="Configure tools and install Git hooks.",
+    )
+    setup.add_argument(
+        "--notebooks",
+        action="store_true",
+        help="Install notebook dependencies and output-stripping/sync hooks.",
+    )
     commands.add_parser(
         "check",
         help="Check generated policy freshness without modifying files.",
