@@ -3488,7 +3488,6 @@ def test_snapshot_math_libraries_run_single_threaded() -> None:
     environ = {"PATH": "/bin", "OMP_NUM_THREADS": "64"}
     assert single_threaded_env(environ) == {
         "MKL_CBWR": "COMPATIBLE",
-        "OPENBLAS_CORETYPE": "Haswell",
         "PATH": "/bin",
         "OMP_NUM_THREADS": "1",
         "MKL_NUM_THREADS": "1",

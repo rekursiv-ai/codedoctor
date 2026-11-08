@@ -8,6 +8,10 @@ def test_the_pins_are_the_ones_the_test_harness_sets() -> None:
     assert kernel_pins() == resources.kernel_pins()
 
 
+def test_openblas_detects_the_hosts_usable_cpu_instructions() -> None:
+    assert "OPENBLAS_CORETYPE" not in kernel_pins()
+
+
 if __name__ == "__main__":
     from codedoctor.lib.testing.runner import test_main
 
