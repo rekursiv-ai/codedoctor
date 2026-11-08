@@ -136,8 +136,14 @@ def project_config(text: str, *, name: str) -> str:
         dict[str, MutablePlainTree],
     )
     project_name = from_plain(project_fields.get("name", name), str)
-    supported = from_plain(project_fields.get("requires-python", ">=3.12"), str)
-    floor = re.search(r"(?:>=|==|~=)\s*(3\.\d+)", supported)
+    floor = (
+        re.search(
+            r"(?:>=|==|~=)\s*(3\.\d+)",
+            from_plain(project_fields["requires-python"], str),
+        )
+        if "requires-python" in project_fields
+        else None
+    )
     policy.apply(
         document,
         defaults=policy.defaults(
@@ -200,14 +206,13 @@ def hook_config(text: str, *, notebooks: bool = False) -> str:
             )
     missing: list[dict[str, object]] = []
     for repo in expected:
-        metadata = {key: value for key, value in repo.items() if key != "hooks"}
         hooks = [
             hook
             for hook in from_plain(repo["hooks"], list[dict[str, object]])
             if _hook_identity(repo, hook=hook) not in existing
         ]
         if hooks:
-            missing.append({**metadata, "hooks": hooks})
+            missing.append({**repo, "hooks": hooks})
     if not missing:
         return text
     return _append_repos(text, repos=missing)
