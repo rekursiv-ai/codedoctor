@@ -238,7 +238,11 @@ def _hook_repos() -> list[dict[str, object]]:
 
 def _append_repos(text: str, *, repos: list[dict[str, object]]) -> str:
     """Insert repositories without reserializing existing configuration."""
-    tree = yaml.compose(text, Loader=yaml.SafeLoader)
+    loader = yaml.SafeLoader(text)
+    try:
+        tree = loader.get_single_node()
+    finally:
+        loader.dispose()
     if tree is None:
         return (
             text
@@ -250,7 +254,6 @@ def _append_repos(text: str, *, repos: list[dict[str, object]]) -> str:
                     "default_install_hook_types": ["pre-commit", "pre-push"],
                     "repos": repos,
                 },
-                sort_keys=False,
             )
         )
     assert isinstance(tree, MappingNode)
@@ -262,7 +265,6 @@ def _append_repos(text: str, *, repos: list[dict[str, object]]) -> str:
         fragment = yaml.safe_dump(
             {"repos": repos},
             default_flow_style=True,
-            sort_keys=False,
         ).strip()[1:-1]
         position = (
             tree.value[-1][1].end_mark.index
@@ -272,11 +274,7 @@ def _append_repos(text: str, *, repos: list[dict[str, object]]) -> str:
         return (
             text[:position] + (", " if tree.value else "") + fragment + text[position:]
         )
-    return (
-        text.rstrip()
-        + "\nrepos:\n"
-        + textwrap.indent(yaml.safe_dump(repos, sort_keys=False), "  ")
-    )
+    return text.rstrip() + "\nrepos:\n" + textwrap.indent(yaml.safe_dump(repos), "  ")
 
 
 def _append_repo(
@@ -293,14 +291,13 @@ def _append_repo(
         fragment = yaml.safe_dump(
             repos,
             default_flow_style=True,
-            sort_keys=False,
         ).strip()[1:-1]
         return (
             text[:position] + (", " if node.value else "") + fragment + text[position:]
         )
     position = node.end_mark.index
     fragment = textwrap.indent(
-        yaml.safe_dump(repos, sort_keys=False),
+        yaml.safe_dump(repos),
         " " * node.start_mark.column,
     )
     return text[:position].rstrip() + "\n" + fragment + text[position:]
