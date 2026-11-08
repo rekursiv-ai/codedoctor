@@ -3,6 +3,23 @@
 All notable codedoctor changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.1.4 - 2026-11-07
+
+### Changed
+
+- Provision pinned, checksummed CodeGraph and skip indexing when unavailable.
+- Generate checker policy from packaged defaults, preserving project overrides.
+- Check for stale generated configuration.
+- Require explicit project settings for user-directory lint rules.
+- Apply coverage floors to sources owned by changed tests.
+
+### Fixed
+
+- Preserve leading whitespace in hook configuration.
+- Prove integer bounds for NumPy `arange` defaults.
+- Restrict mutation's vendored-tree filter to stub directories.
+- Fix mutant import shadowing.
+
 ## 0.1.3 - 2026-11-07
 
 ### Changed
