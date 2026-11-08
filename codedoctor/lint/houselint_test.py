@@ -463,6 +463,24 @@ def test_a_fix_flag_is_separate_from_the_settings() -> None:
     assert flags.fix == "digits"
 
 
+def test_userdirs_policy_is_set_through_the_set_flag() -> None:
+    """Each project names its own helper and namespace; nothing is built in."""
+    xdg, _ = _configured(
+        houselint_rules.XdgLiteralRule(),
+        "--set",
+        "xdg-literal.helper=codedoctor.lib.userdirs",
+    )
+    namespace, _ = _configured(
+        houselint_rules.UserdirsNamespaceRule(),
+        "--set",
+        "userdirs-namespace.namespace=rekursiv-ai",
+    )
+    assert xdg.helper == "codedoctor.lib.userdirs"
+    assert namespace.namespace == "rekursiv-ai"
+    assert houselint_rules.XdgLiteralRule().helper == ""
+    assert houselint_rules.UserdirsNamespaceRule().namespace == ""
+
+
 def test_a_setting_is_coerced_to_the_declared_field_type() -> None:
     """Values arrive as CLI text; the field's type decides what they become."""
     rule, _ = _configured(DigitsRule(), "--set", "digits.min-digits=7")
@@ -3098,7 +3116,9 @@ def test_xdg_rule_reports_home_lookup_forms(tmp_path: Path) -> None:
         tmp_path,
         'import os\na = os.getenv("HOME")\nb = os.environ["HOME"]\n',
     )
-    findings = houselint_rules.XdgLiteralRule().check(unit)
+    findings = houselint_rules.XdgLiteralRule(helper="codedoctor.lib.userdirs").check(
+        unit
+    )
     assert len(findings) == 2
     assert all("userdirs" in finding.message for finding in findings)
 

@@ -3,34 +3,34 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, TypedDict, cast
+from typing import Final
 
 import re
 import shutil
 import subprocess
 import textwrap
-import tomllib
 
-from tomlkit.items import InlineTable, Table
-from treekle import from_plain
+from treekle import MutablePlainTree, from_plain
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
 import tomlkit
 import yaml
 
+from codedoctor import codegraph, policy
+
 
 _THIS: Final = Path(__file__).resolve()
 _CWD: Final = _THIS.parent
 
-if TYPE_CHECKING:
-    from tomlkit.toml_document import TOMLDocument
 
-
-def install(root: Path) -> None:
+def install(root: Path) -> tuple[str, ...]:
     """Configure and activate Codedoctor in a Git repository.
 
     Args:
-      root: Repository root; no source files or existing policy are rewritten.
+      root: Repository root; explicit project overrides are preserved.
+
+    Returns:
+      overrides: Native settings differing from the canonical policy.
 
     Raises:
       ValueError: Existing configuration cannot be merged safely.
@@ -87,8 +87,17 @@ def install(root: Path) -> None:
         cwd=root,
         check=True,
     )
+    codegraph.install()
     _bootstrap_hooks(root)
     _update_gitignore(root)
+    return policy.overrides(tomlkit.parse(configured_project))
+
+
+def current(root: Path) -> bool:
+    """Check generated policy freshness without changing files or dependencies."""
+    path = root / "pyproject.toml"
+    text = path.read_text() if path.exists() else ""
+    return bool(text) and project_config(text, name=root.name) == text
 
 
 def project_config(text: str, *, name: str) -> str:
@@ -103,27 +112,34 @@ def project_config(text: str, *, name: str) -> str:
 
     """
     document = tomlkit.parse(text)
-    dependencies = _table(document, key="dependency-groups")
+    dependencies = policy.table(document, key="dependency-groups")
     dependencies.setdefault("pre-commit", [])
-    tool = _table(document, key="tool")
-    uv = _table(tool, key="uv")
+    tool = policy.table(document, key="tool")
+    uv = policy.table(tool, key="uv")
     if "project" not in document:
-        project = _table(document, key="project")
+        project = policy.table(document, key="project")
         project["name"] = "-".join(re.findall(r"[a-z0-9]+", name.lower())) or "project"
         project["version"] = "0.1.0"
         project["requires-python"] = ">=3.12"
         project["dependencies"] = []
         uv.setdefault("package", False)
-    groups = _table(uv, key="dependency-groups")
-    group = _table(groups, key="pre-commit")
+    groups = policy.table(uv, key="dependency-groups")
+    group = policy.table(groups, key="pre-commit")
     group.setdefault("requires-python", ">=3.12")
-    pytest = _table(tool, key="pytest")
-    options = _table(pytest, key="ini_options")
-    options.setdefault("python_files", ["test_*.py", "*_test.py"])
-    houselint = _table(tool, key="houselint")
-    houselint.setdefault("select", "ALL")
-    houselint.setdefault("fix", "ALL")
-    houselint.setdefault("exclude", _test_exclusions())
+    project_fields = from_plain(
+        policy.table(document, key="project").unwrap(),
+        dict[str, MutablePlainTree],
+    )
+    project_name = from_plain(project_fields.get("name", name), str)
+    supported = from_plain(project_fields.get("requires-python", ">=3.12"), str)
+    floor = re.search(r"(?:>=|==|~=)\s*(3\.\d+)", supported)
+    policy.apply(
+        document,
+        defaults=policy.defaults(
+            name=project_name,
+            python_version=floor[1] if floor else "3.12",
+        ),
+    )
     return tomlkit.dumps(document)
 
 
@@ -148,12 +164,12 @@ def hook_config(text: str) -> str:
     )
     expected = _hook_repos()
     wanted = [
-        ({key: value for key, value in repo.items() if key != "hooks"}, hook)
+        _hook_identity(repo, hook=hook)
         for repo in expected
         for hook in from_plain(repo["hooks"], list[dict[str, object]])
     ]
     existing = [
-        ({key: value for key, value in repo.items() if key != "hooks"}, hook)
+        _hook_identity(repo, hook=hook)
         for repo in repos
         for hook in from_plain(repo.get("hooks", []), list[dict[str, object]])
     ]
@@ -171,7 +187,7 @@ def hook_config(text: str) -> str:
         hooks = [
             hook
             for hook in from_plain(repo["hooks"], list[dict[str, object]])
-            if (metadata, hook) not in existing
+            if _hook_identity(repo, hook=hook) not in existing
         ]
         if hooks:
             missing.append({**metadata, "hooks": hooks})
@@ -180,35 +196,16 @@ def hook_config(text: str) -> str:
     return _append_repos(text, repos=missing)
 
 
-class _HouselintDefaults(TypedDict):
-    exclude: list[str]
-
-
-class _ToolDefaults(TypedDict):
-    houselint: _HouselintDefaults
-
-
-class _ProjectDefaults(TypedDict):
-    tool: _ToolDefaults
-
-
-def _test_exclusions() -> list[str]:
-    """Read portable test exemptions from the package's canonical policy."""
-    template = _THIS.with_name("install_defaults.toml")
-    # Only the wheel holds the copy; a checkout, monorepo or export, reads its own.
-    if not template.is_file():
-        template = next(
-            folder / "pyproject.toml"
-            for folder in _THIS.parents
-            if (folder / "pyproject.toml").is_file()
-        )
-    config = from_plain(tomllib.loads(template.read_text()), _ProjectDefaults)
-    return [
-        spec.replace("*_test.py", "*_test.py test_*.py")
-        for spec in config["tool"]["houselint"]["exclude"]
-        if set(spec.partition("=")[0].split())
-        & {"*_test.py", "**/tests/test*.py", "conftest.py"}
-    ]
+def _hook_identity(
+    repo: dict[str, object],
+    *,
+    hook: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Match hook definitions without taking ownership of project arguments."""
+    return (
+        {key: value for key, value in repo.items() if key != "hooks"},
+        {key: value for key, value in hook.items() if key != "args"},
+    )
 
 
 def _hook_repos() -> list[dict[str, object]]:
@@ -301,18 +298,6 @@ def _append_repo(
         " " * node.start_mark.column,
     )
     return text[:position].rstrip() + "\n" + fragment + text[position:]
-
-
-def _table(
-    parent: TOMLDocument | Table | InlineTable,
-    *,
-    key: str,
-) -> Table | InlineTable:
-    """Return a TOML table, creating it only when absent."""
-    item = cast(object, parent.setdefault(key, tomlkit.table()))
-    if not isinstance(item, Table | InlineTable):
-        raise TypeError(f"Expected a TOML table for {key!r}.")
-    return item
 
 
 def _bootstrap_hooks(root: Path) -> None:

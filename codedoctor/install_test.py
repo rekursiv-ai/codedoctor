@@ -9,13 +9,14 @@ import subprocess
 import tomllib
 
 from ruamel.yaml import YAML
-from treekle import from_plain
+from treekle import MutablePlainTree, from_plain
 
 import pytest
 import rignore
+import tomlkit
 import yaml
 
-from codedoctor import install
+from codedoctor import codegraph, install, policy
 
 
 if TYPE_CHECKING:
@@ -36,8 +37,10 @@ def test_project_config_creates_a_virtual_project() -> None:
     assert document["tool"]["uv"]["package"] is False
     assert document["tool"]["houselint"]["select"] == "ALL"
     assert document["tool"]["houselint"]["fix"] == "ALL"
-    policy = from_plain(tomllib.loads(text), install._ProjectDefaults)
-    exclusions = policy["tool"]["houselint"]["exclude"]
+    settings = from_plain(document, dict[str, MutablePlainTree])
+    tools = policy.table(settings, key="tool")
+    houselint = policy.table(tools, key="houselint")
+    exclusions = from_plain(houselint["exclude"], list[str])
     assert any(
         "*_test.py" in spec and "assert" in spec.split("=")[1].split()
         for spec in exclusions
@@ -60,21 +63,38 @@ def test_project_config_preserves_policy_and_comments() -> None:
         '[tool.houselint]\nselect = "digits"\nfix = ""\nexclude = ["custom.py = digits"]\n'
     )
     text = install.project_config(original, name="ignored")
-    assert text.startswith(original)
     assert "# Keep Python 3.10 support." in text
+    assert tomllib.loads(text)["tool"]["ruff"]["line-length"] == 100
+    assert tomllib.loads(text)["tool"]["houselint"]["select"] == "digits"
     assert tomllib.loads(text)["project"]["requires-python"] == ">=3.10"
     assert tomllib.loads(text)["tool"]["uv"]["dependency-groups"]["pre-commit"] == {
         "requires-python": ">=3.13",
     }
 
 
+def test_project_config_accepts_interleaved_project_and_tool_tables() -> None:
+    original = (
+        '[project]\nname = "consumer"\nrequires-python = ">=3.12"\n'
+        "[tool.ruff]\nline-length = 100\n"
+        '[build-system]\nrequires = ["hatchling"]\n'
+        '[project.scripts]\nconsumer = "consumer:main"\n'
+        '[tool.ty.rules]\nall = "warn"\n'
+        '[tool.ruff.lint]\nselect = ["ALL"]\n'
+    )
+    configured = install.project_config(original, name="ignored")
+    parsed = tomllib.loads(configured)
+    assert parsed["project"]["scripts"] == {"consumer": "consumer:main"}
+    assert parsed["tool"]["ruff"]["line-length"] == 100
+    assert parsed["tool"]["ruff"]["lint"]["select"] == ["ALL"]
+    assert install.project_config(configured, name="ignored") == configured
+
+
 def test_project_config_keeps_pytest_discovery_defaults() -> None:
     text = install.project_config('[project]\nname = "demo"\n', name="demo")
     config = tomllib.loads(text)
-    assert config["tool"]["pytest"]["ini_options"]["python_files"] == [
-        "test_*.py",
-        "*_test.py",
-    ]
+    defaults = tomllib.loads(tomlkit.dumps(policy.defaults(name="demo")))
+    assert config["tool"]["pytest"] == defaults["pytest"]
+    assert policy.overrides(tomlkit.parse(text)) == ()
 
 
 def test_hook_config_preserves_existing_hooks_and_comments() -> None:
@@ -228,6 +248,24 @@ def test_appending_repositories_preserves_leading_whitespace(
     )
 
 
+def test_hook_config_preserves_project_owned_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    defaults: list[dict[str, object]] = [
+        {
+            "repo": "checks",
+            "rev": "v1",
+            "hooks": [{"id": "size", "args": ["--maxkb=800", "--enforce-all"]}],
+        },
+    ]
+    monkeypatch.setattr(install, "_hook_repos", lambda: defaults)
+    original = (
+        "repos:\n- repo: checks\n  rev: v1\n  hooks:\n"
+        "  - id: size\n    args: [--maxkb=5000, --enforce-all]\n"
+    )
+    assert install.hook_config(original) == original
+
+
 def test_hook_config_rejects_conflicting_hook_before_writing() -> None:
     original = (
         "repos:\n  - repo: local\n    hooks:\n      - id: ty-check\n"
@@ -282,6 +320,8 @@ def test_install_locks_dependencies_then_installs_both_git_hooks(
     def which(name: str) -> str | None:
         return f"/tools/{name}" if found_executables else None
 
+    ensured: list[str] = []
+    monkeypatch.setattr(codegraph, "install", lambda: ensured.append("codegraph"))
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(shutil, "which", which)
     install.install(tmp_path)
@@ -330,6 +370,8 @@ def test_install_locks_dependencies_then_installs_both_git_hooks(
         "--hook-type",
         "pre-push",
     ]
+    assert calls[2] == [git, "rev-parse", "--git-common-dir"]
+    assert ensured == ["codegraph", "codegraph"]
     assert (tmp_path / "pyproject.toml").is_file()
     assert (tmp_path / ".pre-commit-config.yaml").is_file()
     for name in ("pre-commit", "pre-push"):
@@ -500,11 +542,16 @@ def test_packaged_defaults_preserve_test_semantics(
         '[tool.houselint]\nexclude = ["*_test.py **/tests/test*.py = assert globals", '
         '"conftest.py = module-side-effects", "private.py = globals"]\n',
     )
-    monkeypatch.setattr(install, "_THIS", module)
+    monkeypatch.setattr(policy, "_THIS", module)
     configured = tomllib.loads(install.project_config("", name="demo"))
     assert configured["tool"]["houselint"] == {
         "select": "ALL",
         "fix": "ALL",
+        "set": [
+            "import-alias.first-party=demo",
+            "test-footer.runner=codedoctor.lib.testing.runner",
+            "userdirs-namespace.namespace=demo",
+        ],
         "exclude": [
             "*_test.py test_*.py **/tests/test*.py = assert globals",
             "conftest.py = module-side-effects",
@@ -527,7 +574,7 @@ def test_a_checkout_without_the_packaged_defaults_reads_its_nearest_pyproject(
         '"*_test.py = assert", "**/tests/test*.py = globals", '
         '"private.py = conftest.py = globals"]\n',
     )
-    monkeypatch.setattr(install, "_THIS", tmp_path / "pkg" / "sub" / "install.py")
+    monkeypatch.setattr(policy, "_THIS", tmp_path / "pkg" / "sub" / "install.py")
 
     configured = tomllib.loads(install.project_config("", name="demo"))
 
@@ -535,6 +582,42 @@ def test_a_checkout_without_the_packaged_defaults_reads_its_nearest_pyproject(
         "*_test.py test_*.py = assert",
         "**/tests/test*.py = globals",
     ]
+
+
+@pytest.mark.parametrize("supported", [">=3.10", "==3.14.*", "~=3.13", "<4"])
+def test_checker_versions_follow_the_project_floor(supported: str) -> None:
+    text = install.project_config(
+        f'[project]\nname = "my-project"\nrequires-python = "{supported}"\n',
+        name="directory",
+    )
+    config = tomllib.loads(text)
+    version = {">=3.10": "3.10", "==3.14.*": "3.14", "~=3.13": "3.13", "<4": "3.12"}[
+        supported
+    ]
+    assert config["tool"]["ruff"]["target-version"] == "py" + version.replace(".", "")
+    assert config["tool"]["ruff"]["lint"]["isort"]["known-first-party"] == [
+        "my_project",
+    ]
+    assert config["tool"]["ty"]["environment"]["python-version"] == version
+    assert config["tool"]["pyrefly"]["python-version"] == version + ".0"
+    assert config["tool"]["basedpyright"]["pythonVersion"] == version
+    assert (
+        config["tool"]["houselint"]["set"][0] == "import-alias.first-party=my_project"
+    )
+    assert install.project_config(text, name="different-directory") == text
+
+
+def test_check_detects_new_and_stale_configuration(tmp_path: Path) -> None:
+    assert not install.current(tmp_path)
+    path = tmp_path / "pyproject.toml"
+    path.write_text(install.project_config("", name=tmp_path.name))
+    assert install.current(tmp_path)
+    document = tomlkit.parse(path.read_text())
+    document["tool"]["ruff"]["show-fixes"] = False
+    path.write_text(tomlkit.dumps(document))
+    assert install.current(tmp_path)
+    path.write_text('[project]\nname = "demo"\n')
+    assert not install.current(tmp_path)
 
 
 if __name__ == "__main__":

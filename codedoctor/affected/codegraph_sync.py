@@ -6,8 +6,8 @@ exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$
 Keep this worktree's CodeGraph index current.
 
 Hook mode runs when an enabled hook's resolved PRECOMMIT_SCOPE needs the graph.
-It installs the CLI if missing and syncs the current filesystem state into the
-worktree's index. It never resolves or fetches a commit. It never fails a commit:
+It skips indexing when the CLI is missing; `codedoctor install` provisions it.
+It never resolves or fetches a commit. It never fails a commit:
 a problem is printed, and `affected` retries before selecting dependents.
 
 --refresh republishes the backbone at origin/main; a timer runs it with --fetch.
@@ -37,6 +37,7 @@ import sqlite3
 import subprocess
 import sys
 
+from codedoctor import codegraph
 from codedoctor.affected import backbone
 from codedoctor.affected.affected import ensure_derived
 from codedoctor.gate.gate import output_argv, run_argv, scope, skipped
@@ -82,7 +83,6 @@ def main() -> int:
             Path.cwd(),
             caches=flags.caches,
             run=run_argv,
-            which=shutil.which,
         )
     ):
         sys.stderr.write(f"codegraph-sync: {problem}\n")
@@ -113,7 +113,6 @@ def sync(
     *,
     caches: Path,
     run: Callable[[Sequence[str]], int],
-    which: Callable[[str], str | None],
 ) -> str:
     """Sync the current worktree's files into its CodeGraph index.
 
@@ -121,19 +120,13 @@ def sync(
       root: The worktree.
       caches: The CodeGraph cache directory.
       run: Runs one argv; returns its exit code.
-      which: Finds an executable on PATH.
 
     Returns:
       problem: Why the gates must select without the graph; empty otherwise.
 
     """
-    if which("codegraph") is None:
-        run(["npm", "install", "-g", "@colbymchenry/codegraph"])
-        if which("codegraph") is None:
-            return (
-                "The codegraph CLI is missing, and `npm install -g "
-                "@colbymchenry/codegraph` did not install it."
-            )
+    if codegraph.executable() is None:
+        return "Skipped: CodeGraph is not installed; run `codedoctor install`."
     return backbone.sync_worktree(root, caches=caches, run=run)
 
 
@@ -311,11 +304,7 @@ def _refresh_locked(
         ):
             return f"`git read-tree` of {sha[:12]} failed (exit {status})."
         working = tree / ".codegraph" / "codegraph.db"
-        if status := run(
-            ["codegraph", "sync", "--quiet", str(tree)]
-            if working.is_file()
-            else ["codegraph", "init", "--yes", str(tree)],
-        ):
+        if status := backbone.index_tree(tree, run=run):
             return f"Indexing {sha[:12]} failed (codegraph exit {status})."
         _publish(working, database, sha=sha)
     if ensure_derived(database) is None:

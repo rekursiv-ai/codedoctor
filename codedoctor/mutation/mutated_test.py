@@ -1256,6 +1256,37 @@ def test_a_function_whose_mutants_are_all_killed_passes(tmp_path: Path) -> None:
 
 @pytest.mark.cli_git
 @pytest.mark.cli_python_subprocess
+def test_flat_project_package_does_not_shadow_mutants(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _runnable(root, source_paths='["."]')
+    (root / "__init__.py").touch()
+    (root / "mod.py").write_text(
+        "from pathlib import Path\n"
+        "ASSET = Path(__file__).with_name('support.txt').read_text()\n"
+        "def first(value):\n    return value + int(ASSET)\n",
+    )
+    (root / "support.txt").write_text("1")
+    (root / "mod_test.py").write_text(
+        "from mod import first\ndef test_first():\n    assert first(2) == 3\n",
+    )
+
+    report = run_shard(
+        root,
+        shard=Shard(source="mod.py", filters=("mod.x_first__mutmut_*",)),
+        snapshot=tmp_path / "snapshot",
+        template=_template(root, tmp_path),
+        workers=1,
+        timeout_sec=None,
+    )
+
+    assert report.failure == ""
+    assert report.checked > 0
+    assert not any(report.outcomes.values())
+
+
+@pytest.mark.cli_git
+@pytest.mark.cli_python_subprocess
 def test_a_mutant_that_skips_every_selected_test_is_killed(tmp_path: Path) -> None:
     """Pytest exits 0 when it skips everything; such a mutant ran no test at all.
 
@@ -1587,6 +1618,178 @@ def test_only_unobservable_mutants_are_dropped(
     expected: bool,
 ) -> None:
     assert _only_unobservable(before, after) is expected
+
+
+@pytest.mark.parametrize(
+    ("query", "replacement", "context", "expected"),
+    [
+        (
+            "SELECT 1 FROM programs LIMIT 1",
+            "select 1 from programs limit 1",
+            True,
+            True,
+        ),
+        (
+            "SELECT 1 FROM programs LIMIT 1",
+            "SELECT 1 FROM PROGRAMS LIMIT 1",
+            True,
+            True,
+        ),
+        (
+            "SELECT 1 FROM programs LIMIT 1",
+            "SELECT 2 FROM programs LIMIT 1",
+            True,
+            False,
+        ),
+        (
+            "SELECT 1 FROM programs LIMIT 1",
+            "SELECT 1 FROM channels LIMIT 1",
+            True,
+            False,
+        ),
+        (
+            "SELECT 1 FROM programs LIMIT 1",
+            "SELECT 1 FROM programs LIMIT 2",
+            True,
+            False,
+        ),
+        (
+            "SELECT 'a' FROM programs LIMIT 1",
+            "SELECT 'A' FROM programs LIMIT 1",
+            True,
+            False,
+        ),
+        (
+            "SELECT title FROM programs LIMIT 1",
+            "SELECT TITLE FROM programs LIMIT 1",
+            True,
+            False,
+        ),
+        (
+            "SELECT 1 FROM programs LIMIT 1",
+            "select 1 from programs limit 1",
+            False,
+            False,
+        ),
+    ],
+)
+def test_sqlite_numeric_projection_case_mutants(
+    query: str,
+    replacement: str,
+    context: bool,
+    expected: bool,
+) -> None:
+    module = (
+        "import sqlite3\ndef _get_conn() -> sqlite3.Connection:\n"
+        "    return sqlite3.connect(':memory:')\n"
+        if context
+        else ""
+    )
+    before = f"def f():\n    conn = _get_conn()\n    return conn.execute({query!r}).fetchone()\n"
+    after = before.replace(repr(query), repr(replacement))
+    assert _only_unobservable(before, after, context=module) is expected
+    assert _only_unobservable(after, before, context=module) is expected
+
+
+@pytest.mark.parametrize(
+    ("context", "assignment"),
+    [
+        ("import unrelated", "conn = _get_conn()"),
+        ("import sqlite3 as other", "conn = _get_conn()"),
+        ("import sqlite3", "conn = _get_conn(); conn = other()"),
+        ("import sqlite3", "holder.conn = _get_conn()"),
+        ("import sqlite3", "conn, other = _get_conn()"),
+    ],
+)
+def test_sqlite_query_case_requires_an_unrebound_connection(
+    context: str,
+    assignment: str,
+) -> None:
+    context += "\ndef _get_conn() -> sqlite3.Connection:\n    pass\n"
+    before = (
+        "def f():\n    ASSIGNMENT\n"
+        "    return conn.execute('SELECT 1 FROM programs LIMIT 1')\n"
+    ).replace("ASSIGNMENT", assignment)
+    after = before.replace(
+        "SELECT 1 FROM programs LIMIT 1",
+        "select 1 from programs limit 1",
+    )
+    assert not _only_unobservable(before, after, context=context)
+
+
+def test_sqlite_query_canonical_form_is_lowercase() -> None:
+    context = "import sqlite3\ndef _get_conn() -> sqlite3.Connection:\n    pass\n"
+    source = "conn = _get_conn()\nconn.execute('SELECT 1 FROM PROGRAMS LIMIT 1')\n"
+    assert mutated._erase_unobservable(source, context=context) == ast.dump(
+        ast.parse(
+            source.replace(
+                "SELECT 1 FROM PROGRAMS LIMIT 1",
+                "select 1 from programs limit 1",
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("if value:\n        use(value)", True),
+        (
+            "if fetch:\n        with suppress(Exception):\n            value = fetch()\n    if value:\n        use(value)",
+            True,
+        ),
+        ("if value:\n        use(value)\n    else:\n        fallback()", True),
+        ("return value", False),
+        ("return bool(value)", False),
+        ("if value is None:\n        use(value)", False),
+        ("if not value:\n        use(value)", False),
+        ("if value:\n        use(value)\n    else:\n        use(value)", False),
+        ("alias = value\n    if alias:\n        use(alias)", False),
+        ("value['key'] = 1", False),
+        ("value += other", False),
+        ("del value", False),
+        ("if value:\n        value = fetch()\n        use(value)", False),
+        ("def inner():\n        return value\n    return inner", False),
+        ("if value:\n        callback = lambda: value\n        use(callback)", False),
+        ("return locals()", False),
+        ("return vars()", False),
+        ("return eval('value')", False),
+        ("exec('use(value)')", False),
+        ("class Inner:\n        snapshot = locals()", False),
+    ],
+)
+@pytest.mark.parametrize("declaration", ["value: dict", "value"])
+def test_falsy_local_initializers_require_truth_guarded_reads(
+    body: str,
+    expected: bool,
+    declaration: str,
+) -> None:
+    before = f"def f():\n    {declaration} = {{}}\n    " + body + "\n"
+    after = before.replace(f"{declaration} = {{}}", f"{declaration} = None")
+    assert _only_unobservable(before, after) is expected
+    assert _only_unobservable(after, before) is expected
+
+
+@pytest.mark.parametrize("initializer", ["{}", "None", "1", "False", "'text'"])
+@pytest.mark.parametrize("declaration", ["value", "value: dict"])
+def test_falsy_local_canonical_ast(initializer: str, declaration: str) -> None:
+    source = f"def f():\n    {declaration} = {initializer}\n    if value:\n        use(value)\n"
+    canonical = (
+        source.replace(f"= {initializer}\n", "= None\n")
+        if initializer in {"{}", "None"}
+        else source
+    )
+    assert mutated._erase_unobservable(source, context="") == ast.dump(
+        ast.parse(canonical),
+    )
+
+
+def test_unsupported_function_does_not_stop_later_local_normalization() -> None:
+    source = (
+        "def unsupported():\n    return locals()\n"
+        "def supported():\n    value = {}\n    if value:\n        use(value)\n"
+    )
+    assert _only_unobservable(source, source.replace("value = {}", "value = None"))
 
 
 @pytest.mark.parametrize(
@@ -2844,6 +3047,7 @@ def test_snapshots_load_the_dynamo_plugin_after_the_projects_own_args(
         assert settings["tool"]["mutmut"]["pytest_add_cli_args"] == [
             "-o",
             "addopts=",
+            "--import-mode=importlib",
             "-p",
             "codedoctor.mutation.mutmut_dynamo",
             "-p",

@@ -34,7 +34,12 @@ def test_install_from_nested_directory(
 ) -> None:
     installed: list[Path] = []
     monkeypatch.setattr(sys, "argv", ["codedoctor", "install"])
-    monkeypatch.setattr(install, "install", installed.append)
+
+    def configure(root: Path) -> tuple[str, ...]:
+        installed.append(root)
+        return ()
+
+    monkeypatch.setattr(install, "install", configure)
 
     def root(
         argv: Sequence[str],
@@ -127,6 +132,59 @@ def test_help_description_tracks_the_module(
     with pytest.raises(SystemExit) as result:
         cli.main()
     assert result.value.code == 0
+
+
+@pytest.mark.parametrize("current", [True, False])
+def test_check_reports_stale_policy_without_installing(
+    current: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["codedoctor", "check"])
+
+    def root(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del args, kwargs
+        return subprocess.CompletedProcess([], 0, stdout=str(tmp_path))
+
+    def check(path: Path) -> bool:
+        assert path == tmp_path
+        return current
+
+    monkeypatch.setattr(subprocess, "run", root)
+    monkeypatch.setattr(install, "current", check)
+    assert cli.main() == (0 if current else 1)
+    captured = capsys.readouterr()
+    assert captured.out == ("Codedoctor configuration is current.\n" if current else "")
+    assert captured.err == (
+        ""
+        if current
+        else "Codedoctor configuration is stale; run `codedoctor install`.\n"
+    )
+
+
+def test_install_reports_preserved_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["codedoctor", "install"])
+
+    def root(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del args, kwargs
+        return subprocess.CompletedProcess([], 0, stdout=str(tmp_path))
+
+    def configure(path: Path) -> tuple[str, ...]:
+        assert path == tmp_path
+        return ("ruff.line-length", "ty.rules.all")
+
+    monkeypatch.setattr(subprocess, "run", root)
+    monkeypatch.setattr(install, "install", configure)
+    assert cli.main() == 0
+    assert (
+        capsys.readouterr().err
+        == "Codedoctor preserved project overrides: ruff.line-length, ty.rules.all\n"
+    )
 
 
 if __name__ == "__main__":
