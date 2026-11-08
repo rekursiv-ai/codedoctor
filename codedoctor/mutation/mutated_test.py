@@ -2545,10 +2545,10 @@ def test_filters_skip_tests_and_paths_outside_the_sources(tmp_path: Path) -> Non
     ) == ("pkg.mod.x_f__mutmut_*",)
 
 
-@pytest.mark.parametrize("vendored", ["third_party", "typings", ".export"])
+@pytest.mark.parametrize("vendored", ["third_party", "typings/stubs", ".export"])
 def test_filters_skip_vendored_trees(tmp_path: Path, vendored: str) -> None:
     root = _repo(tmp_path, body=_TWO_FUNCTIONS)
-    (root / "pkg" / vendored).mkdir()
+    (root / "pkg" / vendored).mkdir(parents=True)
     (root / "pkg" / vendored / "lib.py").write_text(_TWO_FUNCTIONS)
 
     assert (
@@ -2559,6 +2559,35 @@ def test_filters_skip_vendored_trees(tmp_path: Path, vendored: str) -> None:
         )
         == ()
     )
+
+
+@pytest.mark.parametrize("directory", ["typings", "pkg/typings", "pkg/stubs"])
+@pytest.mark.parametrize("most", [None, 1])
+def test_selection_keeps_packaging_runtime_outside_the_stub_tree(
+    tmp_path: Path,
+    directory: str,
+    most: int | None,
+) -> None:
+    root = _repo(tmp_path, body="")
+    _runnable(root, source_paths='["."]')
+    runtime = root / directory / "hatch_build.py"
+    runtime.parent.mkdir(parents=True, exist_ok=True)
+    runtime.write_text("def layout(paths):\n    return sorted(paths)\n")
+    placeholder = root / "pkg/typings/stubs/library/__init__.py"
+    placeholder.parent.mkdir(parents=True, exist_ok=True)
+    placeholder.write_text(_TWO_FUNCTIONS)
+
+    assert mutated.select_functions(
+        root,
+        files=[
+            runtime.relative_to(root).as_posix(),
+            placeholder.relative_to(root).as_posix(),
+        ],
+        sources=(".",),
+        seed="",
+        rate=1,
+        most=most,
+    ) == ((f"{directory.replace('/', '.')}.hatch_build.x_layout__mutmut_*",), 1)
 
 
 _SAMPLED = """\
