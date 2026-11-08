@@ -97,6 +97,27 @@ def test_project_config_keeps_pytest_discovery_defaults() -> None:
     assert policy.overrides(tomlkit.parse(text)) == ()
 
 
+@pytest.mark.parametrize("requires_python", ["", 'requires-python = ">=3.10"\n'])
+def test_project_config_uses_directory_for_dynamic_project_name(
+    requires_python: str,
+    tmp_path: Path,
+) -> None:
+    original = '[project]\ndynamic = ["name"]\n' + requires_python
+    text = install.project_config(original, name=tmp_path.name)
+    config = tomllib.loads(text)
+    assert config["project"] == tomllib.loads(original)["project"]
+    assert config["tool"]["codedoctor"]["lint"]["set"] == [
+        f"import-alias.first-party={tmp_path.name.replace('-', '_')}",
+        "test-footer.runner=codedoctor.lib.testing.runner",
+        f"userdirs-namespace.namespace={tmp_path.name}",
+    ]
+    version = "3.10" if requires_python else "3.12"
+    assert config["tool"]["ty"]["environment"]["python-version"] == version
+    path = tmp_path / "pyproject.toml"
+    path.write_text(text)
+    assert install.current(tmp_path)
+
+
 def test_hook_config_preserves_existing_hooks_and_comments() -> None:
     original = (
         "# Custom checks stay.\ndefault_stages: [manual]\nrepos:\n"
@@ -122,9 +143,13 @@ def test_hook_config_preserves_existing_hooks_and_comments() -> None:
     assert install.hook_config(configured) == configured
 
 
-@pytest.mark.parametrize("notebooks", [False, True])
-def test_hook_config_creates_valid_empty_config(notebooks: bool) -> None:
-    text = install.hook_config("", notebooks=notebooks)
+@pytest.mark.parametrize("notebooks", [None, False, True])
+def test_hook_config_creates_valid_empty_config(notebooks: bool | None) -> None:
+    text = (
+        install.hook_config("")
+        if notebooks is None
+        else install.hook_config("", notebooks=notebooks)
+    )
     assert "repos:" in text
     assert "uv --quiet run --frozen --group pre-commit" in text
     assert "loop." not in text
@@ -140,7 +165,7 @@ def test_hook_config_creates_valid_empty_config(notebooks: bool) -> None:
     ]
     ids = {hook["id"] for hook in hooks}
     assert ids & {"nbstripout", "jupytext-sync"} == (
-        {"nbstripout", "jupytext-sync"} if notebooks else set()
+        {"nbstripout", "jupytext-sync"} if notebooks is True else set()
     )
     assert {
         "end-of-file-fixer",
@@ -188,7 +213,7 @@ def test_hook_config_creates_valid_empty_config(notebooks: bool) -> None:
     assert config["fail_fast"] is False
     assert config["default_stages"] == ["pre-commit"]
     assert config["default_install_hook_types"] == ["pre-commit"]
-    assert install.hook_config(text, notebooks=notebooks) == text
+    assert install.hook_config(text, notebooks=bool(notebooks)) == text
 
 
 @pytest.mark.parametrize(
@@ -412,13 +437,13 @@ def test_hook_config_rejects_conflicting_hook_before_writing() -> None:
 
 @pytest.mark.parametrize("found_executables", [True, False])
 @pytest.mark.parametrize("existing_pre_push", [True, False])
-@pytest.mark.parametrize("notebooks", [False, True])
+@pytest.mark.parametrize("notebooks", [None, False, True])
 def test_install_locks_dependencies_then_installs_only_pre_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     found_executables: bool,
     existing_pre_push: bool,
-    notebooks: bool,
+    notebooks: bool | None,
 ) -> None:
     calls: list[list[str]] = []
     uv = "/tools/uv" if found_executables else "uv"
@@ -466,7 +491,10 @@ def test_install_locks_dependencies_then_installs_only_pre_commit(
     monkeypatch.setattr(codegraph, "install", lambda: ensured.append("codegraph"))
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(shutil, "which", which)
-    install.install(tmp_path, notebooks=notebooks)
+    if notebooks is None:
+        install.install(tmp_path)
+    else:
+        install.install(tmp_path, notebooks=notebooks)
     assert ignored.is_file()
     configured_ignore = ignored.read_text()
     assert configured_ignore.startswith(original_ignore)
@@ -477,9 +505,9 @@ def test_install_locks_dependencies_then_installs_only_pre_commit(
         tomllib.loads(original_project)["tool"]["codedoctor"]["lint"]["select"] == "ALL"
     )
     original_hooks = (tmp_path / ".pre-commit-config.yaml").read_text()
-    assert ("id: nbstripout" in original_hooks) == notebooks
-    assert ("id: jupytext-sync" in original_hooks) == notebooks
-    install.install(tmp_path, notebooks=notebooks)
+    assert ("id: nbstripout" in original_hooks) == bool(notebooks)
+    assert ("id: jupytext-sync" in original_hooks) == bool(notebooks)
+    install.install(tmp_path, notebooks=bool(notebooks))
     assert (tmp_path / "pyproject.toml").read_text() == original_project
     assert (tmp_path / ".pre-commit-config.yaml").read_text() == original_hooks
     assert ignored.read_text() == configured_ignore
@@ -490,7 +518,7 @@ def test_install_locks_dependencies_then_installs_only_pre_commit(
         "pre-commit",
         "--no-sync",
         "codedoctor[coverage,mutation,notebook]"
-        if notebooks
+        if notebooks is True
         else "codedoctor[coverage,mutation]",
         "pre-commit",
         "ruff",
