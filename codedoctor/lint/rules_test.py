@@ -6347,12 +6347,13 @@ def test_cli_header_without_safe_path_is_named_and_given_it(
     """
     unsafe = exec_line.replace(" -P ", " ")
     last = 5 + unsafe.count("\n")
+    tail = "\nRun python3 \"$0\" or python3 -m pkg.tool.\n'''\n# vim: ft=python\n"
     findings, fixed = _cli(
         tmp_path,
-        _HEAD + _PINNED + unsafe + "\n'''\n# vim: ft=python\n",
+        _HEAD + _PINNED + unsafe + tail,
     )
     assert findings == [(1, f"(a) line {last} {_EXEC_MSG}")]
-    assert fixed == _HEAD + _PINNED + exec_line + "\n'''\n# vim: ft=python\n"
+    assert fixed == _HEAD + _PINNED + exec_line + tail
 
 
 def test_cli_header_missing_exec_bit_is_reported_and_set(tmp_path: Path) -> None:

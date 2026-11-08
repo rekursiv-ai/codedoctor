@@ -6892,7 +6892,7 @@ def _fix_polyglot_header(lines: list[str]) -> None:
     # author's, so the pinned line goes in above it; overwriting would shift each
     # line onto the next, down to the docstring summary.
     for offset, (want, stem) in enumerate(
-        zip(_POLYGLOT_HEADER[:2], ("#", 4 * "'"), strict=True),
+        ((_POLYGLOT_HEADER[0], "#"), (_POLYGLOT_HEADER[1], "''''")),
         start=start,
     ):
         if offset == len(lines) or not lines[offset].startswith(stem):
@@ -6916,7 +6916,7 @@ def _fix_polyglot_header(lines: list[str]) -> None:
     # With none, the house line goes in above what follows the opener: with no
     # shell prelude, that is the docstring summary.
     launch = next(
-        (row for row in range(start + 2, exec_at) if lines[row].startswith("exec ")),
+        (row for row, line in enumerate(lines[:exec_at]) if line.startswith("exec ")),
         None,
     )
     if launch is None:
