@@ -199,6 +199,17 @@ def test_related_finds_source_and_all_its_test_pairs(
     assert related(named, root=tmp_path) == sorted(map(Path, files))
 
 
+def test_root_tests_ignore_hidden_package_owners(tmp_path: Path) -> None:
+    for name in (".hidden/sub/mod.py", "tests/sub/mod_test.py"):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+    assert related("tests/sub/mod_test.py", root=tmp_path) == [
+        Path("tests/sub/mod_test.py"),
+    ]
+
+
 def test_related_keeps_an_unpaired_file(tmp_path: Path) -> None:
     (tmp_path / "orphan_test.py").touch()
     assert related("orphan_test.py", root=tmp_path) == [Path("orphan_test.py")]
