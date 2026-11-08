@@ -8,13 +8,13 @@ from typing import TYPE_CHECKING
 
 import fcntl
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
 
 import pytest
 
+from codedoctor import codegraph
 from codedoctor.affected import backbone, codegraph_sync
 from codedoctor.gate.gate import output_argv, run_argv
 
@@ -26,8 +26,13 @@ if TYPE_CHECKING:
 _OLD, _NEW = "a" * 40, "b" * 40
 
 
+@pytest.fixture(autouse=True)
+def isolated_executable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(codegraph, "executable", lambda: "codegraph")
+
+
 class _Tools:
-    """Stands in for git, npm, and the codegraph CLI; records every argv."""
+    """Stand in for Git and CodeGraph; record every argv."""
 
     def __init__(
         self,
@@ -35,14 +40,10 @@ class _Tools:
         sha: str = _NEW,
         codegraph: int = 0,
         diff: str = "",
-        installed: bool = True,
-        installable: bool = False,
     ) -> None:
         self.sha = sha
         self.codegraph = codegraph
         self.diff = diff
-        self.installed = installed
-        self.installable = installable
         self.calls: list[list[str]] = []
 
     def run(self, argv: Sequence[str]) -> int:
@@ -58,14 +59,6 @@ class _Tools:
         if "rev-parse" in argv:
             return f"{self.sha}\n" if self.sha else None
         return self.diff if "diff" in argv else ""
-
-    def which(self, name: str) -> str | None:
-        """Find only the codegraph CLI: installed, or installable and installed by npm."""
-        npm = ["npm", "install", "-g", "@colbymchenry/codegraph"]
-        found = name == "codegraph" and (
-            self.installed or (self.installable and npm in self.calls)
-        )
-        return f"/bin/{name}" if found else None
 
     def ran(self, tool: str) -> list[list[str]]:
         """Return the recorded argvs holding the word ``tool``."""
@@ -104,7 +97,6 @@ def _sync(tmp_path: Path, tools: _Tools) -> str:
         root,
         caches=tmp_path / "caches",
         run=tools.run,
-        which=tools.which,
     )
 
 
@@ -484,28 +476,17 @@ def test_current_files_are_indexed_by_the_codegraph_cli(tmp_path: Path) -> None:
     ]
 
 
-def test_a_missing_cli_that_npm_cannot_install_is_reported(tmp_path: Path) -> None:
-    tools = _Tools(installed=False)
-
-    problem = _sync(tmp_path, tools)
-
-    assert tools.calls == [["npm", "install", "-g", "@colbymchenry/codegraph"]]
-    assert problem == (
-        "The codegraph CLI is missing, and `npm install -g "
-        "@colbymchenry/codegraph` did not install it."
+def test_a_missing_cli_skips_without_running_or_installing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = _Tools()
+    monkeypatch.setattr(codegraph, "executable", lambda: None)
+    assert _sync(tmp_path, tools) == (
+        "Skipped: CodeGraph is not installed; run `codedoctor install`."
     )
-
-
-def test_a_missing_cli_is_installed_then_used(tmp_path: Path) -> None:
-    tools = _Tools(installed=False, installable=True)
-
-    problem = _sync(tmp_path, tools)
-
-    assert tools.calls == [
-        ["npm", "install", "-g", "@colbymchenry/codegraph"],
-        ["codegraph", "init", "--yes", str(tmp_path / "root")],
-    ]
-    assert problem == ""
+    assert tools.calls == []
+    assert not (tmp_path / "root" / ".codegraph").exists()
 
 
 def test_an_installed_cli_is_not_reinstalled(tmp_path: Path) -> None:
@@ -566,7 +547,6 @@ def _main(
         assert kwargs == {
             "caches": caches,
             "run": run_argv,
-            "which": shutil.which,
         }
         called.append(f"sync {root}")
         return "overlay problem"

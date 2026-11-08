@@ -35,6 +35,7 @@ import tomllib
 
 from treekle import ReadError, from_plain
 
+from codedoctor import codegraph
 from codedoctor.affected import backbone
 from codedoctor.gate.gate import skipped
 from codedoctor.lib import sidecars
@@ -83,6 +84,8 @@ def main() -> int:
     )
     if database is None:
         database = Path.cwd() / ".codegraph" / "codegraph.db"
+        if depth > 0 and not saturated and codegraph.executable() is None:
+            depth = 0
         if depth > 0 and not saturated:
             problem = backbone.sync_worktree(
                 Path.cwd(),

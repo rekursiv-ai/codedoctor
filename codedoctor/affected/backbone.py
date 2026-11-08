@@ -27,6 +27,8 @@ import shutil
 import sqlite3
 import tempfile
 
+from codedoctor import codegraph
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -291,10 +293,11 @@ def index_tree(tree: Path, *, run: Callable[[Sequence[str]], int]) -> int:
       status: The CLI's exit code.
 
     """
+    binary = codegraph.executable() or "codegraph"
     return run(
-        ["codegraph", "sync", "--quiet", str(tree)]
+        [binary, "sync", "--quiet", str(tree)]
         if (tree / ".codegraph" / "codegraph.db").is_file()
-        else ["codegraph", "init", "--yes", str(tree)],
+        else [binary, "init", "--yes", str(tree)],
     )
 
 

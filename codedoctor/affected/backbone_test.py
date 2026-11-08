@@ -15,6 +15,7 @@ import subprocess
 
 import pytest
 
+from codedoctor import codegraph
 from codedoctor.affected import backbone
 from codedoctor.gate.gate import output_argv
 
@@ -26,6 +27,11 @@ if TYPE_CHECKING:
 _SHA = "a" * 40
 # Distinct past its 12th character, so a message shows exactly the prefix it names.
 _LONG = "0123456789abcdef" * 2 + "01234567"
+
+
+@pytest.fixture(autouse=True)
+def isolated_executable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(codegraph, "executable", lambda: "codegraph")
 
 
 def _codegraph(database: Path, *, files: Sequence[str] = ()) -> Path:
@@ -107,11 +113,15 @@ def _indexer(calls: list[Path]) -> Callable[[Path], int]:
 
 @pytest.mark.parametrize("status", [0, 3])
 @pytest.mark.parametrize("initialized", [False, True])
+@pytest.mark.parametrize("binary", [None, "/managed/codegraph"])
 def test_a_tree_syncs_its_existing_index_or_initializes_once(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     status: int,
     initialized: bool,
+    binary: str | None,
 ) -> None:
+    monkeypatch.setattr(codegraph, "executable", lambda: binary)
     if initialized:
         _codegraph(tmp_path / ".codegraph" / "codegraph.db")
     seen: list[list[str]] = []
@@ -122,9 +132,9 @@ def test_a_tree_syncs_its_existing_index_or_initializes_once(
 
     assert backbone.index_tree(tmp_path, run=run) == status
     assert seen == [
-        ["codegraph", "sync", "--quiet", str(tmp_path)]
+        [binary or "codegraph", "sync", "--quiet", str(tmp_path)]
         if initialized
-        else ["codegraph", "init", "--yes", str(tmp_path)],
+        else [binary or "codegraph", "init", "--yes", str(tmp_path)],
     ]
 
 

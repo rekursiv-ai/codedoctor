@@ -374,6 +374,41 @@ def test_pytest_without_pytest_cov_measures_nothing(tmp_path: Path) -> None:
     )
 
 
+def test_a_changed_test_measures_the_source_it_owns(tmp_path: Path) -> None:
+    """A test-only change still floors its module: the tests changed, not the bar."""
+    tools = fakes.Recorder()
+
+    assert _pytest(tmp_path, tools, ["pkg/gw_test.py"], existing=["pkg/gw.py"]) == 0
+
+    [run] = tools.calls
+    assert "--no-cov" not in run
+    assert tools.argfiles == [
+        [
+            "--cov=pkg",
+            "--cov-context=test",
+            "--cov-fail-under=0",
+            "--cov-report=",
+            "pkg/gw_test.py",
+        ],
+    ]
+
+
+def test_an_unpaired_test_only_spool_says_no_source_was_measured(
+    tmp_path: Path,
+) -> None:
+    """With pytest-cov installed, nothing to measure is not a missing plugin."""
+    tools = fakes.Recorder()
+
+    assert _pytest(tmp_path, tools, ["orphan_test.py"]) == 0
+
+    [run] = tools.calls
+    assert "--no-cov" in run
+    assert tools.argfiles == [["orphan_test.py"]]
+    assert (tmp_path / "spool" / "coverage.9").read_text() == (
+        "pytest passed but recorded no coverage: no changed source to measure\n"
+    )
+
+
 @pytest.mark.parametrize("skip", ["coverage-floor", "ruff-check, coverage-floor"])
 @pytest.mark.parametrize("status", [0, 1, 2, 5])
 def test_skipping_the_floor_disables_coverage_but_keeps_pytest(
@@ -611,6 +646,42 @@ def test_the_floor_reads_pytests_run_and_clears_it(tmp_path: Path) -> None:
         "--",
     ]
     assert tools.argfiles == [["a.py"]]
+    assert not data.exists()
+
+
+def test_the_floor_floors_the_source_a_changed_test_owns(tmp_path: Path) -> None:
+    tools = fakes.Recorder()
+    context = fakes.context(tmp_path, tools)
+    for name in ("pkg/gw.py", "pkg/gw_test.py", "orphan_test.py"):
+        (context.root / name).parent.mkdir(parents=True, exist_ok=True)
+        (context.root / name).touch()
+    spool.append(
+        context.directory,
+        gate="coverage-floor",
+        key=9,
+        paths=["pkg/gw_test.py", "orphan_test.py"],
+    )
+    testing.handoff(context).write_text("pytest's")
+
+    assert testing.floor(context) == 0
+    assert tools.argfiles == [["pkg/gw.py"]]
+
+
+def test_the_floor_with_only_unpaired_tests_runs_nothing(tmp_path: Path) -> None:
+    tools = fakes.Recorder()
+    context = fakes.context(tmp_path, tools)
+    (context.root / "orphan_test.py").touch()
+    spool.append(
+        context.directory,
+        gate="coverage-floor",
+        key=9,
+        paths=["orphan_test.py"],
+    )
+    data = testing.handoff(context)
+    data.write_text("pytest's")
+
+    assert testing.floor(context) == 0
+    assert tools.calls == []
     assert not data.exists()
 
 

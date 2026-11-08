@@ -22,8 +22,20 @@ uv run --group pre-commit pre-commit run --all-files
 
 `codedoctor install` adds a locked `pre-commit` dependency group and installs
 pre-commit and pre-push Git hooks. It creates missing configuration and preserves
-existing hooks, comments, lint rules, and the project's Python support range.
+existing hooks, comments, hook arguments, and the project's Python support range.
 Running it again does not duplicate hooks.
+
+The installer writes Ruff, ty, basedpyright, and pyrefly settings from the
+package's bundled policy into `pyproject.toml`. It also configures pytest,
+coverage floors, and mutation source selection. That policy comes from Loop's
+canonical configuration, with checkout-specific paths removed. Existing project
+settings remain overrides; installation reports their names.
+
+Codedoctor is development tooling, not an application dependency. Applications
+can use their own user-directory helpers or inline XDG handling. The installer
+uses the project name for `userdirs-namespace.namespace`; set it explicitly in
+`[tool.houselint]` to choose another namespace. `xdg-literal.helper` is unset
+unless the project requires a shared helper.
 
 Setup uses the same hook configuration as this repository, without its
 package-export and Rust-only checks. Commits autofix whitespace, spelling,
@@ -51,6 +63,26 @@ uv run codedoctor install
 Codedoctor requires Python 3.12 or newer. For projects supporting older Python,
 use the `uvx` route: its tools live in a Python 3.12+ dependency group without
 raising the application's runtime floor. Git and uv must already be installed.
+
+## Policy updates
+
+Policy changes reach projects through a new Codedoctor release. Upgrade the
+locked dependency, then reinstall:
+
+```bash
+uv lock --upgrade-package codedoctor
+uv run --group pre-commit codedoctor install
+uv run --group pre-commit codedoctor check
+```
+
+`[tool.codedoctor.managed]` records the last generated defaults. Reinstallation
+updates unchanged managed settings and adds new defaults. It preserves project
+overrides and deliberately deleted settings. Lists are replaced as whole values;
+a customized list remains an override. Do not edit the recorded baseline.
+
+`codedoctor check` exits nonzero when the installed package would refresh the
+project configuration. It does not write files or install dependencies. Preserved
+overrides do not make configuration stale.
 
 pre-commit calls a hook once per chunk of file names, so `--all-files` starts a
 type checker or pytest several times over. Each heavy gate here is two hooks: a

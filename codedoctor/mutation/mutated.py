@@ -670,6 +670,8 @@ def copy_snapshot(
     plain = cast(Mapping[str, object], settings.unwrap())
     settings["pytest_add_cli_args"] = [
         *_strings(plain.get("pytest_add_cli_args", [])),
+        # Prepend mode can put snapshot originals ahead of mutants for flat packages.
+        "--import-mode=importlib",
         "-p",
         "codedoctor.mutation.mutmut_dynamo",
         "-p",
@@ -1480,6 +1482,8 @@ def _erase_unobservable(code: str, *, context: str) -> str:
     """Dump ``code`` with proven unobservable expressions canonicalized."""
     tree = ast.parse(textwrap.dedent(code))
     integers = _integer_expressions(tree, context=context)
+    _normalize_sqlite_queries(tree, context=context)
+    _normalize_falsy_locals(tree)
     _drop_fallthrough_defaults(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Subscript) and (fallback := _raising_fallback(node)):
@@ -1608,6 +1612,134 @@ def _erase_unobservable(code: str, *, context: str) -> str:
             ):
                 keyword.value = ast.Constant(value=None)
     return ast.dump(tree)
+
+
+def _normalize_sqlite_queries(tree: ast.Module, *, context: str) -> None:
+    """Canonicalize case in numeric-projection SQLite existence queries."""
+    module = ast.parse(context)
+    if not any(
+        isinstance(node, ast.Import)
+        and any(
+            alias.name == "sqlite3" and alias.asname is None for alias in node.names
+        )
+        for node in module.body
+    ):
+        return
+    factories = {
+        node.name
+        for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.returns is not None
+        and ast.unparse(node.returns) == "sqlite3.Connection"
+    }
+    writes: dict[str, int] = defaultdict(int)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            writes[node.id] += 1
+    connections = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id in factories
+        for target in node.targets
+        if isinstance(target, ast.Name) and writes[target.id] == 1
+    }
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "execute"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in connections
+            and node.args
+            and isinstance(query := node.args[0], ast.Constant)
+            and isinstance(query.value, str)
+            # Column names and quoted values have observable case; numeric projections do not.
+            and re.fullmatch(
+                r"(?ai)select\s+[0-9]+\s+from\s+[a-z_][a-z_0-9]*\s+limit\s+[0-9]+",
+                query.value,
+            )
+        ):
+            query.value = query.value.lower()
+
+
+def _normalize_falsy_locals(tree: ast.Module) -> None:
+    """Erase empty-dict sentinels whose only reads are positively truth-guarded."""
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        nodes = list(ast.walk(function))
+        if any(
+            isinstance(node, (ast.Global, ast.Nonlocal, ast.Lambda, ast.ClassDef))
+            or (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node is not function
+            )
+            or (
+                isinstance(node, ast.Call)
+                and _callee(node) in {"locals", "vars", "eval", "exec"}
+            )
+            for node in nodes
+        ):
+            continue
+        for node in nodes:
+            match node:
+                case ast.AnnAssign(target=ast.Name(id=name), value=value):
+                    pass
+                case ast.Assign(targets=[ast.Name(id=name)], value=value):
+                    pass
+                case _:
+                    continue
+            if (
+                isinstance(value, ast.Dict)
+                and not value.keys
+                and _truth_guarded(name, nodes=nodes)
+            ):
+                node.value = ast.Constant(value=None)
+
+
+def _truth_guarded(name: str, *, nodes: list[ast.AST]) -> bool:
+    """Require every read under a positive guard with no rebinding in its body."""
+    if any(
+        (
+            isinstance(node, ast.Name)
+            and node.id == name
+            and isinstance(node.ctx, ast.Del)
+        )
+        or (
+            isinstance(node, ast.AugAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == name
+        )
+        for node in nodes
+    ):
+        return False
+    protected: set[int] = set()
+    for node in nodes:
+        if not (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == name
+        ):
+            continue
+        body = [child for statement in node.body for child in ast.walk(statement)]
+        uses = [
+            child for child in body if isinstance(child, ast.Name) and child.id == name
+        ]
+        if any(not isinstance(child.ctx, ast.Load) for child in uses):
+            return False
+        protected.add(id(node.test))
+        protected.update(id(child) for child in uses)
+    reads = {
+        id(node)
+        for node in nodes
+        if isinstance(node, ast.Name)
+        and node.id == name
+        and isinstance(node.ctx, ast.Load)
+    }
+    return reads == protected
 
 
 def _integer_expressions(

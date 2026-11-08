@@ -19,6 +19,7 @@ import threading
 
 import pytest
 
+from codedoctor import codegraph
 from codedoctor.affected import affected, backbone
 from codedoctor.affected.affected import collection_patterns, harvest
 
@@ -42,6 +43,7 @@ def in_tmp_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     passes here, and only diverges once the two configs do.
     """
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(codegraph, "executable", lambda: "codegraph")
     monkeypatch.setattr(
         backbone,
         "sync_worktree",
@@ -2182,6 +2184,31 @@ def test_the_rebuilds_index_output_never_reaches_the_selection(
     assert "Initializing CodeGraph" in err
 
 
+@pytest.mark.parametrize("emit", ["files", "nodeids"])
+def test_a_missing_cli_selects_without_indexing_or_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    emit: str,
+) -> None:
+    (tmp_path / "lib.py").touch()
+    (tmp_path / "lib_test.py").touch()
+    monkeypatch.delenv("SKIP", raising=False)
+    monkeypatch.setattr(codegraph, "executable", lambda: None)
+    sync = Mock(side_effect=AssertionError("missing CodeGraph was invoked"))
+    monkeypatch.setattr(backbone, "sync_worktree", sync)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["affected", "--no-universe", "--depth", "2", "--emit", emit, "--", "lib.py"],
+    )
+
+    assert affected.main() == 0
+    expected = "lib.py\n" if emit == "files" else "lib_test.py\n"
+    assert capsys.readouterr() == (expected, "")
+    sync.assert_not_called()
+
+
 def test_a_missing_index_cli_exits_127_like_a_shell(
     tmp_path: Path,
     capfd: pytest.CaptureFixture[str],
@@ -3058,10 +3085,12 @@ def test_an_explicit_database_is_read_alone(
     """`--database` names an index to walk as it stands, with no overlay."""
     calls = _recorded_harvest(monkeypatch)
     monkeypatch.delenv("SKIP", raising=False)
+    monkeypatch.setattr(codegraph, "executable", lambda: None)
     monkeypatch.setattr(sys, "argv", ["affected", "--database", "x.db", "--", "x.py"])
 
     assert affected.main() == 0
     assert (calls[0]["database"], calls[0]["overlay"]) == (Path("x.db"), None)
+    assert calls[0]["depth"] == 1
 
 
 if __name__ == "__main__":

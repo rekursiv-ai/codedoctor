@@ -702,6 +702,13 @@ class XdgLiteralRule:
     name: ClassVar[str] = "xdg-literal"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
     fixable: ClassVar[bool] = False
+    helper: str = ""
+    """Module that owns the per-user layout, named in every finding.
+
+    Empty disables the rule: a project without such a module has nowhere to
+    send ``Path.home()``, so a finding would demand a dependency it lacks.
+    Set it per project, e.g. ``--set xdg-literal.helper=codedoctor.lib.userdirs``.
+    """
 
     def check(self, unit: Unit, /) -> Sequence[Finding]:
         """Report XDG literals, ``Path.home()``, and ``$HOME`` lookups.
@@ -716,6 +723,8 @@ class XdgLiteralRule:
           findings: One per violation, in source order.
 
         """
+        if not self.helper:
+            return ()
         if not re.search(
             _XDG_PREFIX + r"|Path\.home\(|expanduser|\"HOME\"|'HOME'",
             unit.source,
@@ -740,7 +749,7 @@ class XdgLiteralRule:
                 path=unit.path,
                 line=node.lineno,
                 rule=self.name,
-                message=f"{reason}; go through codedoctor.lib.userdirs",
+                message=f"{reason}; go through {self.helper}",
             )
             for node in unit.nodes(ast.expr)
             if id(node) not in docstrings and (reason := _xdg_violation(node))
@@ -762,11 +771,19 @@ class XdgLiteralRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class UserdirsNamespaceRule:
-    """First segment after a userdirs helper is ``rekursiv-ai`` (or a vendor's)."""
+    """First segment after a userdirs helper is ``namespace`` (or a vendor's)."""
 
     name: ClassVar[str] = "userdirs-namespace"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
     fixable: ClassVar[bool] = False
+    namespace: str = ""
+    """The project's own first segment, e.g. ``rekursiv-ai``.
+
+    Empty disables the rule: without a declared namespace there is no first
+    segment to require. Set it per project, e.g.
+    ``--set userdirs-namespace.namespace=rekursiv-ai``.
+    """
+
     vendor_namespaces: tuple[str, ...] = (
         "uv",
         "ms-playwright",
@@ -790,6 +807,8 @@ class UserdirsNamespaceRule:
           findings: One per violation, in source order.
 
         """
+        if not self.namespace:
+            return ()
         findings: list[Finding] = []
         for node in unit.nodes(ast.BinOp):
             if not (isinstance(node.op, ast.Div) and _is_userdirs_call(node.left)):
@@ -797,7 +816,7 @@ class UserdirsNamespaceRule:
             segment = node.right
             if isinstance(segment, ast.Constant) and isinstance(segment.value, str):
                 if (
-                    segment.value == "rekursiv-ai"
+                    segment.value == self.namespace
                     or segment.value in self.vendor_namespaces
                 ):
                     continue
@@ -811,7 +830,7 @@ class UserdirsNamespaceRule:
                     rule=self.name,
                     message=(
                         f"{what} after {_call_text(node.left)}; the first segment "
-                        'must be "rekursiv-ai" (AGENTS.md Per-User Directories)'
+                        f'must be "{self.namespace}" (userdirs-namespace.namespace)'
                     ),
                 ),
             )

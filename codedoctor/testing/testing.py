@@ -125,7 +125,7 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
     if not own and not extra:
         left.write_text("the pytest hook found no tests\n")
         return 0
-    sources = [path for path in files if not sidecars.is_test(context.root / path)]
+    sources = _floored(files, root=context.root)
     directories = sorted({Path(path).parent.as_posix() for path in sources})
     measured = context.installed("pytest_cov")
     collect_coverage = not gate.skipped(context.environ, "coverage-floor")
@@ -185,14 +185,19 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
             )
             return failure
         if not cov or not data.is_file():
+            # ``cov`` is empty for two reasons; a test-only spool has no source
+            # directory to measure even with pytest-cov installed.
+            why = (
+                ""
+                if cov
+                else ": pytest-cov is not installed"
+                if directories
+                else ": no changed source to measure"
+            )
             left.write_text(
                 f"pytest exited {failure}\n"
                 if failure
-                else (
-                    "pytest passed but recorded no coverage"
-                    + ("" if cov else ": pytest-cov is not installed")
-                    + "\n"
-                ),
+                else f"pytest passed but recorded no coverage{why}\n",
             )
             return failure
         below = coverage_summary.shortfall(sources, data=data)
@@ -220,9 +225,10 @@ def floor(context: gate.Context) -> int:
         return gate.unspooled(name)
     data = handoff(context)
     try:
-        if not files:
+        sources = _floored(files, root=context.root)
+        if not sources:
             return 0
-        with gate.argfile(files) as named:
+        with gate.argfile(sources) as named:
             return context.run(
                 [sys.executable, "-m", _FLOOR, "--data", str(data), "--", named],
             )
@@ -391,6 +397,24 @@ def _floor(flags: Flags, context: gate.Context) -> int:
 
 def _run_tier(flags: Flags, context: gate.Context) -> int:
     return tier(tiers.TIERS[flags.tier], context=context, plugin=flags.plugin)
+
+
+# Both gates read the sources from here, so ``pytest`` measures exactly what
+# ``coverage-floor`` floors: a changed test still holds its module to the floor.
+def _floored(files: Sequence[str], *, root: Path) -> list[str]:
+    """Return the spooled sources and the source each spooled test belongs to."""
+    return sorted(
+        {
+            owned.as_posix()
+            for path in files
+            for owned in (
+                sidecars.related(path, root=root)
+                if sidecars.is_test(root / path)
+                else [Path(path)]
+            )
+            if not sidecars.is_test(root / owned)
+        },
+    )
 
 
 # The own tests are what ``coverage-floor`` floors a file by, so the graph may widen the

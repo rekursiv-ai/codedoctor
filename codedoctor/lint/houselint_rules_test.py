@@ -162,8 +162,16 @@ def test_every_rule_passes_and_leaves_a_file_with_no_code(
     [
         (UserdirsWrapperRule(), "ROOT = state_dir ()\n", 1),
         (UserdirsWrapperRule(), "ROOT = (state_dir)()\n", 1),
-        (UserdirsNamespaceRule(), 'path = state_dir () / "wrong"\n', 1),
-        (UserdirsNamespaceRule(), 'path = (state_dir)() / "wrong"\n', 1),
+        (
+            UserdirsNamespaceRule(namespace="rekursiv-ai"),
+            'path = state_dir () / "wrong"\n',
+            1,
+        ),
+        (
+            UserdirsNamespaceRule(namespace="rekursiv-ai"),
+            'path = (state_dir)() / "wrong"\n',
+            1,
+        ),
         (UnderscoreParamRule(), "def f(  # Input.\n    _value,\n):\n    pass\n", 2),
         (CacheKwargRule(), "load(cache_dir = root)\n", 1),
         (CacheKwargRule(), "load(model_dir = root)\n", 1),
@@ -400,7 +408,7 @@ def test_test_prefix_naming_is_allowed_under_tools_tests(tmp_path: Path) -> None
     ],
 )
 def test_xdg_rederivation_is_reported(tmp_path: Path, body: str) -> None:
-    assert _findings(tmp_path, XdgLiteralRule(), body)
+    assert _findings(tmp_path, XdgLiteralRule(helper="codedoctor.lib.userdirs"), body)
 
 
 def test_xdg_findings_name_each_rederivation(tmp_path: Path) -> None:
@@ -421,7 +429,10 @@ def test_xdg_findings_name_each_rederivation(tmp_path: Path) -> None:
     )
     tail = "; go through codedoctor.lib.userdirs"
     assert [
-        (f.line, f.message) for f in _findings(tmp_path, XdgLiteralRule(), body)
+        (f.line, f.message)
+        for f in _findings(
+            tmp_path, XdgLiteralRule(helper="codedoctor.lib.userdirs"), body
+        )
     ] == [
         (6, f"literal {xdg + ' as a bare non-docstring string'!r}{tail}"),
         (7, f"Path.home(){tail}"),
@@ -435,10 +446,29 @@ def test_xdg_findings_name_each_rederivation(tmp_path: Path) -> None:
     ]
 
 
-def test_userdirs_helper_is_clean(tmp_path: Path) -> None:
+def test_xdg_rule_without_a_helper_reports_nothing(tmp_path: Path) -> None:
+    """A project with no userdirs module is not told to depend on one."""
     assert not _findings(
         tmp_path,
         XdgLiteralRule(),
+        'x = Path.home() / ".config"\ny = os.environ["HOME"]\n',
+    )
+
+
+def test_xdg_finding_names_the_configured_helper(tmp_path: Path) -> None:
+    assert _messages(
+        tmp_path,
+        XdgLiteralRule(helper="pkg.dirs"),
+        "x = Path.home()\n",
+    ) == [
+        (1, "Path.home(); go through pkg.dirs"),
+    ]
+
+
+def test_userdirs_helper_is_clean(tmp_path: Path) -> None:
+    assert not _findings(
+        tmp_path,
+        XdgLiteralRule(helper="codedoctor.lib.userdirs"),
         'x = config_dir() / "rekursiv-ai"\n',
     )
 
@@ -449,14 +479,14 @@ def test_userdirs_helper_is_clean(tmp_path: Path) -> None:
 def test_wrong_namespace_is_reported(tmp_path: Path) -> None:
     findings = _findings(
         tmp_path,
-        UserdirsNamespaceRule(),
+        UserdirsNamespaceRule(namespace="rekursiv-ai"),
         'x = state_dir() / "loop" / "a"\n'
         'y = userdirs.config_dir() / "rekursiv-ai"\n'
         "z = cache_dir() / name\n"
         'w = cache_dir() * "loop"\n'
         "v = cache_dir() / 3\n",
     )
-    tail = 'the first segment must be "rekursiv-ai" (AGENTS.md Per-User Directories)'
+    tail = 'the first segment must be "rekursiv-ai" (userdirs-namespace.namespace)'
     assert [(f.line, f.message) for f in findings] == [
         (1, f"namespace 'loop' after state_dir; {tail}"),
         (3, f"non-literal namespace after cache_dir; {tail}"),
@@ -465,19 +495,58 @@ def test_wrong_namespace_is_reported(tmp_path: Path) -> None:
 
 
 def test_non_literal_namespace_is_reported(tmp_path: Path) -> None:
-    assert _findings(tmp_path, UserdirsNamespaceRule(), "x = state_dir() / name\n")
+    assert _findings(
+        tmp_path,
+        UserdirsNamespaceRule(namespace="rekursiv-ai"),
+        "x = state_dir() / name\n",
+    )
 
 
 def test_rekursiv_and_vendor_namespaces_are_clean(tmp_path: Path) -> None:
     assert not _findings(
         tmp_path,
-        UserdirsNamespaceRule(),
+        UserdirsNamespaceRule(namespace="rekursiv-ai"),
         'a = config_dir() / "rekursiv-ai" / "x"\n'
         'b = cache_dir() / "uv"\n'
         'c = userdirs.config_dir() / "goa-1.0"\n'
         'd = config_dir() / "Google" / "Chrome"\n'
         'e = config_dir() / "google-chrome"\n',
     )
+
+
+def test_userdirs_namespace_without_a_namespace_reports_nothing(tmp_path: Path) -> None:
+    """The portable default imposes no project namespace."""
+    assert not _findings(
+        tmp_path,
+        UserdirsNamespaceRule(),
+        'x = state_dir() / "loop"\ny = cache_dir() / name\n',
+    )
+
+
+def test_project_subdirectory_under_the_namespace_is_clean(tmp_path: Path) -> None:
+    assert not _findings(
+        tmp_path,
+        UserdirsNamespaceRule(namespace="rekursiv-ai"),
+        'x = config_dir() / "rekursiv-ai" / "netv"\n',
+    )
+
+
+def test_userdirs_namespace_message_names_the_configured_namespace(
+    tmp_path: Path,
+) -> None:
+    assert _messages(
+        tmp_path,
+        UserdirsNamespaceRule(namespace="netv"),
+        'x = config_dir() / "netv"\ny = config_dir() / "rekursiv-ai"\n',
+    ) == [
+        (
+            2,
+            (
+                "namespace 'rekursiv-ai' after config_dir; the first segment must be "
+                '"netv" (userdirs-namespace.namespace)'
+            ),
+        ),
+    ]
 
 
 # -- userdirs-wrapper --------------------------------------------------------
@@ -5217,8 +5286,8 @@ def test_invalid_syntax_units_are_left_alone(tmp_path: Path) -> None:
     for rule in (
         DataclassRule(),
         StaticMethodRule(),
-        XdgLiteralRule(),
-        UserdirsNamespaceRule(),
+        XdgLiteralRule(helper="codedoctor.lib.userdirs"),
+        UserdirsNamespaceRule(namespace="rekursiv-ai"),
         UserdirsWrapperRule(),
         CacheKwargRule(),
         LazyImportBindingRule(),
@@ -5427,13 +5496,17 @@ def test_digits_reports_one_finding_per_file(tmp_path: Path) -> None:
 def test_xdg_docstring_is_clean(tmp_path: Path) -> None:
     assert not _findings(
         tmp_path,
-        XdgLiteralRule(),
+        XdgLiteralRule(helper="codedoctor.lib.userdirs"),
         '"""Path.home() is documented here."""\n',
     )
 
 
 def test_userdirs_namespace_and_wrapper_nonliteral_paths(tmp_path: Path) -> None:
-    assert _findings(tmp_path, UserdirsNamespaceRule(), "x = state_dir() / name\n")
+    assert _findings(
+        tmp_path,
+        UserdirsNamespaceRule(namespace="rekursiv-ai"),
+        "x = state_dir() / name\n",
+    )
     assert _findings(
         tmp_path,
         UserdirsWrapperRule(),
@@ -5639,8 +5712,8 @@ def test_helpers_cover_bound_names_and_comment_blocks(tmp_path: Path) -> None:
 def test_marker_syntax_errors_short_circuit_rules(tmp_path: Path) -> None:
     cases: list[tuple[Rule, str]] = [
         (StaticMethodRule(), "staticmethod(\n"),
-        (XdgLiteralRule(), "Path.home(\n"),
-        (UserdirsNamespaceRule(), "state_dir() /\n"),
+        (XdgLiteralRule(helper="codedoctor.lib.userdirs"), "Path.home(\n"),
+        (UserdirsNamespaceRule(namespace="rekursiv-ai"), "state_dir() /\n"),
         (UserdirsWrapperRule(), "state_dir() /\n"),
         (CacheKwargRule(), "f(cache_dir=\n"),
         (LazyImportBindingRule(), "lazy_import(\n"),
@@ -10132,7 +10205,11 @@ def test_home_lookup_spellings_are_reported_exactly(
     lookup: str,
     expected: str,
 ) -> None:
-    assert _messages(tmp_path, XdgLiteralRule(), f"value = {lookup}\n") == [
+    assert _messages(
+        tmp_path,
+        XdgLiteralRule(helper="codedoctor.lib.userdirs"),
+        f"value = {lookup}\n",
+    ) == [
         (1, expected),
     ]
 
@@ -10142,7 +10219,7 @@ def test_async_function_docstring_is_exempt_but_later_expression_is_not(
 ) -> None:
     assert _messages(
         tmp_path,
-        XdgLiteralRule(),
+        XdgLiteralRule(helper="codedoctor.lib.userdirs"),
         "async def f():\n"
         '    """XDG_CONFIG_HOME is described, not executed."""\n'
         '    "XDG_CONFIG_HOME is not a docstring here"\n',
