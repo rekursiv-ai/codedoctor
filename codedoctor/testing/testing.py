@@ -100,9 +100,9 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
     Args:
       context: What the gate reads and runs.
       dependents: Module whose CLI names tests within the resolved affected:N
-        scope. They run in a second pytest, unmeasured; the selected own tests
-        run first, measured per test for ``coverage-floor``.
-        Both runs keep the project's default marker selection.
+        scope. They run in a second pytest at the project's default tiers,
+        unmeasured; the selected own tests run first, at every runnable tier,
+        measured per test for ``coverage-floor``.
 
     Returns:
       exit_code: pytest's, 0 for an empty collection, or the coverage summary's;
@@ -148,10 +148,11 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
         # pragma: no mutate start -- any name in a private dir.
         data = Path(temp) / ".coverage"
         # pragma: no mutate end
-        # Measure only own tests: graph imports would otherwise count as own.
-        # Keep pytest's default marker selection in both passes.
+        # Measure only own tests: graph imports would otherwise count as own. They
+        # run every runnable tier: the floor counts a file's own tests from this run,
+        # and a route's database tests are its own too.
         passes: list[tuple[list[str], list[str], list[str]]] = [
-            (own, [], cov),
+            (own, ["-m", tiers.RUNNABLE], cov),
             (extra, [], []),
         ]
         failure = 0
@@ -170,7 +171,7 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
             if measuring and data.is_file():
                 outcomes.save(
                     data,
-                    events=Path(temp) / "outcomes",
+                    events=Path(temp) / _OUTCOMES,
                     tests=tests,
                     status=status,
                 )
@@ -249,6 +250,9 @@ _STALE_SEC: Final = 24 * 60 * 60
 # The floor imports coverage, which an export without pytest-cov lacks; named, not
 # imported, so this module still loads there.
 _FLOOR: Final = f"{__name__.rsplit('.', 2)[0]}.coverage_floor"
+
+# The event log the pytest plugin writes and the gate reads, beside the coverage data.
+_OUTCOMES: Final = "outcomes"
 
 
 def tier(spec: Tier, *, context: gate.Context, plugin: str | None) -> int:
@@ -507,7 +511,7 @@ def _run_pytest(
                 *marker,
                 *(["--no-cov"] if not cov and context.installed("pytest_cov") else []),
                 *narrowed,
-                *([f"--gate-outcomes={data.parent / 'outcomes'}"] if cov else []),
+                *([f"--gate-outcomes={data.parent / _OUTCOMES}"] if cov else []),
                 named,
             ],
         )
