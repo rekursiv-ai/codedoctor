@@ -229,6 +229,7 @@ def default_rules() -> tuple[Rule, ...]:
             rules.AssertRule(),
             rules.TreekleTorchLoadRule(),
             rules.LoggingFstringRule(),
+            rules.SleepRule(),
         ),
     )
     # pragma: no mutate end

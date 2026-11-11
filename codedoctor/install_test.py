@@ -612,6 +612,27 @@ def test_install_locks_dependencies_then_installs_only_pre_commit(
             False,
         ),
         ("**/.codegraph/\n.testmondata*\n.coverage\n.coverage[.-]*\n", "", False),
+        (
+            "/**/.codegraph/\n.testmondata*\n.coverage\n.coverage.*\n.coverage-*\n",
+            "",
+            False,
+        ),
+        (
+            (
+                ".testmondata\n.testmondata-shm\n.testmondata-wal\n.codegraph/\n.coverage\n"
+                ".coverage.w*\n.coverage-journal\n"
+            ),
+            "\n# Codedoctor\n.testmondata*\n.coverage.*\n.coverage-*\n",
+            False,
+        ),
+        (
+            (
+                ".testmondata*\n!.testmondata-keep\n.codegraph/\n.coverage\n.coverage.*\n"
+                ".coverage-*\n"
+            ),
+            "\n# Codedoctor\n.testmondata*\n",
+            False,
+        ),
     ],
 )
 def test_git_ignores_generated_state_without_hiding_source(

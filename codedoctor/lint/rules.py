@@ -4337,6 +4337,98 @@ class LoggingFstringRule:
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
+class SleepRule:
+    """Reject a real sleep; wait on the event, never on a clock.
+
+    A sleep guesses how long something takes. Guess short and the code races;
+    guess long and every run pays the full guess -- a test that polled 36 x
+    0.5 s for a service to settle cost 20 s of wall time and 0.01 s of CPU.
+    Wait on the thing itself (``Event.wait``, a readiness probe, a process
+    exit), or take the clock as a parameter so a test passes a fake one.
+
+    A zero delay passes: ``asyncio.sleep(0)`` yields to the event loop and
+    waits on no clock. Backoff passes too, where the wait is the remedy
+    rather than a guess: a sleep inside an ``except`` block of its own
+    function, or one whose delay names an ``attempt``, ``retry`` or
+    ``backoff``. A method on some other object (``clock.sleep``) is
+    not resolved to ``time`` and passes, which is what lets an injected fake
+    clock through. The one real clock that backs it marks its call::
+
+        # The real clock.
+        time.sleep(delay_sec)  # house-ignore[sleep] -- See above.
+    """
+
+    name: ClassVar[str] = "sleep"
+    kinds: ClassVar[frozenset[str]] = frozenset({"python"})
+    fixable: ClassVar[bool] = False
+    functions: tuple[str, ...] = ("time.sleep", "asyncio.sleep")
+    """Dotted ``module.function`` names that block on a real clock."""
+
+    def check(self, unit: Unit, /) -> Sequence[Finding]:
+        """Report each call to a sleep function with a delay other than zero.
+
+        Args:
+          unit: The file under inspection.
+
+        Returns:
+          findings: One per violation, in source order.
+
+        """
+        if "sleep" not in unit.source:
+            return ()
+        wanted = {name.rpartition(".")[::2] for name in self.functions}
+        # Local name -> the module it binds, for ``import time as t``.
+        modules: dict[str, str] = {}
+        direct: set[str] = set()
+        for node in unit.nodes(ast.Import, ast.ImportFrom):
+            if isinstance(node, ast.Import):
+                modules.update(
+                    (alias.asname or alias.name, alias.name) for alias in node.names
+                )
+            elif node.level == 0:
+                direct.update(
+                    alias.asname or alias.name
+                    for alias in node.names
+                    if (node.module, alias.name) in wanted
+                )
+        return tuple(
+            Finding(
+                path=unit.path,
+                line=call.lineno,
+                rule=self.name,
+                message=(
+                    "sleep waits on a clock; wait on the event itself "
+                    "(Event.wait, a readiness probe) or inject a clock"
+                ),
+            )
+            for call in unit.nodes(ast.Call)
+            if (
+                (isinstance(call.func, ast.Name) and call.func.id in direct)
+                or (
+                    isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and (modules.get(call.func.value.id), call.func.attr) in wanted
+                )
+            )
+            and not _is_zero_delay(call)
+            and not _is_backoff(call, unit.parents)
+        )
+
+    def fix(self, unit: Unit, /) -> str | None:
+        """No autofix: what to wait on instead is a design decision.
+
+        Args:
+          unit: The file under inspection.
+
+        Returns:
+          rewritten: The full new source, or None when nothing changes.
+
+        """
+        del unit
+        return None
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
 class CliShapeRule:
     """Mechanical checks from the ``cli`` skill, one lettered finding each."""
 
@@ -6594,6 +6686,31 @@ def _is_test_file(path: Path) -> bool:
     """Whether ``path`` is a pytest module by house naming."""
     return path.name.endswith("_test.py") or (
         path.name.startswith("test_") and path.suffix == ".py"
+    )
+
+
+def _is_backoff(call: ast.Call, parents: Mapping[ast.AST, ast.AST]) -> bool:
+    """Whether a sleep call waits after a failure rather than for an event."""
+    delay = " ".join(ast.unparse(arg).lower() for arg in call.args)
+    if any(word in delay for word in ("attempt", "retry", "backoff")):
+        return True
+    parent = parents.get(call)
+    while parent is not None and not isinstance(parent, (*_DEF_KINDS, ast.Lambda)):
+        if isinstance(parent, ast.ExceptHandler):
+            return True
+        parent = parents.get(parent)
+    return False
+
+
+def _is_zero_delay(call: ast.Call) -> bool:
+    """Whether a sleep call's delay is the literal ``0``: a yield, not a wait."""
+    delay = call.args[0] if call.args else next(iter(call.keywords), None)
+    if isinstance(delay, ast.keyword):
+        delay = delay.value
+    return (
+        isinstance(delay, ast.Constant)
+        and isinstance(delay.value, (int, float))
+        and delay.value == 0
     )
 
 

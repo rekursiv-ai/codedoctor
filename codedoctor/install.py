@@ -422,15 +422,15 @@ def _update_gitignore(root: Path) -> None:
     text = path.read_text() if path.exists() else ""
     lines = text.splitlines()
     missing = [
-        pattern
-        for pattern, generated in (
-            (".testmondata*", (".testmondata", ".testmondata-shm", ".testmondata-wal")),
-            (".codegraph/", (".codegraph/",)),
-            (".coverage", (".coverage",)),
-            (".coverage.*", (".coverage.worker",)),
-            (".coverage-*", (".coverage-journal",)),
+        rule
+        for rule in (
+            ".testmondata*",
+            ".codegraph/",
+            ".coverage",
+            ".coverage.*",
+            ".coverage-*",
         )
-        if not all(_ignores(lines, name=name) for name in generated)
+        if not _covered(lines, rule=rule)
     ]
     if missing:
         with path.open("ab") as stream:
@@ -439,25 +439,50 @@ def _update_gitignore(root: Path) -> None:
             stream.write(("\n".join(["# Codedoctor", *missing]) + "\n").encode())
 
 
-# Applies gitignore's rules for a top-level path: the last matching pattern wins, `!`
-# re-includes, a trailing `/` matches only directories, and a pattern with an inner `/`
-# names a deeper path.
-def _ignores(lines: list[str], *, name: str) -> bool:
-    """Whether root-level `name` (a directory if it ends in `/`) is ignored."""
-    directory = name.endswith("/")
-    name = name.removesuffix("/")
-    ignored = False
+# Gitignore semantics for root-level paths: the last matching line wins, `!` re-includes,
+# a trailing `/` matches only directories, and an inner `/` names a deeper path. Every
+# undecided case reads as uncovered, so the cost of imprecision is a redundant line.
+def _covered(lines: list[str], *, rule: str) -> bool:
+    """Whether `lines` ignore every root-level path `rule` ignores."""
+    directory = rule.endswith("/")
+    rule = rule.removesuffix("/")
+    stem = rule.removesuffix("*")
+    covered = False
     for line in lines:
         pattern = line.rstrip(" ")
         if not pattern or pattern.startswith("#"):
             continue
         negated = pattern.startswith("!")
         pattern = pattern.removeprefix("!")
-        if pattern.endswith("/"):
-            if not directory:
-                continue
-            pattern = pattern.removesuffix("/")
-        pattern = pattern.removeprefix("**/").removeprefix("/")
-        if "/" not in pattern and fnmatch.fnmatchcase(name, pattern):
-            ignored = not negated
-    return ignored
+        if pattern.endswith("/") and not directory:
+            continue
+        pattern = pattern.removesuffix("/").removeprefix("/").removeprefix("**/")
+        if negated:
+            literal = re.split(r"[*?\[\\]", pattern, maxsplit=1)[0]
+            if (
+                "\\" in pattern
+                or (stem == rule and fnmatch.fnmatchcase(rule, pattern))
+                or (
+                    stem != rule
+                    and (stem.startswith(literal) or literal.startswith(stem))
+                )
+            ):
+                covered = False
+        elif "/" not in pattern and _matches_every(pattern, rule=rule):
+            covered = True
+    return covered
+
+
+def _matches_every(pattern: str, *, rule: str) -> bool:
+    """Whether glob `pattern` matches every name `rule` (literal or `stem*`) matches."""
+    stem = rule.removesuffix("*")
+    if stem == rule:
+        return fnmatch.fnmatchcase(rule, pattern)
+    # `pattern` matches every `stem + suffix` when a prefix of it matches `stem` and
+    # the rest is a `*` that absorbs any suffix.
+    return any(
+        fnmatch.fnmatchcase(stem, pattern[:split])
+        and not pattern[split:].strip("*")
+        and (pattern[split:] or pattern[:split].endswith("*"))
+        for split in range(len(pattern) + 1)
+    )

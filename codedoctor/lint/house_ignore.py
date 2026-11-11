@@ -2,7 +2,8 @@
 
 One marker for every rule. Its POSITION decides its scope, as ruff's ``noqa`` vs
 ``ruff: noqa`` does: a marker trailing code covers that statement; one on a line
-of its own covers the whole file. The rule list is required and so is the
+of its own covers the whole file, except for the rules in ``STATEMENT_ONLY``,
+which only a trailing marker silences. The rule list is required and so is the
 ``-- Reason.`` tail; a marker missing either is itself a finding. Checks never
 parse markers -- :func:`apply` filters their findings against them.
 
@@ -12,7 +13,7 @@ parse markers -- :func:`apply` filters their findings against them.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import ast
 import re
@@ -28,6 +29,10 @@ if TYPE_CHECKING:
 
 
 IGNORE = re.compile(r"#\s*house-ignore\[([^\]]*)\](.*)$")
+
+# Rules a file-level marker cannot silence: each finding must argue for itself
+# where it is, and a file-wide pass silently admits the next one written there.
+STATEMENT_ONLY: Final = frozenset({"sleep"})
 
 
 def apply(
@@ -52,7 +57,15 @@ def apply(
     """
     marks = tuple(markers(unit))
     file_ignores = [
-        (lineno, rule_names(match.group(1))) for lineno, match, own in marks if own
+        (lineno, rule_names(match.group(1)) - STATEMENT_ONLY)
+        for lineno, match, own in marks
+        if own
+    ]
+    refused = [
+        (lineno, name)
+        for lineno, match, own in marks
+        if own
+        for name in sorted(rule_names(match.group(1)) & STATEMENT_ONLY)
     ]
     inline_ignores = {
         lineno: rule_names(match.group(1)) for lineno, match, own in marks if not own
@@ -68,6 +81,18 @@ def apply(
             used_inline.update((line, finding.rule) for line in marker_lines)
         else:
             kept.append(finding)
+    kept.extend(
+        Finding(
+            path=unit.path,
+            line=line,
+            rule="codedoctor lint",
+            message=(
+                f"{name!r} cannot be ignored file-wide; mark each statement with a "
+                f"trailing house-ignore[{name}]"
+            ),
+        )
+        for line, name in refused
+    )
     # A marker naming a rule that reports nothing there has rotted -- the code
     # was fixed and the marker outlived it. Reported as ``codedoctor lint`` so the
     # marker cannot silence the complaint about itself.

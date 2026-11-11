@@ -223,6 +223,30 @@ def test_a_marker_suppressing_nothing_is_reported_once_its_rule_ran(
     assert house_ignore.apply(unit, [], active=frozenset({"other"})) == []
 
 
+def test_a_file_level_marker_cannot_ignore_a_statement_only_rule() -> None:
+    """A sleep argues for itself where it is; a file-wide pass hides the next one."""
+    unit = _unit("# house-ignore[sleep, r] -- Why.\na = 1\nb = 2\n")
+    found = [_finding(2, "sleep"), _finding(3, "r")]
+    assert house_ignore.apply(unit, found, active=frozenset({"sleep", "r"})) == [
+        _finding(2, "sleep"),
+        Finding(
+            path=Path("mod.py"),
+            line=1,
+            rule="codedoctor lint",
+            message=(
+                "'sleep' cannot be ignored file-wide; mark each statement with a "
+                "trailing house-ignore[sleep]"
+            ),
+        ),
+    ]
+
+
+def test_a_trailing_marker_still_ignores_a_statement_only_rule() -> None:
+    unit = _unit("a = 1  # house-ignore[sleep] -- Why.\n")
+    found = [_finding(1, "sleep")]
+    assert house_ignore.apply(unit, found, active=frozenset({"sleep"})) == []
+
+
 def _unit(source: str, name: str = "mod.py") -> Unit:
     """Build a Python Unit over ``source``."""
     return Unit(path=Path(name), source=source, kind="python")
