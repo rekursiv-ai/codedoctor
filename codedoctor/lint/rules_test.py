@@ -56,6 +56,7 @@ from codedoctor.lint.rules import (
     ReturnsNamedRule,
     ReturnsSectionRule,
     SingleUseHelperRule,
+    SleepRule,
     StaticMethodRule,
     SuperOnlyRule,
     SuppressionFormRule,
@@ -5393,6 +5394,74 @@ def test_logging_fstring_fix_is_idempotent(tmp_path: Path) -> None:
     assert once is not None
     ast.parse(once)
     assert _fixed(tmp_path, LoggingFstringRule(), once) is None
+
+
+@pytest.mark.parametrize(
+    ("body", "line"),
+    [
+        ("import time\n\ntime.sleep(0.5)\n", 3),
+        ("import time\n\ntime.sleep(secs=1)\n", 3),
+        ("import time\n\ntime.sleep()\n", 3),
+        ("import time as t\n\nt.sleep(delay)\n", 3),
+        ("from time import sleep\n\nsleep(2)\n", 3),
+        ("from time import sleep as nap\n\nnap(2)\n", 3),
+        ("import asyncio\n\nasync def f():\n    await asyncio.sleep(0.01)\n", 4),
+        ("from asyncio import sleep\n\nasync def f():\n    await sleep(1)\n", 4),
+        ("def f():\n    import time\n\n    time.sleep(1)\n", 4),
+        (
+            (
+                "import time\n\ntry:\n    def f():\n        time.sleep(1)\n"
+                "except OSError:\n    pass\n"
+            ),
+            5,
+        ),
+    ],
+)
+def test_sleep_reports_a_real_wait(tmp_path: Path, body: str, line: int) -> None:
+    findings = _findings(tmp_path, SleepRule(), body)
+    assert [f.line for f in findings] == [line]
+    assert findings[0].message == (
+        "sleep waits on a clock; wait on the event itself "
+        "(Event.wait, a readiness probe) or inject a clock"
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "import asyncio\n\nasync def f():\n    await asyncio.sleep(0)\n",
+        "import time\n\ntime.sleep(0.0)\n",
+        "import asyncio\n\nasync def f():\n    await asyncio.sleep(delay=0)\n",
+        "clock.sleep(30)\n",
+        "rig.clock.sleep(600)\n",
+        "import trio\n\ntrio.sleep(1)\n",
+        "def sleep(x):\n    pass\n\nsleep(1)\n",
+        "import time\n\nf(time.sleep)\n",
+        "import time\n\ntime.monotonic()\n",
+        "x = 'time.sleep(1)'\n",
+        "import time\n\ntry:\n    f()\nexcept OSError:\n    time.sleep(1)\n",
+        "import time\n\nfor attempt in range(3):\n    time.sleep(2**attempt)\n",
+        "import time\n\ntime.sleep(err.retry_after_sec)\n",
+        "import time\n\ntime.sleep(backoff.delay_sec(n))\n",
+    ],
+)
+def test_sleep_allows_a_yield_or_a_fake_clock(tmp_path: Path, body: str) -> None:
+    assert not _findings(tmp_path, SleepRule(), body)
+
+
+def test_sleep_reports_in_test_files(tmp_path: Path) -> None:
+    body = "import time\n\n\ndef test_x():\n    time.sleep(0.5)\n"
+    assert [f.line for f in _findings(tmp_path, SleepRule(), body, "a_test.py")] == [5]
+
+
+def test_sleep_functions_setting_adds_a_module(tmp_path: Path) -> None:
+    body = "import trio\nfrom trio.lowlevel import sleep\n\ntrio.sleep(1)\nsleep(1)\n"
+    rule = SleepRule(functions=("trio.sleep", "trio.lowlevel.sleep"))
+    assert [f.line for f in _findings(tmp_path, rule, body)] == [4, 5]
+
+
+def test_sleep_has_no_fix(tmp_path: Path) -> None:
+    assert _fixed(tmp_path, SleepRule(), "import time\n\ntime.sleep(1)\n") is None
 
 
 def test_assert_fix_is_idempotent_and_parses(tmp_path: Path) -> None:
