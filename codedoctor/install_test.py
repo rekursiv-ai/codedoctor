@@ -435,6 +435,25 @@ def test_hook_config_rejects_conflicting_hook_before_writing() -> None:
         install.hook_config(original)
 
 
+_PACKAGED_HOOKS = """\
+repos:
+- repo: local
+  hooks:
+  - id: codedoctor-lint
+    name: codedoctor lint
+    entry: uv run python -m codedoctor lint
+    language: system
+  - id: nbstripout
+    name: nbstripout
+    entry: nbstripout
+    language: system
+  - id: jupytext-sync
+    name: jupytext sync
+    entry: jupytext --sync
+    language: system
+"""
+
+
 @pytest.mark.parametrize("found_executables", [True, False])
 @pytest.mark.parametrize("existing_pre_push", [True, False])
 @pytest.mark.parametrize("notebooks", [None, False, True])
@@ -491,6 +510,14 @@ def test_install_locks_dependencies_then_installs_only_pre_commit(
     monkeypatch.setattr(codegraph, "install", lambda: ensured.append("codegraph"))
     monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(shutil, "which", which)
+    # A wheel's templates, as small as tell the notebook hooks apart: the
+    # repository's own are the hook and policy tests' subject, not this one's.
+    packaged = tmp_path / "wheel" / "install.py"
+    packaged.parent.mkdir()
+    packaged.with_name("install_hooks.yaml").write_text(_PACKAGED_HOOKS)
+    packaged.with_name("install_defaults.toml").write_text("[tool.ruff]\n")
+    monkeypatch.setattr(install, "_THIS", packaged)
+    monkeypatch.setattr(policy, "_THIS", packaged)
     if notebooks is None:
         install.install(tmp_path)
     else:

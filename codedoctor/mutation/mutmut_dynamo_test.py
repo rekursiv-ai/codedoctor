@@ -7,13 +7,15 @@ it, and one without it has nothing for Dynamo to trace.
 from __future__ import annotations
 
 from importlib import util
-from typing import TYPE_CHECKING
+from types import ModuleType
+from typing import TYPE_CHECKING, cast
 
 import os
-import subprocess
 import sys
 
+from mutmut import configuration
 from mutmut.mutation import trampoline
+from mutmut.mutation.file_mutation import mutate_file_contents
 
 import pytest
 
@@ -21,7 +23,10 @@ from codedoctor.mutation import mutmut_dynamo
 
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
     from pathlib import Path
+
+    import torch
 
 
 pytestmark = pytest.mark.skipif(
@@ -30,44 +35,58 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.cli_python_subprocess
-def test_a_fullgraph_compile_traces_a_trampoline_while_stats_are_collected(
+@pytest.fixture
+def stats_phase(
     tmp_path: Path,
-) -> None:
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[ModuleType]:
+    """Yield a mutated module whose trampolines record, as the stats phase runs it.
+
+    A trampoline hit reads mutmut's config from the cwd, so the module's project is
+    the cwd. Dynamo's caches are cleared after, so no compiled frame reaches the
+    next test.
+    """
+    from torch import _dynamo  # noqa: PLC0415 -- optional; see the module docstring.
+
     source = tmp_path / "mod.py"
     source.write_text("def shift(x):\n    return x + 1\n")
     (tmp_path / "pyproject.toml").write_text('[tool.mutmut]\nsource_paths = ["."]\n')
-    probe = tmp_path / "probe.py"
-    probe.write_text(
-        "import importlib.util, os, sys, torch\n"
-        "from mutmut.mutation.file_mutation import mutate_file_contents\n"
-        "if sys.argv[1] == 'plugin':\n"
-        "    import codedoctor.mutation.mutmut_dynamo as plugin\n"
-        "    plugin.pytest_configure()\n"
-        "path = sys.argv[2]\n"
-        "code = mutate_file_contents(path, open(path).read()).code\n"
-        "module = type(sys)('pkg.mod')\n"
-        "exec(compile(code, path, 'exec'), module.__dict__)\n"
-        "os.environ['MUTANT_UNDER_TEST'] = 'stats'\n"
-        "compiled = torch.compile(module.shift, fullgraph=True, backend='eager')\n"
-        "try:\n"
-        "    print(compiled(torch.ones(2)).tolist())\n"
-        "except Exception as error:\n"
-        "    print(type(error).__name__)\n",
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        trampoline,
+        "get_mutant_under_test",
+        trampoline.get_mutant_under_test,
     )
+    monkeypatch.setattr(trampoline, "_mutant_under_test", None)
+    monkeypatch.setenv("MUTANT_UNDER_TEST", "stats")
+    configuration.reset_config()
+    code = mutate_file_contents(str(source), source.read_text()).code
+    module = ModuleType("pkg.mod")
+    exec(compile(code, str(source), "exec"), module.__dict__)  # noqa: S102 -- mutmut's own output, as its snapshot imports it.
+    yield module
+    _dynamo.reset()
+    configuration.reset_config()
 
-    def run(mode: str) -> str:
-        return subprocess.run(  # noqa: S603 -- Fixed interpreter and probe.
-            [sys.executable, str(probe), mode, str(source)],
-            capture_output=True,
-            check=True,
-            cwd=tmp_path,
-            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
-            text=True,
-        ).stdout.strip()
 
-    assert run("bare") == "Unsupported"
-    assert run("plugin") == "[2.0, 2.0]"
+def test_a_fullgraph_compile_traces_a_trampoline_while_stats_are_collected(
+    stats_phase: ModuleType,
+) -> None:
+    from torch import _dynamo  # noqa: PLC0415 -- optional; see the module docstring.
+    from torch._dynamo.exc import Unsupported  # noqa: PLC0415 -- optional; see the module docstring.
+
+    import torch  # noqa: PLC0415 -- optional; see the module docstring.
+
+    shift = cast("Callable[[torch.Tensor], torch.Tensor]", stats_phase.shift)
+
+    # Without the plugin, mutmut's bookkeeping is what Dynamo cannot trace.
+    with pytest.raises(Unsupported):
+        torch.compile(shift, fullgraph=True, backend="eager")(torch.ones(2))
+    _dynamo.reset()
+    mutmut_dynamo.pytest_configure()
+
+    assert torch.compile(shift, fullgraph=True, backend="eager")(
+        torch.ones(2),
+    ).tolist() == [2.0, 2.0]
 
 
 def test_a_patched_is_compiling_does_not_hide_stats(
@@ -115,6 +134,17 @@ def test_compiling_is_false_without_importing_torch(
     assert mutmut_dynamo._compiling() is False
     assert mutmut_dynamo._is_compiling == []
     assert "torch" not in sys.modules
+
+
+def test_compiling_binds_torchs_own_check_at_the_first_lookup_that_finds_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from torch import compiler  # noqa: PLC0415 -- optional; see the module docstring.
+
+    monkeypatch.setattr(mutmut_dynamo, "_is_compiling", [])
+
+    assert mutmut_dynamo._compiling() is False
+    assert mutmut_dynamo._is_compiling == [compiler.is_compiling]
 
 
 @pytest.mark.parametrize("name", ["", "fail", "loop.mod.x_f__mutmut_1"])

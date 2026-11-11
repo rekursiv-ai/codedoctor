@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
-
-import os
-import subprocess
-import sys
+from typing import Literal
 
 from mutmut.mutation import trampoline
 
@@ -15,9 +11,7 @@ import pytest
 from codedoctor.mutation import mutmut_outcome
 
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
+pytest_plugins = ("pytester",)
 
 _MODULE = """\
 import pytest
@@ -42,7 +36,6 @@ def test_fails():
 """
 
 
-@pytest.mark.cli_python_subprocess
 @pytest.mark.parametrize(
     ("mutant", "selected", "status"),
     [
@@ -69,38 +62,27 @@ def test_fails():
     ],
 )
 def test_only_a_mutant_run_that_ran_no_test_fails(
-    tmp_path: Path,
+    pytester: pytest.Pytester,
+    monkeypatch: pytest.MonkeyPatch,
     mutant: str,
     selected: str,
     status: int,
 ) -> None:
-    (tmp_path / "probe_test.py").write_text(_MODULE)
-    completed = subprocess.run(  # noqa: S603 -- Fixed interpreter and arguments.
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "-p",
-            "no:cacheprovider",
-            "-p",
-            "codedoctor.mutation.mutmut_outcome",
-            "-k",
-            selected,
-            "probe_test.py",
-        ],
-        capture_output=True,
-        check=False,
-        cwd=tmp_path,
-        env={
-            "PYTHONPATH": os.pathsep.join(sys.path),
-            "PATH": "",
-            "MUTANT_UNDER_TEST": mutant,
-        },
-        text=True,
+    pytester.makepyfile(probe_test=_MODULE)
+    monkeypatch.setenv("MUTANT_UNDER_TEST", mutant)
+    # The installed plugins (asyncio, randomly, xdist) are no part of a mutant run's
+    # verdict, and their own warnings would land in this session.
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+
+    result = pytester.runpytest_inprocess(
+        "-p",
+        "codedoctor.mutation.mutmut_outcome",
+        "-k",
+        selected,
+        "probe_test.py",
     )
 
-    assert completed.returncode == status, completed.stdout + completed.stderr
+    assert result.ret == status, result.outlines
 
 
 class _Session:
