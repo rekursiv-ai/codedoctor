@@ -1035,7 +1035,7 @@ def test_the_defaults_check_loop_and_leave_sizing_to_the_run(
         "fix": fix,
         "threads": threads,
         "checker": "pyrefly",
-        "typechecker": ["pyrefly"],
+        "typechecker": ["pyrefly", "basedpyright"],
         "paths": [],
     }
 
@@ -1196,7 +1196,17 @@ def test_pyrefly_flags_only_the_redundant_assert(
     source = _PYREFLY_REDUNDANT
     _pyrefly_project(tmp_path, monkeypatch, source)
     _replay_clean_ty(monkeypatch)
-    argv = ["check.py", "--threads", "1", *(["--fix"] * fix), "m.py"]
+    # Pyrefly's verdict is the subject; the other checkers have tests of their own.
+    argv = [
+        "check.py",
+        "--threads",
+        "1",
+        "--typechecker",
+        "pyrefly",
+        *(["--fix"] * fix),
+        "--",
+        "m.py",
+    ]
     monkeypatch.setattr(sys, "argv", argv)
 
     assert unnecessary_assert_isinstance.main() == 1
@@ -1308,14 +1318,15 @@ def shared_pyrefly(
 @pytest.mark.parametrize(
     ("typechecker", "kept"),
     [
-        ([], False),
+        (["--typechecker", "pyrefly"], False),
+        pytest.param([], True, marks=pytest.mark.cli_node),
         pytest.param(
             ["--typechecker", "basedpyright"],
             True,
             marks=pytest.mark.cli_node,
         ),
     ],
-    ids=["default", "typechecker-basedpyright"],
+    ids=["pyrefly-alone", "default", "typechecker-basedpyright"],
 )
 def test_typechecker_basedpyright_keeps_an_assert_it_still_narrows(
     tmp_path: Path,

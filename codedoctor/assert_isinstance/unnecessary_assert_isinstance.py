@@ -17,9 +17,10 @@ is redundant.
 
 An assert the checker calls unnecessary may still narrow for another gate
 checker, so it is only unnecessary when ty and each ``--typechecker`` other
-than ``--checker`` (default: pyrefly), run once over copies with every
-candidate replaced by ``pass``, report nothing new on those files. Those runs
-happen only when the checker flagged something, and a crash fails the run.
+than ``--checker`` (default: pyrefly and basedpyright, every checker the gate
+runs), run once over copies with every candidate replaced by ``pass``, report
+nothing new on those files. Those runs happen only when the checker flagged
+something, and a crash fails the run.
 
 Findings follow checker's contract: each is rule ``unnecessary-assert-isinstance``,
 a ``house-ignore`` marker naming it suppresses it (and is reported once it
@@ -625,9 +626,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "--typechecker",
         nargs="+",
         choices=["pyrefly", "basedpyright"],
-        default=["pyrefly"],
+        default=["pyrefly", "basedpyright"],
         help="Checkers that, with ty, must agree an assert is unnecessary "
-        "(default: %(default)s).",
+        "(default: every gated one, %(default)s).",
     )
     parser.add_argument(
         "paths",
