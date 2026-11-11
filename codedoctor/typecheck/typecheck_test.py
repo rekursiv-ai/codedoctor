@@ -133,15 +133,28 @@ def test_pyrefly_checks_its_own_spool_even_when_ty_checked_nothing(
     [("pyrefly-check", "pyrefly"), ("basedpyright", "basedpyright")],
 )
 @pytest.mark.parametrize("skipped", [False, True])
+@pytest.mark.parametrize("installed", [False, True])
 def test_the_fixer_runs_the_checker_in_its_place(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     name: str,
     checker: str,
     *,
     skipped: bool,
+    installed: bool,
 ) -> None:
+    """An assert basedpyright still needs is kept whenever it can be asked.
+
+    Skipping basedpyright's own hook once let the fixer delete five asserts only
+    basedpyright needed, and the next run without the skip failed on all five.
+    """
     _spool(tmp_path, "a.py")
     tools = fakes.Recorder()
+    interpreter = tmp_path / "venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    if installed:
+        (interpreter.parent / "basedpyright").touch()
+    monkeypatch.setattr(sys, "executable", str(interpreter))
 
     _typecheck(
         name,
@@ -162,7 +175,7 @@ def test_the_fixer_runs_the_checker_in_its_place(
         "3",
         "--typechecker",
         "pyrefly",
-        *([] if skipped else ["basedpyright"]),
+        *(["basedpyright"] if installed else []),
         "--",
     ]
     assert named.startswith("@")

@@ -84,6 +84,10 @@ def typecheck(
     if not files:
         return 0
     if fixer is not None:
+        # Asked whenever the fixer can run it, ``SKIP`` or not: skipping its hook
+        # once let the fixer delete asserts only basedpyright needed, and the next
+        # run without the skip failed on every one.
+        consulted = (Path(sys.executable).parent / "basedpyright").is_file()
         with gate.argfile(files) as named:
             return context.run(
                 [
@@ -97,11 +101,7 @@ def typecheck(
                     str(count),
                     "--typechecker",
                     "pyrefly",
-                    *(
-                        []
-                        if gate.skipped(context.environ, "basedpyright")
-                        else ["basedpyright"]
-                    ),
+                    *(["basedpyright"] if consulted else []),
                     "--",
                     named,
                 ],
