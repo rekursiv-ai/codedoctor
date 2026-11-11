@@ -27,8 +27,11 @@ Unaccepted findings and setup failures exit 1. A trailing comment can accept
 survivors after execution: ``# mutmut: accept[diagnostic-text] -- Reason.``
 applies only to wording changes of one string literal on that line, preserving
 format placeholders. Use it only when exact wording is independently
-noncontractual. Acceptance never skips execution or hides the diff; other
-mutations remain blocking. No blanket or fingerprint acceptance is supported.
+noncontractual. ``# mutmut: accept[case-insensitive] -- Reason.`` accepts only
+casing changes with equal lowercase values, at a case-insensitive use site;
+added text such as ``XXCookieXX`` remains blocking. Each reason justifies its
+rule, never broadens it. Acceptance never skips execution or hides the diff;
+other mutations remain blocking. No blanket or fingerprint acceptance is supported.
 Malformed markers fail; unused markers fail once the whole owning function
 has been checked. Sampling and partial remainder runs defer unused checks.
 PRECOMMIT_SCOPE and PRECOMMIT_SCOPE_MUTATION select exact, sidecar, or affected:N
@@ -1491,7 +1494,7 @@ def _survivors(
             continue
         location = f"{shard.source}:{token.start[0]}"
         match = re.fullmatch(
-            r"# mutmut: accept\[diagnostic-text\] -- (\S.*)",
+            r"# mutmut: accept\[(diagnostic-text|case-insensitive)\] -- (\S.*)",
             token.string,
         )
         if owner is None or match is None or not token.line[: token.start[1]].strip():
@@ -1499,14 +1502,15 @@ def _survivors(
                 f"{location}: invalid mutation acceptance; require a trailing rule and reason",
             )
             continue
-        (reason,) = match.groups()
+        rule, reason = match.groups()
         matched = {
-            name: replace(survivors[name], accepted=f"diagnostic-text -- {reason}")
+            name: replace(survivors[name], accepted=f"{rule} -- {reason}")
             for name in names & survivors.keys()
             for original, mutant in [functions[name]]
-            if _diagnostic_change(
+            if _accepted_string_change(
                 original,
                 mutant=mutant,
+                rule=rule,
                 line=token.start[0]
                 - owner[1].stop
                 + cast(int, ast.parse(original).body[0].end_lineno)
@@ -1515,12 +1519,18 @@ def _survivors(
         }
         survivors.update(matched)
         if not matched and names <= selected:
-            errors.append(f"{location}: unused mutation acceptance [diagnostic-text]")
+            errors.append(f"{location}: unused mutation acceptance [{rule}]")
     return survivors, tuple(errors)
 
 
-def _diagnostic_change(original: str, *, mutant: str, line: int) -> bool:
-    """Require one changed string literal, with every other token unchanged."""
+def _accepted_string_change(
+    original: str,
+    *,
+    mutant: str,
+    line: int,
+    rule: str,
+) -> bool:
+    """Match a local rule against one changed literal and otherwise identical tokens."""
     before, after = (
         [
             t
@@ -1547,6 +1557,8 @@ def _diagnostic_change(original: str, *, mutant: str, line: int) -> bool:
     new_value = cast(object, ast.literal_eval(new.string))
     if not isinstance(old_value, str) or not isinstance(new_value, str):
         return False
+    if rule == "case-insensitive":
+        return old_value != new_value and old_value.lower() == new_value.lower()
     fields = _diagnostic_fields(old_value)
     return fields is not None and fields == _diagnostic_fields(new_value)
 
