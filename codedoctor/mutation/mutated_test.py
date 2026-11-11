@@ -4197,6 +4197,43 @@ def test_diagnostic_acceptance_keeps_survivors_visible_without_failing(
     assert '+    raise ValueError("XXBad inputXX")' in output
 
 
+def test_case_insensitive_acceptance_does_not_accept_decoration(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = _repo(
+        tmp_path,
+        body='def f():\n    return "Cookie".lower()  '
+        "# mutmut: accept[case-insensitive] -- The result is lowercased.\n",
+    )
+    data = _generated_survivors(root)
+    path = root / "mutants/pkg/mod.py"
+    recorded = path.with_suffix(".py.meta").read_bytes()
+    report = mutated._collect(
+        root,
+        shard=Shard(source="pkg/mod.py", filters=("pkg.mod.x_f__mutmut_*",)),
+    )
+
+    assert not report.acceptance_errors
+    assert report.checked == len(data.exit_code_by_key)
+    assert set(report.survivors) == set(report.outcomes["survived"])
+    accepted = [survivor for survivor in report.survivors.values() if survivor.accepted]
+    assert len(accepted) == 2
+    assert all(
+        survivor.accepted == "case-insensitive -- The result is lowercased."
+        for survivor in accepted
+    )
+    assert any('+    return "cookie".lower()' in survivor.diff for survivor in accepted)
+    assert any('+    return "COOKIE".lower()' in survivor.diff for survivor in accepted)
+    assert any(
+        '"XXCookieXX"' in survivor.diff and not survivor.accepted
+        for survivor in report.survivors.values()
+    )
+    assert path.with_suffix(".py.meta").read_bytes() == recorded
+    assert mutated._print_reports([report]) == 1
+    assert "survived, accepted: case-insensitive" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     "replacement",
     [
@@ -4213,10 +4250,11 @@ def test_diagnostic_acceptance_does_not_cover_call_or_placeholder_changes(
     replacement: str,
 ) -> None:
     original = 'def f():\n    warn("Bad %s", value)\n'
-    assert not mutated._diagnostic_change(
+    assert not mutated._accepted_string_change(
         original,
         mutant=f"def f():\n    {replacement}\n",
         line=2,
+        rule="diagnostic-text",
     )
 
 
@@ -4256,10 +4294,41 @@ def test_diagnostic_acceptance_is_one_literal_at_the_annotated_site(
     accepted: bool,
 ) -> None:
     assert (
-        mutated._diagnostic_change(
+        mutated._accepted_string_change(
             f"def f():\n    {original}\n",
             mutant=f"def f():\n    {variant}\n",
             line=line,
+            rule="diagnostic-text",
+        )
+        is accepted
+    )
+
+
+@pytest.mark.parametrize(
+    ("original", "variant", "accepted"),
+    [
+        ('"Cookie"', '"COokie"', True),
+        ('"Ä"', '"ä"', True),
+        ('"Cookie"', "'Cookie'", False),
+        ('"Cookie"', '"XXCookieXX"', False),
+        ('"Cookie"', '"Cookie"', False),
+        ('"Cookie"', '"cookie", other', False),
+        ('"Cookie"', 'b"cookie"', False),
+        ('"Straße"', '"STRASSE"', False),
+    ],
+)
+def test_case_insensitive_acceptance_changes_only_case(
+    original: str,
+    variant: str,
+    *,
+    accepted: bool,
+) -> None:
+    assert (
+        mutated._accepted_string_change(
+            f"def f():\n    read({original})\n",
+            mutant=f"def f():\n    read({variant})\n",
+            line=2,
+            rule="case-insensitive",
         )
         is accepted
     )
@@ -4271,6 +4340,8 @@ def test_diagnostic_acceptance_is_one_literal_at_the_annotated_site(
         "# mutmut: accept[unknown] -- Reason.",
         "# mutmut: accept[diagnostic-text]",
         "# mutmut: accept[diagnostic-text] -- ",
+        "# mutmut: accept[case-insensitive]",
+        "# mutmut: accept[case-insensitive] -- ",
         "# mutmut: accept[0000000000000000] -- Unsupported fingerprint.",
     ],
 )
@@ -4295,13 +4366,14 @@ def test_invalid_acceptance_keeps_findings(
     assert report.acceptance_errors[0] in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("rule", ["diagnostic-text", "case-insensitive"])
 def test_unused_acceptance_checks_only_completed_function_selections(
     tmp_path: Path,
+    rule: str,
 ) -> None:
     root = _repo(
         tmp_path,
-        body='def f():\n    return "Bad"  '
-        "# mutmut: accept[diagnostic-text] -- Display only.\n",
+        body=f'def f():\n    return "Bad"  # mutmut: accept[{rule}] -- Display only.\n',
     )
     data = _generated_survivors(root)
     data.exit_code_by_key = dict.fromkeys(data.exit_code_by_key, 1)
@@ -4309,7 +4381,7 @@ def test_unused_acceptance_checks_only_completed_function_selections(
     full = Shard(source="pkg/mod.py", filters=("pkg.mod.x_f__mutmut_*",))
     report = mutated._collect(root, shard=full)
     assert report.acceptance_errors == (
-        "pkg/mod.py:2: unused mutation acceptance [diagnostic-text]",
+        f"pkg/mod.py:2: unused mutation acceptance [{rule}]",
     )
     assert mutated._print_reports([report]) == 1
     partial = Shard(source="pkg/mod.py", filters=(next(iter(data.exit_code_by_key)),))
