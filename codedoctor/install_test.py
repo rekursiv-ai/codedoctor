@@ -567,21 +567,63 @@ def test_install_locks_dependencies_then_installs_only_pre_commit(
     ["rignore", pytest.param("git", marks=pytest.mark.cli_git)],
 )
 @pytest.mark.parametrize(
-    ("original_ignore", "custom_ignored"),
+    ("original_ignore", "appended", "custom_ignored"),
     [
-        (None, False),
-        ("", False),
-        ("# Keep existing rules.\ncustom/", True),
-        ("# Existing coverage rule.\r\n.coverage\r\n", False),
+        (
+            None,
+            (
+                "# Codedoctor\n.testmondata*\n.codegraph/\n.coverage\n.coverage.*\n"
+                ".coverage-*\n"
+            ),
+            False,
+        ),
+        (
+            "",
+            (
+                "# Codedoctor\n.testmondata*\n.codegraph/\n.coverage\n.coverage.*\n"
+                ".coverage-*\n"
+            ),
+            False,
+        ),
+        (
+            "# Keep existing rules.\ncustom/",
+            (
+                "\n\n# Codedoctor\n.testmondata*\n.codegraph/\n.coverage\n.coverage.*\n"
+                ".coverage-*\n"
+            ),
+            True,
+        ),
+        (
+            "# Existing coverage rule.\r\n.coverage\r\n",
+            "\n# Codedoctor\n.testmondata*\n.codegraph/\n.coverage.*\n.coverage-*\n",
+            False,
+        ),
+        (
+            ".codegraph\n/.coverage\n.coverage.*\n.coverage-*\n",
+            "\n# Codedoctor\n.testmondata*\n",
+            False,
+        ),
+        (
+            ".testmondata\n.coverage\n!.coverage\n",
+            (
+                "\n# Codedoctor\n.testmondata*\n.codegraph/\n.coverage\n.coverage.*\n"
+                ".coverage-*\n"
+            ),
+            False,
+        ),
+        ("**/.codegraph/\n.testmondata*\n.coverage\n.coverage[.-]*\n", "", False),
     ],
 )
 def test_git_ignores_generated_state_without_hiding_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    *,
     original_ignore: str | None,
+    appended: str,
     custom_ignored: bool,
     backend: str,
 ) -> None:
+    """Only rules the existing file does not already cover are appended."""
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     ignored = tmp_path / ".gitignore"
@@ -589,15 +631,7 @@ def test_git_ignores_generated_state_without_hiding_source(
         ignored.write_bytes(original_ignore.encode())
     install._update_gitignore(tmp_path)
     configured = ignored.read_bytes()
-    original = (original_ignore or "").encode()
-    assert configured.startswith(original)
-    appended = configured[len(original) :]
-    if original and not original.endswith(b"\n"):
-        assert appended.startswith(b"\n")
-        appended = appended[1:]
-    assert appended.endswith(b"\n")
-    assert all(appended.splitlines())
-    assert len(configured.splitlines()) == len(set(configured.splitlines()))
+    assert configured == ((original_ignore or "") + appended).encode()
     generated = {
         ".testmondata",
         ".testmondata-wal",
