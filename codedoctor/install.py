@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Final
 
+import fnmatch
 import json
 import re
 import shutil
@@ -416,23 +417,47 @@ def _bootstrap_hooks(root: Path) -> None:
 
 
 def _update_gitignore(root: Path) -> None:
-    """Append missing generated-state rules without rewriting existing entries."""
+    """Append rules for generated state the existing rules do not already ignore."""
     path = root / ".gitignore"
     text = path.read_text() if path.exists() else ""
-    existing = set(text.splitlines())
+    lines = text.splitlines()
     missing = [
         pattern
-        for pattern in (
-            ".testmondata*",
-            ".codegraph/",
-            ".coverage",
-            ".coverage.*",
-            ".coverage-*",
+        for pattern, generated in (
+            (".testmondata*", (".testmondata", ".testmondata-shm", ".testmondata-wal")),
+            (".codegraph/", (".codegraph/",)),
+            (".coverage", (".coverage",)),
+            (".coverage.*", (".coverage.worker",)),
+            (".coverage-*", (".coverage-journal",)),
         )
-        if pattern not in existing
+        if not all(_ignores(lines, name=name) for name in generated)
     ]
     if missing:
         with path.open("ab") as stream:
-            if text and not text.endswith("\n"):
-                stream.write(b"\n")
-            stream.write(("\n".join(missing) + "\n").encode())
+            if text:
+                stream.write(b"\n" if text.endswith("\n") else b"\n\n")
+            stream.write(("\n".join(["# Codedoctor", *missing]) + "\n").encode())
+
+
+# Applies gitignore's rules for a top-level path: the last matching pattern wins, `!`
+# re-includes, a trailing `/` matches only directories, and a pattern with an inner `/`
+# names a deeper path.
+def _ignores(lines: list[str], *, name: str) -> bool:
+    """Whether root-level `name` (a directory if it ends in `/`) is ignored."""
+    directory = name.endswith("/")
+    name = name.removesuffix("/")
+    ignored = False
+    for line in lines:
+        pattern = line.rstrip(" ")
+        if not pattern or pattern.startswith("#"):
+            continue
+        negated = pattern.startswith("!")
+        pattern = pattern.removeprefix("!")
+        if pattern.endswith("/"):
+            if not directory:
+                continue
+            pattern = pattern.removesuffix("/")
+        pattern = pattern.removeprefix("**/").removeprefix("/")
+        if "/" not in pattern and fnmatch.fnmatchcase(name, pattern):
+            ignored = not negated
+    return ignored
