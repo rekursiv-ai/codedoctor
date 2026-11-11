@@ -75,6 +75,75 @@ def test_packaged_policy_is_the_source_of_new_rules(
     assert defaults["mutmut"]["mutate_only_covered_lines"] is True
 
 
+def test_defaults_drop_checkout_settings_and_name_the_consumer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every setting the checkout owns is replaced, and nothing else is kept."""
+    module = tmp_path / "policy.py"
+    module.with_name("install_defaults.toml").write_text(
+        "[tool.ruff.lint.flake8-tidy-imports.banned-api]\n"
+        '"pathlib.Path.home".msg = "Use userdirs."\n'
+        '"os.system".msg = "Use subprocess."\n'
+        "[tool.basedpyright]\n"
+        'executionEnvironments = [{root = "src"}]\n'
+        'stubPath = "src/typings"\n'
+        'typeCheckingMode = "recommended"\n'
+        "[tool.pyrefly]\n"
+        'python-interpreter-path = ".venv/bin/python"\n'
+        'python-platform = "linux"\n'
+        'preset = "strict"\n'
+        "[tool.codedoctor.lint]\n"
+        'exclude = ["*_test.py = assert", "conftest.py = globals", '
+        '"**/tests/test*.py = globals", "private.py = globals", '
+        # A test pattern after the ``=`` is a rule's argument, not the files.
+        '"private.py = conftest.py = globals"]\n'
+        "[tool.unrelated]\nkept = false\n",
+    )
+    monkeypatch.setattr(policy, "_THIS", module)
+    stubs = ["typings", ".venv/share/rekursiv-ai-typings"]
+
+    assert policy.defaults(name="my-project", python_version="3.10") == {
+        "ruff": {
+            "target-version": "py310",
+            "lint": {
+                "flake8-tidy-imports": {
+                    "banned-api": {"os.system": {"msg": "Use subprocess."}},
+                },
+                "isort": {"known-first-party": ["my_project"]},
+            },
+        },
+        "basedpyright": {
+            "typeCheckingMode": "recommended",
+            "pythonVersion": "3.10",
+            "extraPaths": stubs,
+        },
+        "pyrefly": {
+            "preset": "strict",
+            "python-version": "3.10.0",
+            "search-path": stubs,
+        },
+        "ty": {"environment": {"python-version": "3.10", "extra-paths": stubs}},
+        "mutmut": {"source_paths": ["."]},
+        "codedoctor": {
+            "lint": {
+                "select": "ALL",
+                "fix": "ALL",
+                "exclude": [
+                    "*_test.py test_*.py = assert",
+                    "conftest.py = globals",
+                    "**/tests/test*.py = globals",
+                ],
+                "set": [
+                    "import-alias.first-party=my_project",
+                    "test-footer.runner=codedoctor.lib.testing.runner",
+                    "userdirs-namespace.namespace=my-project",
+                ],
+            },
+        },
+    }
+
+
 def test_source_policy_finds_the_nearest_pyproject(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -172,8 +241,10 @@ def test_table_accepts_inline_toml_and_rejects_plain_scalars() -> None:
     ruff = policy.table(tools, key="ruff")
     assert policy.table(ruff, key="lint")["select"] == ["ALL"]
     malformed: dict[str, MutablePlainTree] = {"ruff": 1}
-    with pytest.raises(TypeError, match="TOML table"):
+    with pytest.raises(TypeError, match="Expected a TOML table for 'ruff'"):
         policy.table(malformed, key="ruff")
+    with pytest.raises(TypeError, match="Expected a TOML table for 'ty'"):
+        policy.table(tomlkit.parse("ty = 1\n"), key="ty")
 
 
 @pytest.mark.parametrize(

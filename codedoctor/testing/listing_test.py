@@ -7,14 +7,10 @@ banner or summary line is not a cosmetic flaw, it is a silent empty run.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Protocol, cast
-from unittest.mock import Mock
+from typing import TYPE_CHECKING, Final, Protocol
 
-import os
-import re
-import subprocess
-import sys
 import textwrap
 
 import pytest
@@ -26,105 +22,84 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 
-_CWD: Final = Path(__file__).resolve().parent
+pytest_plugins = ("pytester",)
+
+_PLUGIN: Final = "codedoctor.testing.listing"
 
 
-@pytest.mark.parametrize("collect", [True, False])
-def test_subprocesses_keep_their_import_paths(
-    tmp_path: Path,
+@pytest.fixture
+def isolated(
+    pytester: pytest.Pytester,
     monkeypatch: pytest.MonkeyPatch,
-    *,
-    collect: bool,
-) -> None:
-    run = Mock(return_value=subprocess.CompletedProcess([], 0))
-    monkeypatch.setattr(subprocess, "run", run)
-    monkeypatch.syspath_prepend(str(tmp_path))
+) -> pytest.Pytester:
+    """Return a pytester whose runs load only the plugins they name.
 
-    if collect:
-        result = _collect(tmp_path, tmp_path / "selected.txt", noisy=False)
-    else:
-        result = _narrowed_pytest(tmp_path)
-
-    assert result.returncode == 0
-    path = cast(dict[str, str], run.call_args.kwargs["env"])["PYTHONPATH"]
-    assert path == os.pathsep.join([str(_CWD), *sys.path])
+    The installed ones (asyncio, randomly, xdist) print and warn on their own,
+    and none is under test. The outer run's own destinations stay out of these.
+    """
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    for name in (
+        "PYTEST_COLLECT_SELECTED",
+        "PYTEST_COLLECT_SELECTED_DIR",
+        "PYTEST_COLLECT_TIERS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    return pytester
 
 
 def _collect(
-    tree: Path,
+    isolated: pytest.Pytester,
+    monkeypatch: pytest.MonkeyPatch,
     destination: Path,
     *,
     noisy: bool,
-) -> subprocess.CompletedProcess[str]:
-    """Collect ``tree`` with the plugin enabled, optionally beside a noisy one."""
-    (tree / "probe_test.py").write_text(
-        textwrap.dedent(
-            """
-            def test_one():
-                pass
+) -> pytest.RunResult:
+    """Collect the tree with the plugin enabled, optionally beside a noisy one."""
+    isolated.makepyfile(
+        probe_test="""
+        def test_one():
+            pass
 
 
-            def test_two():
-                pass
-            """,
-        ),
-        encoding="utf-8",
+        def test_two():
+            pass
+        """,
     )
     if noisy:
         # Stands in for py-pglite, which prints a tips banner at session finish.
-        (tree / "conftest.py").write_text(
-            textwrap.dedent(
-                """
-                def pytest_collection_finish(session):
-                    del session
-                    print("===== Framework Isolation Tips =====")
-                    print("  pytest -m sqlalchemy -p no:django")
-                """,
-            ),
-            encoding="utf-8",
+        isolated.makeconftest(
+            """
+            def pytest_collection_finish(session):
+                del session
+                print("===== Framework Isolation Tips =====")
+                print("  pytest -m sqlalchemy -p no:django")
+            """,
         )
-    return subprocess.run(  # noqa: S603 -- fixed argv, internal literals.
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            str(tree),
-            "--collect-only",
-            "-q",
-            "-p",
-            "no:cacheprovider",
-            "-p",
-            "listing",
-        ],
-        capture_output=True,
-        check=False,
-        cwd=tree,
-        env={
-            "PATH": "/usr/bin:/bin",
-            "PYTHONPATH": os.pathsep.join([str(_CWD), *sys.path]),
-            "PYTEST_COLLECT_SELECTED": str(destination),
-        },
-        text=True,
-    )
+    monkeypatch.setenv("PYTEST_COLLECT_SELECTED", str(destination))
+    return isolated.runpytest_inprocess("--collect-only", "-q", "-p", _PLUGIN)
 
 
-@pytest.mark.cli_python_subprocess
-def test_every_written_line_is_a_node_id(tmp_path: Path) -> None:
+def test_every_written_line_is_a_node_id(
+    isolated: pytest.Pytester,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A plugin printing banners cannot contaminate the selection file."""
-    destination = tmp_path / "selected" / "pytest-global.txt"
-    result = _collect(tmp_path, destination, noisy=True)
+    destination = isolated.path / "selected" / "pytest-global.txt"
+    result = _collect(isolated, monkeypatch, destination, noisy=True)
 
-    assert result.returncode == 0, result.stderr[-400:]
+    assert result.ret == 0, result.outlines
     lines = destination.read_text(encoding="utf-8").splitlines()
     assert lines, "the plugin wrote no node ids"
     assert all("::" in line for line in lines), lines
     # The banner reached the console but not the file -- the whole point.
-    assert "Framework Isolation Tips" in result.stdout
+    assert "===== Framework Isolation Tips =====" in result.outlines
     assert not any("Isolation Tips" in line for line in lines)
 
 
-@pytest.mark.cli_python_subprocess
-def test_a_deselecting_plugin_narrows_the_file(tmp_path: Path) -> None:
+def test_a_deselecting_plugin_narrows_the_file(
+    isolated: pytest.Pytester,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """What a deselector left is what lands in the file.
 
     testmon deselects from `pytest_collection_modifyitems` registered
@@ -136,103 +111,88 @@ def test_a_deselecting_plugin_narrows_the_file(tmp_path: Path) -> None:
     The consuming job runs exactly this file, so over-recording silently
     forfeits the selection the job exists to compute.
     """
-    (tmp_path / "conftest.py").write_text(
-        textwrap.dedent(
-            """
-            import pytest
+    isolated.makeconftest(
+        """
+        import pytest
 
 
-            @pytest.hookimpl(trylast=True)
-            def pytest_collection_modifyitems(config, items):
-                config.hook.pytest_deselected(items=items[1:])
-                items[:] = items[:1]
-            """,
-        ),
-        encoding="utf-8",
+        @pytest.hookimpl(trylast=True)
+        def pytest_collection_modifyitems(config, items):
+            config.hook.pytest_deselected(items=items[1:])
+            items[:] = items[:1]
+        """,
     )
-    destination = tmp_path / "selected.txt"
-    result = _collect(tmp_path, destination, noisy=False)
+    destination = isolated.path / "selected.txt"
+    result = _collect(isolated, monkeypatch, destination, noisy=False)
 
-    assert result.returncode == 0, result.stderr[-400:]
+    assert result.ret == 0, result.outlines
     lines = destination.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1, lines
 
 
-@pytest.mark.cli_python_subprocess
-def test_the_summary_line_is_not_written(tmp_path: Path) -> None:
+def test_the_summary_line_is_not_written(
+    isolated: pytest.Pytester,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """``N/M tests collected`` is console chrome, not a node id.
 
     This is the exact line that, passed back as an argument, collected zero
     tests and failed a required check.
     """
-    destination = tmp_path / "selected.txt"
-    result = _collect(tmp_path, destination, noisy=False)
+    destination = isolated.path / "selected.txt"
+    result = _collect(isolated, monkeypatch, destination, noisy=False)
 
-    assert result.returncode == 0, result.stderr[-400:]
+    assert result.ret == 0, result.outlines
+    assert any("tests collected" in line for line in result.outlines)
     lines = destination.read_text(encoding="utf-8").splitlines()
     assert not any("tests collected" in line for line in lines), lines
     assert len(lines) == 2, lines
 
 
-@pytest.mark.cli_python_subprocess
-def test_one_collection_writes_each_pr_pytest_tier(tmp_path: Path) -> None:
+def test_one_collection_writes_each_pr_pytest_tier(
+    isolated: pytest.Pytester,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """One selector job writes every artifact the PR pytest matrix consumes."""
-    (tmp_path / "probe_test.py").write_text(
-        textwrap.dedent(
-            """
-            import pytest
+    isolated.makepyfile(
+        probe_test="""
+        import pytest
 
 
-            def test_global():
-                pass
+        def test_global():
+            pass
 
 
-            @getattr(pytest.mark, "slow")
-            def test_slow():
-                pass
+        @getattr(pytest.mark, "slow")
+        def test_slow():
+            pass
 
 
-            @getattr(pytest.mark, "ci_smoke")
-            def test_smoke():
-                pass
+        @getattr(pytest.mark, "ci_smoke")
+        def test_smoke():
+            pass
 
 
-            @getattr(pytest.mark, "integration")
-            def test_integration():
-                pass
-            """,
-        ),
-        encoding="utf-8",
+        @getattr(pytest.mark, "integration")
+        def test_integration():
+            pass
+        """,
     )
-    destination = tmp_path / "selected"
+    # Registered, as the repository registers them.
+    isolated.makeini("[pytest]\nmarkers =\n    slow\n    ci_smoke\n    integration\n")
+    destination = isolated.path / "selected"
+    monkeypatch.setenv("PYTEST_COLLECT_SELECTED_DIR", str(destination))
 
-    result = subprocess.run(  # noqa: S603 -- fixed argv, internal literals.
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            str(tmp_path),
-            "--collect-only",
-            "-q",
-            "-p",
-            "no:cacheprovider",
-            "-p",
-            "listing",
-            "-m",
-            "not cluster and not cuda and not performance",
-        ],
-        capture_output=True,
-        check=False,
-        cwd=tmp_path,
-        env={
-            "PATH": "/usr/bin:/bin",
-            "PYTHONPATH": os.pathsep.join([str(_CWD), *sys.path]),
-            "PYTEST_COLLECT_SELECTED_DIR": str(destination),
-        },
-        text=True,
+    result = isolated.runpytest_inprocess(
+        "--collect-only",
+        "-q",
+        "-p",
+        _PLUGIN,
+        "-m",
+        "not cluster and not cuda and not performance",
     )
 
-    assert result.returncode == 0, result.stderr[-400:]
+    assert result.ret == 0, result.outlines
     assert (destination / "pytest-global.txt").read_text(encoding="utf-8") == (
         "probe_test.py::test_global\n"
     )
@@ -251,46 +211,122 @@ def test_one_collection_writes_each_pr_pytest_tier(tmp_path: Path) -> None:
     )
 
 
-@pytest.mark.cli_python_subprocess
-def test_no_destination_writes_nothing(tmp_path: Path) -> None:
-    """Without the variable the plugin writes NO file, not merely a harmless one.
+def test_a_real_collection_is_narrowed_to_the_listing(
+    isolated: pytest.Pytester,
+) -> None:
+    for relative in ("keep/kept_test.py", "keep/dropped_test.py", "skip/other_test.py"):
+        (isolated.path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (isolated.path / relative).write_text(
+            "def test_it():\n    pass\n",
+            encoding="utf-8",
+        )
+    # A conftest that cannot import proves its directory is never entered.
+    (isolated.path / "skip" / "conftest.py").write_text(
+        "import missing_module\n",
+        encoding="utf-8",
+    )
+    (isolated.path / "files.txt").write_text("keep/kept_test.py\n", encoding="utf-8")
 
-    A plugin that fell back to a default path would still exit 0, so asserting
-    the status alone cannot fail. Compare the directory before and after: an
-    inert run leaves it byte-identical.
+    ran = _narrowed(isolated, listing_file="files.txt")
+
+    assert ran.ret == 0, ran.outlines
+    assert ran.passed == ["keep/kept_test.py::test_it"]
+
+
+def test_the_shards_of_a_split_file_run_each_of_its_tests_once(
+    isolated: pytest.Pytester,
+) -> None:
+    isolated.makepyfile(
+        split_test="".join(
+            f"def test_{name}():\n    pass\n" for name in ("a", "b", "c", "new")
+        ),
+    )
+    ran: list[set[str]] = []
+    # One listing per shard, as each CI shard is handed its own.
+    for shard, lines in enumerate(
+        (
+            "split_test.py\n!split_test.py::test_b\n!split_test.py::test_c\n",
+            "split_test.py::test_b\n",
+            "split_test.py::test_c\nsplit_test.py::test_gone\n",
+        ),
+    ):
+        (isolated.path / f"shard{shard}.txt").write_text(lines, encoding="utf-8")
+        shard_run = _narrowed(isolated, listing_file=f"shard{shard}.txt")
+        assert shard_run.ret == 0, shard_run.outlines
+        ran.append({nodeid.partition("::")[2] for nodeid in shard_run.passed})
+
+    # The whole-file shard keeps the test no listing names; renamed ones vanish.
+    assert ran == [{"test_a", "test_new"}, {"test_b"}, {"test_c"}]
+
+
+def test_a_pytest_a_narrowed_test_starts_collects_its_own_tests(
+    isolated: pytest.Pytester,
+) -> None:
+    """The listing narrows one pytest, not every pytest its tests start.
+
+    Tests that run pytest over a tree of their own inherit the environment, so
+    a listing handed over as a variable narrowed their run too: it collected
+    nothing and exited 5. The inner run is a real child, which is what inherits.
     """
-    tree = tmp_path / "tree"
-    tree.mkdir()
-    (tree / "probe_test.py").write_text("def test_one():\n    pass\n", encoding="utf-8")
-    before = set(tmp_path.rglob("*"))
-    result = subprocess.run(  # noqa: S603 -- fixed argv, internal literals.
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            str(tree),
-            "--collect-only",
-            "-q",
-            "-p",
-            "no:cacheprovider",
-            "-p",
-            "listing",
+    inner = isolated.mkdir("inner")
+    (inner / "inner_test.py").write_text("def test_it():\n    pass\n", encoding="utf-8")
+    outer = isolated.mkdir("outer")
+    (outer / "outer_test.py").write_text(
+        textwrap.dedent(
+            f"""
+            import subprocess
+            import sys
+
+            def test_inner_pytest_runs_its_test():
+                result = subprocess.run(
+                    [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+                    capture_output=True,
+                    check=False,
+                    cwd={str(inner)!r},
+                    text=True,
+                )
+                assert result.returncode == 0, result.stdout + result.stderr
+                assert "1 passed" in result.stdout
+            """,
+        ),
+        encoding="utf-8",
+    )
+    (outer / "files.txt").write_text("outer/outer_test.py\n", encoding="utf-8")
+
+    ran = _narrowed(isolated, listing_file="outer/files.txt")
+
+    assert ran.ret == 0, ran.outlines
+    assert ran.passed == ["outer/outer_test.py::test_inner_pytest_runs_its_test"]
+
+
+def _narrowed(isolated: pytest.Pytester, *, listing_file: str) -> _Narrowed:
+    """Run pytest over the tree narrowed to ``listing_file``, as a CI job does."""
+    result = isolated.runpytest_inprocess(
+        "-v",
+        "-p",
+        "no:cacheprovider",
+        "-p",
+        _PLUGIN,
+        f"--test-files={listing_file}",
+    )
+    return _Narrowed(
+        ret=int(result.ret),
+        outlines=result.outlines,
+        passed=[
+            line.partition(" ")[0]
+            for line in result.outlines
+            if line.endswith("PASSED") or " PASSED " in line
         ],
-        capture_output=True,
-        check=False,
-        cwd=tree,
-        # Byte-compilation would add __pycache__ under the tree and mask the
-        # only difference this test looks for.
-        env={
-            "PATH": "/usr/bin:/bin",
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONPATH": os.pathsep.join([str(_CWD), *sys.path]),
-        },
-        text=True,
     )
 
-    assert result.returncode == 0, result.stderr[-400:]
-    assert set(tmp_path.rglob("*")) == before, "the inert run created a file"
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Narrowed:
+    """What a narrowed run did: its status, its console, and the tests it passed."""
+
+    ret: int
+    outlines: list[str]
+    passed: list[str]
 
 
 class _Mark:
@@ -314,9 +350,6 @@ class _Session:
         self.items = items
 
 
-# In-process twins of the subprocess tests above: those run a real pytest and so
-# sit in the integration tier, which the unit tier and the mutation hook never
-# reach. These pin the same partition without a child interpreter.
 def test_each_tier_receives_exactly_its_tests(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -457,26 +490,6 @@ def test_no_listing_ignores_nothing(tmp_path: Path) -> None:
     )
 
 
-@pytest.mark.cli_python_subprocess
-def test_a_real_collection_is_narrowed_to_the_listing(tmp_path: Path) -> None:
-    for relative in ("keep/kept_test.py", "keep/dropped_test.py", "skip/other_test.py"):
-        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / relative).write_text("def test_it():\n    pass\n", encoding="utf-8")
-    # A conftest that cannot import proves its directory is never entered.
-    (tmp_path / "skip" / "conftest.py").write_text(
-        "import missing_module\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "files.txt").write_text("keep/kept_test.py\n", encoding="utf-8")
-
-    result = _narrowed_pytest(tmp_path)
-
-    assert result.returncode == 0, result.stdout[-400:] + result.stderr[-400:]
-    assert "keep/kept_test.py::test_it" in result.stdout
-    assert "dropped_test" not in result.stdout
-    assert "other_test" not in result.stdout
-
-
 def test_a_split_file_is_collected_wherever_a_listing_names_its_tests(
     tmp_path: Path,
 ) -> None:
@@ -580,93 +593,6 @@ def test_no_listing_keeps_every_test_of_a_split_file(tmp_path: Path) -> None:
 
     assert [item.nodeid for item in items] == ["s_test.py::a", "s_test.py::b[1]"]
     assert config.hook.deselected == []
-
-
-@pytest.mark.cli_python_subprocess
-def test_the_shards_of_a_split_file_run_each_of_its_tests_once(tmp_path: Path) -> None:
-    (tmp_path / "split_test.py").write_text(
-        "".join(f"def test_{name}():\n    pass\n" for name in ("a", "b", "c", "new")),
-        encoding="utf-8",
-    )
-    ran: list[set[str]] = []
-    for lines in (
-        "split_test.py\n!split_test.py::test_b\n!split_test.py::test_c\n",
-        "split_test.py::test_b\n",
-        "split_test.py::test_c\nsplit_test.py::test_gone\n",
-    ):
-        (tmp_path / "files.txt").write_text(lines, encoding="utf-8")
-        result = _narrowed_pytest(tmp_path)
-        assert result.returncode == 0, result.stdout[-400:] + result.stderr[-400:]
-        ran.append(set(re.findall(r"split_test\.py::(test_\w+) PASSED", result.stdout)))
-
-    # The whole-file shard keeps the test no listing names; renamed ones vanish.
-    assert ran == [{"test_a", "test_new"}, {"test_b"}, {"test_c"}]
-
-
-@pytest.mark.cli_python_subprocess
-def test_a_pytest_a_narrowed_test_starts_collects_its_own_tests(tmp_path: Path) -> None:
-    """The listing narrows one pytest, not every pytest its tests start.
-
-    Tests that run pytest over a tree of their own inherit the environment, so
-    a listing handed over as a variable narrowed their run too: it collected
-    nothing and exited 5.
-    """
-    inner = tmp_path / "inner"
-    inner.mkdir()
-    (inner / "inner_test.py").write_text("def test_it():\n    pass\n", encoding="utf-8")
-    outer = tmp_path / "outer"
-    outer.mkdir()
-    (outer / "outer_test.py").write_text(
-        textwrap.dedent(
-            f"""
-            import subprocess
-            import sys
-
-            def test_inner_pytest_runs_its_test():
-                result = subprocess.run(
-                    [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
-                    capture_output=True,
-                    check=False,
-                    cwd={str(inner)!r},
-                    text=True,
-                )
-                assert result.returncode == 0, result.stdout + result.stderr
-                assert "1 passed" in result.stdout
-            """,
-        ),
-        encoding="utf-8",
-    )
-    (outer / "files.txt").write_text("outer_test.py\n", encoding="utf-8")
-
-    result = _narrowed_pytest(outer)
-
-    assert result.returncode == 0, result.stdout[-800:] + result.stderr[-400:]
-    assert "1 passed" in result.stdout
-
-
-def _narrowed_pytest(cwd: Path) -> subprocess.CompletedProcess[str]:
-    """Run pytest in ``cwd`` narrowed to its ``files.txt``, as a CI job does."""
-    return subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-v",
-            "-p",
-            "no:cacheprovider",
-            "-p",
-            "listing",
-            "--test-files=files.txt",
-        ],
-        capture_output=True,
-        check=False,
-        cwd=cwd,
-        env={
-            "PATH": "/usr/bin:/bin",
-            "PYTHONPATH": os.pathsep.join([str(_CWD), *sys.path]),
-        },
-        text=True,
-    )
 
 
 def _ignored(path: Path, *, config: _Config) -> bool | None:

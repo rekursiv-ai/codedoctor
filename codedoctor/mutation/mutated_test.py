@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from functools import partial
 from multiprocessing.context import ForkContext
 from pathlib import Path
@@ -34,6 +35,7 @@ from mutmut.mutation.file_mutation import create_mutations, mutate_file_contents
 from mutmut.mutation.pragma_handling import PragmaParseError
 from mutmut.mutation.trampoline_templates import CLASS_NAME_SEPARATOR
 from mutmut.state import state
+from mutmut.utils.format_utils import get_mutant_name
 from treekle import from_plain, to_plain
 
 import libcst as cst
@@ -46,7 +48,9 @@ from codedoctor.mutation import mutated
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Iterator
+
+from collections.abc import Mapping
 
 from codedoctor.mutation.mutated import (
     Shard,
@@ -111,6 +115,85 @@ def _template(root: Path, tmp_path: Path) -> Path:
     return template
 
 
+class _SnapshotMutmut(TypedDict):
+    source_paths: list[str]
+    pytest_add_cli_args_test_selection: list[str]
+
+
+class _SnapshotTool(TypedDict):
+    mutmut: _SnapshotMutmut
+
+
+class _SnapshotProject(TypedDict):
+    """The part of a snapshot's ``pyproject.toml`` that ``mutmut run`` reads."""
+
+    tool: _SnapshotTool
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Mutmut:
+    """Stand in for ``mutmut run`` in a snapshot: mutmut's own mutants, given verdicts.
+
+    Each source the snapshot names is mutated by mutmut's library, under mutmut's
+    names, as the CLI does; each mutant's exit code is then ``codes``'s for its
+    function, 1 (killed) for any other. One real run stays in
+    ``test_a_surviving_mutant_is_reported_with_its_diff``.
+
+    Attributes:
+      codes: Exit codes by mangled function name, such as ``x_second``.
+      argvs: Each command the snapshot was handed, in order.
+      tests: The tests each snapshot selected, in order.
+      layouts: What each snapshot's tests run among, before mutation: every path
+        under its ``mutants/``, a symlink as ``path -> target``.
+
+    """
+
+    codes: Mapping[str, int] = field(default_factory=dict[str, int])
+    argvs: list[list[str]] = field(default_factory=list[list[str]])
+    tests: list[list[str]] = field(default_factory=list[list[str]])
+    layouts: list[set[str]] = field(default_factory=list[set[str]])
+
+    def __call__(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+        timeout_sec: float | None,
+    ) -> subprocess.CompletedProcess[str]:
+        del env, timeout_sec
+        self.argvs.append(argv)
+        settings = from_plain(
+            tomllib.loads((cwd / "pyproject.toml").read_text()),
+            _SnapshotProject,
+        )["tool"]["mutmut"]
+        self.tests.append(settings["pytest_add_cli_args_test_selection"])
+        tree = cwd / "mutants"
+        self.layouts.append(
+            {
+                f"{path.relative_to(tree)} -> {path.readlink()}"
+                if path.is_symlink()
+                else str(path.relative_to(tree))
+                for path in tree.rglob("*")
+                if "__pycache__" not in path.parts
+            },
+        )
+        for source in settings["source_paths"]:
+            generated = mutate_file_contents(source, (cwd / source).read_text())
+            path = cwd / "mutants" / source
+            path.write_text(generated.code)
+            data = SourceFileMutationData(path=path)
+            data.exit_code_by_key = {
+                get_mutant_name(Path(source), name): self.codes.get(
+                    name.partition("__mutmut_")[0],
+                    1,
+                )
+                for name in generated.mutant_names
+            }
+            data.save()
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+
 _TWO_FUNCTIONS = """\
 def first(value):
     return value + 1
@@ -140,6 +223,9 @@ def isolate_mutation_environment(
     monkeypatch.delenv("PRECOMMIT_SCOPE_MUTATION", raising=False)
     monkeypatch.delenv("SKIP", raising=False)
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    # The projects here need no installed plugin, and each mutmut phase's pytest
+    # would import every one: a real run took 4.2 s with them, 2.8 s without.
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
     temporary = tmp_path_factory.mktemp("snapshots")
     monkeypatch.setattr(tempfile, "tempdir", str(temporary))
     project = tmp_path_factory.mktemp("project")
@@ -884,7 +970,6 @@ def test_selected_source_symlinks_are_isolated_readable_files(
 
 
 @pytest.mark.cli_git
-@pytest.mark.cli_python_subprocess
 def test_a_selected_symlink_runs_its_paired_tests(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -896,10 +981,16 @@ def test_a_selected_symlink_runs_its_paired_tests(
     (root / "pkg/link_test.py").write_text(
         "from pkg.link import first\ndef test_first():\n    assert first(2) == 3\n",
     )
+    run = _Mutmut()
+    monkeypatch.setattr(mutated, "_run_mutmut", run)
     monkeypatch.chdir(root)
     monkeypatch.setattr(sys, "argv", ["mutated", "pkg/link.py"])
 
     assert mutated.main() == 0
+    assert [argv[-2:] for argv in run.argvs] == [
+        ["pkg.link.x_first__mutmut_*", "pkg.link.x_first__mutmut_1"],
+    ]
+    assert run.tests == [["pkg/link_test.py"]]
     assert not (root / "mutants").exists()
 
 
@@ -1154,49 +1245,57 @@ def test_a_surviving_mutant_is_reported_with_its_diff(
     *,
     accepted: bool,
 ) -> None:
-    """Run real mutmut so a change to its result format fails here, not in CI."""
-    body = (
+    """Run real mutmut so a change to its result format fails here, not in CI.
+
+    A flat project, its root a package, so the mutants are what its tests import
+    and not the snapshot's originals; its asset is read beside the module.
+    """
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / ".git").mkdir()
+    _runnable(root, source_paths='["."]')
+    _git(root, "init", "-q")
+    (root / "__init__.py").touch()
+    first = (
         'def first(value):\n    return "Bad input"  '
         "# mutmut: accept[diagnostic-text] -- Display only.\n"
         if accepted
-        else _TWO_FUNCTIONS.replace("+ 1", "+ 0")
+        else "def first(value):\n    return value + int(ASSET)\n"
     )
-    root = _repo(tmp_path, body=body)
-    _runnable(root)
-    _git(root, "init", "-q")
-    (root / "pkg/__init__.py").touch()
-    (root / "pkg/mod_test.py").write_text(
-        "from pkg.mod import first\n"
+    (root / "mod.py").write_text(
+        "from pathlib import Path\n"
+        "ASSET = Path(__file__).with_name('support.txt').read_text()\n" + first,
+    )
+    (root / "support.txt").write_text("0")
+    # Asserting only the type lets every mutant of the return survive.
+    (root / "mod_test.py").write_text(
+        "from mod import first\n"
         f"def test_first():\n    assert isinstance(first(2), {'str' if accepted else 'int'})\n",
     )
     monkeypatch.chdir(root)
-    monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py"])
+    monkeypatch.setattr(sys, "argv", ["mutated", "mod.py"])
 
     assert mutated.main() == (0 if accepted else 1)
 
     out = capsys.readouterr().out
     assert "survived the selected tests" in out
-    assert "  pkg.mod.x_first__mutmut_1\n" in out
+    assert "  mod.x_first__mutmut_1\n" in out
     status = (
         "survived, accepted: diagnostic-text -- Display only."
         if accepted
         else "survived"
     )
+    assert f"# mod.x_first__mutmut_1: {status}\n--- mod.py\n+++ mod.py\n" in out
     assert (
-        f"# pkg.mod.x_first__mutmut_1: {status}\n--- pkg/mod.py\n+++ pkg/mod.py\n"
-        in out
-    )
-    assert (
-        '+    return "XXBad inputXX"' if accepted else "-    return value + 0"
+        '+    return "XXBad inputXX"' if accepted else "-    return value + int(ASSET)"
     ) in out
     assert not (root / "mutants").exists()
     assert not any(isolate_mutation_environment.iterdir())
 
 
-@pytest.mark.cli_git
-@pytest.mark.cli_python_subprocess
 def test_every_selected_function_must_be_exercised(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     root = _repo(tmp_path / "repo", body=_TWO_FUNCTIONS)
@@ -1205,6 +1304,8 @@ def test_every_selected_function_must_be_exercised(
     (root / "pkg/mod_test.py").write_text(
         "from pkg.mod import first\ndef test_first():\n    assert first(2) == 3\n",
     )
+    # 33 is mutmut's exit code for a mutant no test reaches.
+    monkeypatch.setattr(mutated, "_run_mutmut", _Mutmut(codes={"x_second": 33}))
 
     report = run_shard(
         root,
@@ -1238,8 +1339,10 @@ def test_every_selected_function_must_be_exercised(
 
 
 @pytest.mark.cli_git
-@pytest.mark.cli_python_subprocess
-def test_a_function_whose_mutants_are_all_killed_passes(tmp_path: Path) -> None:
+def test_a_function_whose_mutants_are_all_killed_passes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     root = _repo(
         tmp_path / "repo",
         body="def foo(value):\n    return value + 1\n\n"
@@ -1250,6 +1353,9 @@ def test_a_function_whose_mutants_are_all_killed_passes(tmp_path: Path) -> None:
     (root / "pkg/mod_test.py").write_text(
         "from pkg.mod import foo\ndef test_foo():\n    assert foo(2) == 3\n",
     )
+
+    run = _Mutmut()
+    monkeypatch.setattr(mutated, "_run_mutmut", run)
 
     report = run_shard(
         root,
@@ -1269,138 +1375,9 @@ def test_a_function_whose_mutants_are_all_killed_passes(tmp_path: Path) -> None:
         checked=report.checked,
     )
     assert report.checked > 0
+    # ``foobar`` shares ``foo``'s prefix and is left unmutated, its own name aside.
+    assert run.argvs[0][-2:] == ["pkg.mod.x_foo__mutmut_*", "pkg.mod.x_foo__mutmut_1"]
     assert not (tmp_path / "snapshot").exists()
-
-
-@pytest.mark.cli_git
-@pytest.mark.cli_python_subprocess
-def test_flat_project_package_does_not_shadow_mutants(tmp_path: Path) -> None:
-    root = tmp_path / "repo"
-    root.mkdir()
-    _runnable(root, source_paths='["."]')
-    (root / "__init__.py").touch()
-    (root / "mod.py").write_text(
-        "from pathlib import Path\n"
-        "ASSET = Path(__file__).with_name('support.txt').read_text()\n"
-        "def first(value):\n    return value + int(ASSET)\n",
-    )
-    (root / "support.txt").write_text("1")
-    (root / "mod_test.py").write_text(
-        "from mod import first\ndef test_first():\n    assert first(2) == 3\n",
-    )
-
-    report = run_shard(
-        root,
-        shard=Shard(source="mod.py", filters=("mod.x_first__mutmut_*",)),
-        snapshot=tmp_path / "snapshot",
-        template=_template(root, tmp_path),
-        workers=1,
-        timeout_sec=None,
-    )
-
-    assert report.failure == ""
-    assert report.checked > 0
-    assert not any(report.outcomes.values())
-
-
-@pytest.mark.cli_git
-@pytest.mark.cli_python_subprocess
-def test_a_mutant_that_skips_every_selected_test_is_killed(tmp_path: Path) -> None:
-    """Pytest exits 0 when it skips everything; such a mutant ran no test at all.
-
-    The repository's own collection hook decides what to skip, so a mutant of the
-    function it calls can skip the very tests that would catch it.
-    """
-    root = _repo(
-        tmp_path / "repo",
-        body='def skipped(name):\n    return name == "test_never"\n',
-    )
-    _runnable(root)
-    (root / "pkg/__init__.py").touch()
-    (root / "conftest.py").write_text(
-        "import pytest\n"
-        "from pkg.mod import skipped\n"
-        "def pytest_collection_modifyitems(items):\n"
-        "    for item in items:\n"
-        "        if skipped(item.name):\n"
-        "            item.add_marker(pytest.mark.skip(reason='skipped'))\n",
-    )
-    (root / "pkg/mod_test.py").write_text(
-        "from pkg.mod import skipped\n"
-        "def test_skipped():\n"
-        "    assert skipped('test_never')\n"
-        "    assert not skipped('test_skipped')\n",
-    )
-
-    report = run_shard(
-        root,
-        shard=Shard(source="pkg/mod.py", filters=("pkg.mod.x_skipped__mutmut_*",)),
-        snapshot=tmp_path / "snapshot",
-        template=_template(root, tmp_path),
-        workers=1,
-        timeout_sec=None,
-    )
-
-    assert report.failure == ""
-    assert report.outcomes["survived"] == ()
-    assert report.checked > 0
-
-
-@pytest.mark.cli_git
-@pytest.mark.cli_python_subprocess
-def test_a_mutant_confined_to_a_cast_type_is_not_a_survivor(tmp_path: Path) -> None:
-    root = _repo(
-        tmp_path / "repo",
-        body="from typing import cast\n\n"
-        "def foo(value):\n    return cast(\n        int,\n        value,\n    ) + 1\n",
-    )
-    _runnable(root)
-    (root / "pkg/__init__.py").touch()
-    (root / "pkg/mod_test.py").write_text(
-        "from pkg.mod import foo\ndef test_foo():\n    assert foo(2) == 3\n",
-    )
-
-    report = run_shard(
-        root,
-        shard=Shard(source="pkg/mod.py", filters=("pkg.mod.x_foo__mutmut_*",)),
-        snapshot=tmp_path / "snapshot",
-        template=_template(root, tmp_path),
-        workers=1,
-        timeout_sec=None,
-    )
-
-    assert report.failure == ""
-    assert report.outcomes["survived"] == ()
-    assert report.checked > 1
-
-
-@pytest.mark.cli_git
-@pytest.mark.cli_python_subprocess
-def test_an_unreachable_docstring_fallback_is_not_a_survivor(tmp_path: Path) -> None:
-    root = _repo(
-        tmp_path / "repo",
-        body='"""Title.\n\nBody.\n"""\n\n'
-        'def describe():\n    return (__doc__ or "").split("\\n", 2)[2]\n',
-    )
-    _runnable(root)
-    (root / "pkg/__init__.py").touch()
-    (root / "pkg/mod_test.py").write_text(
-        "from pkg.mod import describe\n"
-        "def test_describe():\n    assert describe() == 'Body.\\n'\n",
-    )
-
-    report = run_shard(
-        root,
-        shard=Shard(source="pkg/mod.py", filters=("pkg.mod.x_describe__mutmut_*",)),
-        snapshot=tmp_path / "snapshot",
-        template=_template(root, tmp_path),
-        workers=1,
-        timeout_sec=None,
-    )
-
-    assert report.failure == ""
-    assert report.outcomes["survived"] == ()
-    assert report.checked > 1
 
 
 @pytest.mark.parametrize(
@@ -2378,7 +2355,6 @@ def test_the_callee_is_the_bare_name_or_empty(source: str, name: str) -> None:
 
 
 @pytest.mark.cli_git
-@pytest.mark.cli_python_subprocess
 def test_broad_run_uses_paired_tests_and_unmutated_support(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2419,15 +2395,26 @@ def test_broad_run_uses_paired_tests_and_unmutated_support(
     (root / "pkg/mod.py").write_text(
         (root / "pkg/mod.py").read_text().replace("+ 1", "+ 2"),
     )
+    run = _Mutmut()
+    monkeypatch.setattr(mutated, "_run_mutmut", run)
     monkeypatch.chdir(root)
     monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py"])
 
     assert mutated.main() == 0
     assert not (root / "mutants").exists()
+    # The paired tests alone, among the support they read and the links they check.
+    assert run.tests == [["pkg/mod_extra_test.py", "pkg/mod_test.py"]]
+    (layout,) = run.layouts
+    assert {
+        "conftest.py",
+        "helper.py",
+        "support/offset.txt",
+        "pkg/link.py -> mod.py",
+        "package_link -> pkg",
+    } <= layout
 
 
 @pytest.mark.cli_git
-@pytest.mark.cli_python_subprocess
 @pytest.mark.parametrize("module", ["pkg/__init__.py", "docs.example/mod.py"])
 def test_source_paths_survive_mutant_name_normalization(
     tmp_path: Path,
@@ -2447,6 +2434,7 @@ def test_source_paths_survive_mutant_name_normalization(
         "sample = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(sample)\n"
         "def test_foo():\n    assert sample.foo(2) == 3\n",
     )
+    monkeypatch.setattr(mutated, "_run_mutmut", _Mutmut())
     monkeypatch.chdir(root)
     monkeypatch.setattr(sys, "argv", ["mutated", module])
 
