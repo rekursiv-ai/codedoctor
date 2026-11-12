@@ -16,7 +16,7 @@ from codedoctor.lib import worker_count as worker_count_module
 from codedoctor.lib.worker_count import capped_workers, default_workers, worker_count
 
 
-_THIS: Final = Path(__file__).resolve()
+_THIS: Final[Path] = Path(__file__).resolve()
 _CWD: Final = _THIS.parent
 
 _REPO = next(

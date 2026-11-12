@@ -118,7 +118,11 @@ def _find_table(
         except tomllib.TOMLDecodeError as err:
             parser.error(f"{path}: {err}")
         try:
-            tools = from_plain(document.get("tool"), dict[str, object], default={})
+            tools = from_plain(
+                document.get("tool"),
+                dict[str, object],
+                default=dict[str, object](),
+            )
         except ReadError:
             parser.error(f"{path} [tool]: expected a table")
         for segment in tool.split("."):

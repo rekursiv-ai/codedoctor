@@ -251,7 +251,11 @@ def mutable_sources(root: Path) -> tuple[str, ...]:
     with config.open("rb") as handle:
         table = from_plain(tomllib.load(handle), dict[str, object])
     for name in ("tool", "mutmut"):
-        table = from_plain(table.get(name), dict[str, object], default={})
+        table = from_plain(
+            table.get(name),
+            dict[str, object],
+            default=dict[str, object](),
+        )
     raw = table.get("source_paths", [])
     # One ``convert`` for both shapes: a non-list and a non-string entry are
     # the same typo, not "no source". Narrowing with ``isinstance`` first would

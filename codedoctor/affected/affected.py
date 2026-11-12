@@ -43,7 +43,7 @@ from codedoctor.lib.files import walk
 from codedoctor.lib.worker_count import worker_count
 
 
-_THIS: Final = Path(__file__).resolve()
+_THIS: Final[Path] = Path(__file__).resolve()
 _CWD: Final = _THIS.parent
 
 if TYPE_CHECKING:
@@ -537,7 +537,7 @@ def _globs(value: object, *, default: list[str]) -> list[str]:
     # hand it a ``list[Unknown]`` and lose the element type the conversion
     # establishes.
     try:
-        words = from_plain(value, list[object], default=[])
+        words = from_plain(value, list[object], default=list[object]())
     except ReadError:
         return default
     return [str(word) for word in words] or default
