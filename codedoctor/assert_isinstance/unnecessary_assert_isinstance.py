@@ -173,7 +173,7 @@ def project_root(start: Path, *, tool: str) -> Path:
         if path.is_file() and tool in from_plain(
             tomllib.loads(path.read_text()).get("tool"),
             dict[str, object],
-            default={},
+            default=dict[str, object](),
         ):
             return directory
     return start
@@ -311,8 +311,16 @@ def diagnostics(report: str, *, overlay: Path, root: Path) -> list[Diagnostic]:
             else checked
         )
         # A file-level finding (an import cycle) carries no ``range``.
-        where = from_plain(item.get("range"), dict[str, object], default={})
-        start = from_plain(where.get("start"), dict[str, object], default={})
+        where = from_plain(
+            item.get("range"),
+            dict[str, object],
+            default=dict[str, object](),
+        )
+        start = from_plain(
+            where.get("start"),
+            dict[str, object],
+            default=dict[str, object](),
+        )
         line = from_plain(start.get("line"), int, default=0) + 1
         column = from_plain(start.get("character"), int, default=0)
         rule = from_plain(item.get("rule"), str, default="")
@@ -685,8 +693,16 @@ def _diagnostic_keys(
             list[dict[str, object]],
         )
         for item in items:
-            where = from_plain(item.get("range"), dict[str, object], default={})
-            start = from_plain(where.get("start"), dict[str, object], default={})
+            where = from_plain(
+                item.get("range"),
+                dict[str, object],
+                default=dict[str, object](),
+            )
+            start = from_plain(
+                where.get("start"),
+                dict[str, object],
+                default=dict[str, object](),
+            )
             line = from_plain(start.get("line"), int, default=0)
             column = from_plain(start.get("character"), int, default=0)
             rule = from_plain(item.get("rule"), str, default="")

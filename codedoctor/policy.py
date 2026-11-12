@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
 
-_THIS: Final = Path(__file__).resolve()
+_THIS: Final[Path] = Path(__file__).resolve()
 
 
 type TomlTable = Table | InlineTable | OutOfOrderTableProxy
@@ -89,7 +89,7 @@ def defaults(*, name: str, python_version: str = "3.12") -> dict[str, MutablePla
     exclusions = from_plain(
         table(table(tools, key="codedoctor"), key="lint").get("exclude"),
         list[str],
-        default=[],
+        default=list[str](),
     )
     table(result, key="codedoctor")["lint"] = {
         "select": "ALL",

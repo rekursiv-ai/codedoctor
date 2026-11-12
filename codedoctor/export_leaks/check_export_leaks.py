@@ -35,7 +35,7 @@ import tomllib
 from codedoctor.lib.worker_count import capped_workers, worker_count
 
 
-_CWD: Final = Path(__file__).resolve().parent
+_CWD: Final[Path] = Path(__file__).resolve().parent
 # The checkout this module lives in. Installed from a wheel there is none: no sync
 # config lies under it, so every function below finds no package and the gate
 # passes, as it should in a repository that exports nothing.

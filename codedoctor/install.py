@@ -21,7 +21,7 @@ import yaml
 from codedoctor import codegraph, policy
 
 
-_THIS: Final = Path(__file__).resolve()
+_THIS: Final[Path] = Path(__file__).resolve()
 _CWD: Final = _THIS.parent
 
 
@@ -181,7 +181,11 @@ def hook_config(text: str, *, notebooks: bool = False) -> str:
         for repo in _hook_repos()
     ]
     text = _upgrade_hooks(text, expected=expected)
-    document = from_plain(yaml.safe_load(text), dict[str, object], default={})
+    document = from_plain(
+        yaml.safe_load(text),
+        dict[str, object],
+        default=dict[str, object](),
+    )
     repos = (
         from_plain(document["repos"], list[dict[str, object]])
         if "repos" in document

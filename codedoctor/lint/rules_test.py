@@ -785,11 +785,13 @@ def test_tempfile_prefix_fix_handles_direct_imports_and_is_idempotent(
         "_CWD = Path(__file__).resolve().parent\n",
         "ROOT: Final = Path(__file__).resolve().parents[2]\n",
         "def f() -> Path:\n    return Path(__file__).resolve().parent\n",
-        "_CWD: Final = Path(__file__).parent\n",
+        "_CWD: Final[Path] = Path(__file__).parent\n",
         (
-            "_CWD: Final = Path(__file__).resolve().parent\n"
-            "_THIS: Final = _CWD / Path(__file__).name\n"
+            "_CWD: Final[Path] = Path(__file__).resolve().parent\n"
+            "_THIS: Final[Path] = _CWD / Path(__file__).name\n"
         ),
+        "_THIS: Final = Path(__file__).resolve()\n",
+        "_CWD: Final = Path(__file__).resolve().parent\n",
     ],
 )
 def test_noncanonical_path_file_is_reported(tmp_path: Path, body: str) -> None:
@@ -799,8 +801,8 @@ def test_noncanonical_path_file_is_reported(tmp_path: Path, body: str) -> None:
 @pytest.mark.parametrize(
     "body",
     [
-        '_CWD: Final = Path(__file__).resolve().parent\nDATA = _CWD / "testdata"\n',
-        "_THIS: Final = Path(__file__).resolve()\n_CWD: Final = _THIS.parent\n",
+        '_CWD: Final[Path] = Path(__file__).resolve().parent\nDATA = _CWD / "testdata"\n',
+        "_THIS: Final[Path] = Path(__file__).resolve()\n_CWD: Final[Path] = _THIS.parent\n",
     ],
 )
 def test_canonical_cwd_binding_is_clean(tmp_path: Path, body: str) -> None:
@@ -820,7 +822,7 @@ def test_cwd_final_fixes_directory_paths_and_parents(tmp_path: Path) -> None:
     assert fixed == (
         "from pathlib import Path\n"
         "from typing import Final\n\n"
-        "_CWD: Final = Path(__file__).resolve().parent\n\n"
+        "_CWD: Final[Path] = Path(__file__).resolve().parent\n\n"
         "a = _CWD\n"
         "b = _CWD\n"
         "c = _CWD.parent\n"
@@ -850,9 +852,9 @@ def test_cwd_final_fix_every_shape_on_one_line_each(tmp_path: Path) -> None:
         "from pathlib import Path\n"
         "from typing import Final\n"
         "\n"
-        "_THIS: Final = Path(__file__).resolve()\n"
+        "_THIS: Final[Path] = Path(__file__).resolve()\n"
         "\n"
-        "_CWD: Final = Path(__file__).resolve().parent\n"
+        "_CWD: Final[Path] = Path(__file__).resolve().parent\n"
         "a = _CWD, _CWD\n"
         "b = _CWD.parent\n"
         "c = _CWD.parents[2]\n"
@@ -872,8 +874,8 @@ def test_cwd_final_fixes_file_paths_with_this_binding(tmp_path: Path) -> None:
     assert fixed == (
         "from pathlib import Path\n"
         "from typing import Final\n\n"
-        "_THIS: Final = Path(__file__).resolve()\n"
-        "_CWD: Final = _THIS.parent\n\n"
+        "_THIS: Final[Path] = Path(__file__).resolve()\n"
+        "_CWD: Final[Path] = _THIS.parent\n\n"
         "name = _THIS.name\n"
     )
 
@@ -895,8 +897,8 @@ def test_cwd_final_fix_preserves_an_existing_this_binding(tmp_path: Path) -> Non
     body = (
         "from pathlib import Path\n"
         "from typing import Final\n"
-        "_THIS: Final = Path(__file__).resolve()\n"
-        "_CWD: Final = _THIS.parent\n"
+        "_THIS: Final[Path] = Path(__file__).resolve()\n"
+        "_CWD: Final[Path] = _THIS.parent\n"
         "other = Path(__file__).resolve()\n"
     )
     rule = CwdFinalRule()
@@ -907,9 +909,34 @@ def test_cwd_final_fix_preserves_an_existing_this_binding(tmp_path: Path) -> Non
     assert fixed == (
         "from pathlib import Path\n"
         "from typing import Final\n"
-        "_THIS: Final = Path(__file__).resolve()\n"
-        "_CWD: Final = _THIS.parent\n"
+        "_THIS: Final[Path] = Path(__file__).resolve()\n"
+        "_CWD: Final[Path] = _THIS.parent\n"
         "other = _THIS\n"
+    )
+    assert not _findings(tmp_path, rule, fixed)
+    assert _fixed(tmp_path, rule, fixed) is None
+
+
+def test_cwd_final_annotates_a_bare_final_binding(tmp_path: Path) -> None:
+    """A bare ``Final`` binding is reported and gains ``[Path]``, value untouched."""
+    body = (
+        "from pathlib import Path\n"
+        "from typing import Final\n"
+        "_THIS: Final = Path(__file__).resolve()\n"
+        "_CWD: Final = Path(__file__).resolve().parent\n"
+        "x = Path(__file__).parent\n"
+    )
+    rule = CwdFinalRule()
+    assert [f.line for f in _findings(tmp_path, rule, body)] == [3, 4, 5]
+
+    fixed = _fixed(tmp_path, rule, body)
+
+    assert fixed == (
+        "from pathlib import Path\n"
+        "from typing import Final\n"
+        "_THIS: Final[Path] = Path(__file__).resolve()\n"
+        "_CWD: Final[Path] = Path(__file__).resolve().parent\n"
+        "x = _CWD\n"
     )
     assert not _findings(tmp_path, rule, fixed)
     assert _fixed(tmp_path, rule, fixed) is None
@@ -919,13 +946,13 @@ def test_cwd_final_findings_skip_the_canonical_bindings(tmp_path: Path) -> None:
     body = (
         "from pathlib import Path\n"
         "from typing import Final\n"
-        "_THIS: Final = Path(__file__).resolve()\n"
-        "_CWD: Final = Path(__file__).resolve().parent\n"
+        "_THIS: Final[Path] = Path(__file__).resolve()\n"
+        "_CWD: Final[Path] = Path(__file__).resolve().parent\n"
         "x = Path(__file__).parent\n"
         "_OTHER: Final = Path(__file__).resolve().parent\n"
     )
     message = (
-        "Path(__file__) outside `_CWD: Final = Path(__file__).resolve().parent`; "
+        "Path(__file__) outside `_CWD: Final[Path] = Path(__file__).resolve().parent`; "
         "bind _CWD once and build subpaths from it"
     )
     assert [(f.line, f.message) for f in _findings(tmp_path, CwdFinalRule(), body)] == [
@@ -7466,7 +7493,7 @@ def test_split_private_docstring_wraps_summary_and_rationale(
             False,
             (
                 "from typing import Final\n\n"
-                "_CWD: Final = Path(__file__).resolve().parent\n\nx = 1\n"
+                "_CWD: Final[Path] = Path(__file__).resolve().parent\n\nx = 1\n"
             ),
         ),
         (
@@ -7474,7 +7501,7 @@ def test_split_private_docstring_wraps_summary_and_rationale(
             False,
             (
                 "import os \nfrom typing import Final\n\n"
-                "_CWD: Final = Path(__file__).resolve().parent\n\nX = 1\n"
+                "_CWD: Final[Path] = Path(__file__).resolve().parent\n\nX = 1\n"
             ),
         ),
         (
@@ -7482,7 +7509,7 @@ def test_split_private_docstring_wraps_summary_and_rationale(
             False,
             (
                 "from a import (\n    b,\n)\nfrom typing import Final\n\n"
-                "_CWD: Final = Path(__file__).resolve().parent\n\nx = 1\n"
+                "_CWD: Final[Path] = Path(__file__).resolve().parent\n\nx = 1\n"
             ),
         ),
         (
@@ -7490,7 +7517,7 @@ def test_split_private_docstring_wraps_summary_and_rationale(
             False,
             (
                 "import X\nfrom typing import Final\n\n"
-                "_CWD: Final = Path(__file__).resolve().parent\n\n  # c\nX = 1\n"
+                "_CWD: Final[Path] = Path(__file__).resolve().parent\n\n  # c\nX = 1\n"
             ),
         ),
         (
@@ -7498,7 +7525,7 @@ def test_split_private_docstring_wraps_summary_and_rationale(
             True,
             (
                 "from typing import Final\nimport os\n\n"
-                "_CWD: Final = _THIS.parent\n\n_THIS: Final = 1\n"
+                "_CWD: Final[Path] = _THIS.parent\n\n_THIS: Final = 1\n"
             ),
         ),
         (
@@ -7506,7 +7533,7 @@ def test_split_private_docstring_wraps_summary_and_rationale(
             True,
             (
                 "from typing import Final\nimport os\n\n"
-                "_THIS: Final = Path(__file__).resolve()\n\n_CWD: Final = 1\n"
+                "_THIS: Final[Path] = Path(__file__).resolve()\n\n_CWD: Final = 1\n"
             ),
         ),
         (
@@ -7519,7 +7546,7 @@ def test_split_private_docstring_wraps_summary_and_rationale(
             False,
             (
                 "from x import Final\nfrom typing import Final\n\n"
-                "_CWD: Final = Path(__file__).resolve().parent\n\nx = 1\n"
+                "_CWD: Final[Path] = Path(__file__).resolve().parent\n\nx = 1\n"
             ),
         ),
         (
@@ -7527,7 +7554,7 @@ def test_split_private_docstring_wraps_summary_and_rationale(
             False,
             (
                 "from typing import Final \n\n"
-                "_CWD: Final = Path(__file__).resolve().parent\n\nx = 1\n"
+                "_CWD: Final[Path] = Path(__file__).resolve().parent\n\nx = 1\n"
             ),
         ),
         (
@@ -7535,7 +7562,7 @@ def test_split_private_docstring_wraps_summary_and_rationale(
             False,
             (
                 "from typing import Final\nimport X\n\n"
-                "_CWD: Final = Path(__file__).resolve().parent\n\nx = 1\n"
+                "_CWD: Final[Path] = Path(__file__).resolve().parent\n\nx = 1\n"
             ),
         ),
         (
@@ -7543,7 +7570,7 @@ def test_split_private_docstring_wraps_summary_and_rationale(
             True,
             (
                 "from typing import Final\nimport os\n\n"
-                "_THIS: Final = Path(__file__).resolve()\n_CWD: Final = _THIS.parent\n\n"
+                "_THIS: Final[Path] = Path(__file__).resolve()\n_CWD: Final[Path] = _THIS.parent\n\n"
                 "_this: Final = 1\n"
             ),
         ),

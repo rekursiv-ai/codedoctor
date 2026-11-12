@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 
-_THIS: Final = Path(__file__).resolve()
+_THIS: Final[Path] = Path(__file__).resolve()
 
 _SOURCE: Final = "def f(x):\n    if x:\n        return 1\n    return 2\n"
 

@@ -3439,13 +3439,13 @@ def test_cwd_final_fix_reuses_existing_bindings(tmp_path: Path) -> None:
         tmp_path,
         "from pathlib import Path\n"
         "from typing import Final\n"
-        "_CWD: Final = Path(__file__).resolve().parent\n"
+        "_CWD: Final[Path] = Path(__file__).resolve().parent\n"
         "Y = Path(__file__).parent\n",
     )
     assert rules.CwdFinalRule().fix(unit) == (
         "from pathlib import Path\n"
         "from typing import Final\n"
-        "_CWD: Final = Path(__file__).resolve().parent\n"
+        "_CWD: Final[Path] = Path(__file__).resolve().parent\n"
         "Y = _CWD\n"
     )
 
@@ -3486,7 +3486,7 @@ def test_cwd_final_fix_rewrites_an_uncalled_resolve_attribute(tmp_path: Path) ->
     assert rules.CwdFinalRule().fix(unit) == (
         "from pathlib import Path\n"
         "from typing import Final\n\n"
-        "_CWD: Final = Path(__file__).resolve().parent\n\n"
+        "_CWD: Final[Path] = Path(__file__).resolve().parent\n\n"
         "X = _CWD\n"
         "Y = _CWD.parents[1]\n"
     )

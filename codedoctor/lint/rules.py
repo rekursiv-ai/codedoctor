@@ -1150,12 +1150,13 @@ class TempfilePrefixRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class CwdFinalRule:
-    """``Path(__file__)`` appears only as ``_CWD: Final = Path(__file__).resolve().parent``.
+    """``Path(__file__)`` appears only as ``_CWD: Final[Path] = Path(__file__).resolve().parent``.
 
     A file that needs its own path (a test excluding itself from a directory
-    scan) binds ``_THIS: Final = Path(__file__).resolve()`` and derives
-    ``_CWD: Final = _THIS.parent`` from it. Anything else spelled with
-    ``Path(__file__)`` is a violation.
+    scan) binds ``_THIS: Final[Path] = Path(__file__).resolve()`` and derives
+    ``_CWD: Final[Path] = _THIS.parent`` from it. Anything else spelled with
+    ``Path(__file__)`` is a violation, a bare ``Final`` binding included: ty
+    infers a bare ``Final`` bound to a ``Self``-returning call as ``Unknown``.
     """
 
     name: ClassVar[str] = "cwd-final"
@@ -1175,27 +1176,18 @@ class CwdFinalRule:
         tree = unit.tree
         if tree is None:
             return ()
-        canonical: set[int] = set()
-        for stmt in tree.body:
-            if (
-                isinstance(stmt, ast.AnnAssign)
-                and isinstance(stmt.target, ast.Name)
-                and ast.unparse(stmt.annotation) == "Final"
-                and stmt.value is not None
-                and (stmt.target.id, ast.unparse(stmt.value))
-                in (
-                    ("_CWD", "Path(__file__).resolve().parent"),
-                    ("_THIS", "Path(__file__).resolve()"),
-                )
-            ):
-                canonical.add(stmt.lineno)
+        canonical = {
+            line
+            for line, annotation in _cwd_bindings(tree).items()
+            if ast.unparse(annotation) == "Final[Path]"
+        }
         return tuple(
             Finding(
                 path=unit.path,
                 line=node.lineno,
                 rule=self.name,
                 message=(
-                    "Path(__file__) outside `_CWD: Final = "
+                    "Path(__file__) outside `_CWD: Final[Path] = "
                     "Path(__file__).resolve().parent`; bind _CWD once and build "
                     "subpaths from it"
                 ),
@@ -7351,19 +7343,14 @@ def _is_file_path_call(node: ast.AST) -> TypeIs[ast.Call]:
     )
 
 
-def _cwd_replacements(
-    unit: Unit,
-    tree: ast.Module,
-) -> tuple[list[tuple[int, int, str]], bool]:
-    """Return ``(start, end, text)`` source splices and whether ``_THIS`` is needed."""
-    parents = unit.parents
-    starts = _cached_line_starts(unit.source)
-    canonical = {
-        stmt.lineno
+def _cwd_bindings(tree: ast.Module) -> dict[int, ast.expr]:
+    """Return each module-path binding's line and its ``Final`` annotation."""
+    return {
+        stmt.lineno: stmt.annotation
         for stmt in tree.body
         if isinstance(stmt, ast.AnnAssign)
         and isinstance(stmt.target, ast.Name)
-        and ast.unparse(stmt.annotation) == "Final"
+        and ast.unparse(stmt.annotation) in {"Final", "Final[Path]"}
         and stmt.value is not None
         and (stmt.target.id, ast.unparse(stmt.value))
         in (
@@ -7371,12 +7358,30 @@ def _cwd_replacements(
             ("_THIS", "Path(__file__).resolve()"),
         )
     }
+
+
+def _cwd_replacements(
+    unit: Unit,
+    tree: ast.Module,
+) -> tuple[list[tuple[int, int, str]], bool]:
+    """Return ``(start, end, text)`` source splices and whether ``_THIS`` is needed."""
+    parents = unit.parents
+    starts = _cached_line_starts(unit.source)
+    bindings = _cwd_bindings(tree)
+    replacements: list[tuple[int, int, str]] = [
+        (
+            _offset(starts, annotation.lineno, annotation.col_offset),
+            _offset(starts, annotation.end_lineno, annotation.end_col_offset),
+            "Final[Path]",
+        )
+        for annotation in bindings.values()
+        if ast.unparse(annotation) == "Final"
+    ]
     # Each ``Path(__file__)`` call is the root of exactly one rewrite, chosen by
     # walking up its parents: ``.resolve()`` may sit between it and ``.parent``
     # or ``.parents[n]`` (called or not), and a ``/`` makes it a directory.
-    replacements: list[tuple[int, int, str]] = []
     for node in unit.nodes(ast.Call):
-        if not _is_file_path_call(node) or node.lineno in canonical:
+        if not _is_file_path_call(node) or node.lineno in bindings:
             continue
         top: ast.expr = node
         parent = parents.get(node)
@@ -7428,12 +7433,12 @@ def _insert_cwd_bindings(source: str, *, needs_this: bool) -> str:
     }
     bindings: list[str] = []
     if needs_this and "_THIS" not in names:
-        bindings.append("_THIS: Final = Path(__file__).resolve()")
+        bindings.append("_THIS: Final[Path] = Path(__file__).resolve()")
     if "_CWD" not in names:
         bindings.append(
-            "_CWD: Final = _THIS.parent"
+            "_CWD: Final[Path] = _THIS.parent"
             if needs_this
-            else "_CWD: Final = Path(__file__).resolve().parent",
+            else "_CWD: Final[Path] = Path(__file__).resolve().parent",
         )
     if not bindings:
         return source
@@ -8445,7 +8450,7 @@ def _unprefixed_tempfile_calls(unit: Unit, tree: ast.Module) -> Iterator[ast.Cal
 def _listed(value: object) -> list[object]:
     """Return ``value`` when it is a JSON array, else ``[]``."""
     try:
-        return from_plain(value, list[object], default=[])
+        return from_plain(value, list[object], default=list[object]())
     except ReadError:
         return []
 
