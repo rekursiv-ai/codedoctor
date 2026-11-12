@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from unittest.mock import Mock
 
+import ast
 import subprocess
 import sys
 import threading
@@ -322,6 +323,45 @@ def test_check_exports_into_scratch_then_format_checks_that_tree(
     }
 
 
+def test_check_reports_every_failure_of_the_exported_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each check reads the exported tree; one failing does not hide another.
+
+    The stubs are the checkout's own stub trees; a file there is no stubbed
+    package.
+    """
+    stubs = tmp_path / "loop" / "typings" / "stubs"
+    (stubs / "torch").mkdir(parents=True)
+    (stubs / "numpy").mkdir()
+    (stubs / "pkg.pyi").write_text("")
+
+    def run(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        if "export" in argv:
+            tree = Path(argv[7])
+            (tree / "pkg").mkdir()
+            (tree / "pkg" / "__init__.py").write_text(
+                "from pkg.gone import x\nimport pkg.lost\nimport torch, numpy\n",
+            )
+            (tree / "pyproject.toml").write_text('[project]\nname = "pkg"\n')
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 1, "pkg/__init__.py\n", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert check_export_leaks.check(_package(tmp_path, "loop/a"), root=tmp_path) == (
+        "exported tree is not format-clean (the export rewrites line lengths; "
+        "run `ruff format` on the exported tree to see the wrapping it wants):\n"
+        "pkg/__init__.py\n"
+        "exported imports of unshipped code:\n"
+        "pkg/__init__.py: pkg.gone\n"
+        "pkg/__init__.py: pkg.lost\n"
+        "exported tree imports stubbed packages without depending on "
+        "rekursiv-ai-typings: numpy, torch"
+    )
+
+
 @pytest.mark.parametrize("stderr", ["", "  \n"])
 def test_export_exit_is_failure_even_without_diagnostics(
     tmp_path: Path,
@@ -400,6 +440,194 @@ def test_copy_sources_handles_non_mapping_entries(tmp_path: Path) -> None:
     assert check_export_leaks._copy_sources(config) == ("kept",)
     config.write_text('files = "bad"', encoding="utf-8")
     assert check_export_leaks._copy_sources(config) == ()
+
+
+def test_an_import_of_a_missing_module_or_name_is_unresolved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A name counts only when the shipped ``.py`` binds it in module scope."""
+    package = tmp_path / "pkg" / "data"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "shipped.py").write_text(
+        "import os.path\nfrom typing import Final\nx: Final = 1\n"
+        "if condition:\n    conditional = 1\n"
+        "def f(): ...\nclass C: ...\n"
+        "def helper():\n"
+        "    local_store = 1\n"
+        "    from math import sqrt as local_import\n"
+        "class Namespace:\n"
+        "    class_store = 1\n"
+        "comprehension = [comprehension_store for comprehension_store in ()]\n"
+        "callback = lambda: (lambda_store := 1)\n",
+        encoding="utf-8",
+    )
+    (package / "shipped.pyi").write_text(
+        "class stripped: ...\nclass StubOnly: ...\n",
+        encoding="utf-8",
+    )
+    (package / "stubs.pyi").write_text("class Public: ...\n", encoding="utf-8")
+    (package / "user.py").write_text(
+        "from pkg.data.shipped import C as ClassAlias, f, os, x, conditional\n"
+        "from pkg.data.shipped import local_store, local_import\n"
+        "from pkg.data.shipped import class_store, comprehension_store\n"
+        "from pkg.data.shipped import lambda_store\n"
+        "from pkg.data.shipped import *\n"
+        "from pkg.data.shipped import stripped\n"
+        "from pkg.data.shipped import StubOnly\n"
+        "from pkg.data.stubs import Public\n"
+        "from pkg.data import shipped\n"
+        "from pkg.data.excluded import y\n"
+        "import pkg.data.gone\n",
+        encoding="utf-8",
+    )
+    namespace = tmp_path / "pkg" / "namespace"
+    namespace.mkdir()
+    (namespace / "leaf.py").write_text("", encoding="utf-8")
+    (namespace / "leaf_test.py").write_text(
+        "import pkg.namespace\nfrom pkg.namespace import leaf\n",
+        encoding="utf-8",
+    )
+    parsed: dict[str, int] = {}
+    parse = ast.parse
+
+    def count_parse(source: str, filename: str = "<unknown>") -> ast.Module:
+        parsed[filename] = parsed.get(filename, 0) + 1
+        return parse(source, filename=filename)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ast, "parse", count_parse)
+        unresolved = check_export_leaks._unresolved_imports(tmp_path)
+
+    assert unresolved == [
+        "pkg/data/user.py: pkg.data.shipped.local_store",
+        "pkg/data/user.py: pkg.data.shipped.local_import",
+        "pkg/data/user.py: pkg.data.shipped.class_store",
+        "pkg/data/user.py: pkg.data.shipped.comprehension_store",
+        "pkg/data/user.py: pkg.data.shipped.lambda_store",
+        "pkg/data/user.py: pkg.data.shipped.stripped",
+        "pkg/data/user.py: pkg.data.shipped.StubOnly",
+        "pkg/data/user.py: pkg.data.stubs",
+        "pkg/data/user.py: pkg.data.excluded",
+        "pkg/data/user.py: pkg.data.gone",
+    ]
+    assert parsed == {str(path): 1 for path in sorted(tmp_path.glob("pkg/**/*.py"))}
+
+
+def test_an_import_nested_in_a_function_or_handler_is_checked(tmp_path: Path) -> None:
+    """Imports hide under ``TYPE_CHECKING``, in functions, and in handlers."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text(
+        "def lazy():\n"
+        "    try:\n"
+        "        pass\n"
+        "    except ImportError:\n"
+        "        from pkg import in_handler\n"
+        "    match 1:\n"
+        "        case 1:\n"
+        "            import pkg.in_case\n",
+        encoding="utf-8",
+    )
+
+    assert check_export_leaks._unresolved_imports(tmp_path) == [
+        "pkg/__init__.py: pkg.in_handler",
+        "pkg/__init__.py: pkg.in_case",
+    ]
+
+
+def test_a_dependency_or_relative_import_is_not_the_trees_own(tmp_path: Path) -> None:
+    """Only a name the tree ships at its top level is checked."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text(
+        "import numpy.missing\nfrom torch import absent\nfrom . import sibling\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "setup.py").write_text("import pkg\nfrom pkg import nothing\n")
+
+    assert check_export_leaks._unresolved_imports(tmp_path) == ["setup.py: pkg.nothing"]
+
+
+def test_a_hidden_directory_is_not_scanned(tmp_path: Path) -> None:
+    """``.github`` scripts and caches ship no importable module."""
+    hidden = tmp_path / ".github" / "scripts"
+    hidden.mkdir(parents=True)
+    (hidden / "tool.py").write_text("from pkg import hidden\n", encoding="utf-8")
+    (tmp_path / "pkg.py").write_text("", encoding="utf-8")
+    (tmp_path / "user.py").write_text("from pkg import absent\n", encoding="utf-8")
+
+    assert check_export_leaks._unresolved_imports(tmp_path) == ["user.py: pkg.absent"]
+
+
+_STUBBED = frozenset({"torch", "datasets", "cv2"})
+
+
+def _tree(root: Path, pyproject: str | None) -> Path:
+    """Write a tree importing two stubbed packages; return its root."""
+    (root / "pkg").mkdir()
+    (root / "pkg" / "model.py").write_text("import torch.nn as nn, os\n")
+    (root / "pkg" / "data.pyi").write_text("from datasets import Dataset\n")
+    (root / "typings" / "cv2").mkdir(parents=True)
+    (root / "typings" / "cv2" / "__init__.pyi").write_text("import cv2.dnn\n")
+    if pyproject is not None:
+        (root / "pyproject.toml").write_text(pyproject)
+    return root
+
+
+@pytest.mark.parametrize(
+    "pyproject",
+    [
+        '[project]\nname = "pkg"\ndependencies = ["rekursiv-ai-typings>=0.1"]\n',
+        (
+            '[project]\nname = "pkg"\n'
+            '[project.optional-dependencies]\nlint = ["Rekursiv_AI-Typings"]\n'
+        ),
+        (
+            '[project]\nname = "pkg"\n[dependency-groups]\n'
+            'dev = [{include-group = "lint"}, "rekursiv-ai-typings ; python_version>\'3\'"]\n'
+        ),
+        '[project]\nname = "rekursiv-ai-typings"\n',
+        '[dependency-groups]\ndev = ["rekursiv-ai-typings"]\n',
+    ],
+    ids=["dependency", "extra", "group", "itself", "no-project-table"],
+)
+def test_a_declared_stubs_dependency_satisfies_the_rule(
+    tmp_path: Path,
+    pyproject: str,
+) -> None:
+    assert (
+        check_export_leaks._undeclared_stubs(_tree(tmp_path, pyproject), _STUBBED) == []
+    )
+
+
+def test_an_undeclared_one_names_each_stubbed_import(tmp_path: Path) -> None:
+    """``.py`` and ``.pyi`` imports count; the tree's own ``typings/`` does not."""
+    tree = _tree(
+        tmp_path,
+        '[project]\nname = "pkg"\ndependencies = ["rekursiv-ai-typings-extra"]\n'
+        '[dependency-groups]\ndev = [{include-group = "x"}]\n',
+    )
+
+    assert check_export_leaks._undeclared_stubs(tree, _STUBBED) == ["datasets", "torch"]
+
+
+def test_a_tree_with_no_pyproject_is_no_python_package(tmp_path: Path) -> None:
+    assert check_export_leaks._undeclared_stubs(_tree(tmp_path, None), _STUBBED) == []
+
+
+def test_import_lines_yield_each_top_level_name(tmp_path: Path) -> None:
+    (tmp_path / "m.py").write_text(
+        "import a.b as c, d\n  from e.f import g\nx = 'import h'\n# import i\n"
+        "import j\tas k,  l as m\n",
+    )
+
+    assert check_export_leaks._imported_top_level_packages(tmp_path) == {
+        "a",
+        "d",
+        "e",
+        "j",
+        "l",
+    }
 
 
 def _package(

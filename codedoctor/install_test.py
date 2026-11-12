@@ -735,6 +735,63 @@ def test_git_ignores_generated_state_without_hiding_source(
     assert ignored.read_bytes() == configured
 
 
+@pytest.mark.parametrize(
+    ("lines", "rule", "covered"),
+    [
+        ([], "x", False),
+        (["x"], "x", True),
+        (["x "], "x", True),
+        (["x\t"], "x", False),
+        (["xX"], "x", False),
+        (["#x"], "#x", False),
+        (["", "x"], "x", True),
+        (["x/"], "x", False),
+        (["x/"], "x/", True),
+        (["/x", "**/y"], "y", True),
+        (["x[!/]"], "xa", False),
+        (["x", "!y\\z"], "x", False),
+        (["x", "!y"], "x", True),
+        (["x", "!x"], "x", False),
+        (["x*", "!zz"], "x*", True),
+        (["x*", "!xa"], "x*", False),
+        ([".coverage.*", "!.cov*x"], ".coverage.*", False),
+        ([".coverage.*", "!.cov*x", ".coverage.*"], ".coverage.*", True),
+    ],
+)
+def test_a_rule_is_covered_by_the_last_line_that_decides_it(
+    lines: list[str],
+    rule: str,
+    covered: bool,
+) -> None:
+    """Trailing spaces, comments, directory-only lines and re-includes, by gitignore rules.
+
+    A re-include the matcher cannot decide (an escape, a glob sharing the
+    rule's prefix) reads as uncovered: the cost is one redundant line.
+    """
+    assert install._covered(lines, rule=rule) is covered
+
+
+@pytest.mark.parametrize(
+    ("pattern", "rule", "matches"),
+    [
+        ("x*", "x*", True),
+        ("*", "x*", True),
+        ("x[.-]*", "x.*", True),
+        ("x", "x*", False),
+        ("x.w*", "x.*", False),
+        ("x[*]", "x*", False),
+        ("x?", "xa", True),
+        ("x?", "x", False),
+    ],
+)
+def test_a_pattern_matches_every_name_a_rule_matches(
+    pattern: str,
+    rule: str,
+    matches: bool,
+) -> None:
+    assert install._matches_every(pattern, rule=rule) is matches
+
+
 def test_invalid_config_prevents_partial_setup(tmp_path: Path) -> None:
     path = tmp_path / ".pre-commit-config.yaml"
     path.write_text("repos: broken\n")

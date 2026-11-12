@@ -325,6 +325,8 @@ def _hook_repos() -> list[dict[str, object]]:
                 "check-copybarista-pr-text",
                 "check-export-leaks-spool",
                 "check-export-leaks",
+                "priml-golden-owners",
+                "arcagi3-gold-isolation",
             }
         ]
         if hooks:
@@ -462,7 +464,7 @@ def _covered(lines: list[str], *, rule: str) -> bool:
             continue
         pattern = pattern.removesuffix("/").removeprefix("/").removeprefix("**/")
         if negated:
-            literal = re.split(r"[*?\[\\]", pattern, maxsplit=1)[0]
+            literal = re.split(r"[*?\[\\]", pattern)[0]
             if (
                 "\\" in pattern
                 or (stem == rule and fnmatch.fnmatchcase(rule, pattern))
@@ -482,11 +484,5 @@ def _matches_every(pattern: str, *, rule: str) -> bool:
     stem = rule.removesuffix("*")
     if stem == rule:
         return fnmatch.fnmatchcase(rule, pattern)
-    # `pattern` matches every `stem + suffix` when a prefix of it matches `stem` and
-    # the rest is a `*` that absorbs any suffix.
-    return any(
-        fnmatch.fnmatchcase(stem, pattern[:split])
-        and not pattern[split:].strip("*")
-        and (pattern[split:] or pattern[:split].endswith("*"))
-        for split in range(len(pattern) + 1)
-    )
+    # A trailing `*` that matches `stem` stretches over any suffix after it.
+    return pattern.endswith("*") and fnmatch.fnmatchcase(stem, pattern)
