@@ -20,13 +20,16 @@ Usage:
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections import deque
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Final, Protocol, cast
 
 import argparse
+import ast
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -40,6 +43,13 @@ _CWD: Final[Path] = Path(__file__).resolve().parent
 # config lies under it, so every function below finds no package and the gate
 # passes, as it should in a repository that exports nothing.
 _ROOT: Final = _CWD.parents[2]
+
+_REQUIREMENT_NAME: Final = re.compile(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+
+_IMPORT_LINE: Final = re.compile(
+    r"^\s*(?:from\s+([A-Za-z_][A-Za-z0-9_]*)|import\s+([^\n#]+))",
+    re.MULTILINE,
+)
 
 
 def package_configs(
@@ -142,7 +152,8 @@ def check(config: Path, *, root: Path = _ROOT) -> str:
     report leaks the public repo never receives.
 
     The exported tree is then format-checked for the same reason (see
-    `_format_check`).
+    `_format_check`), its own imports resolved (see `_import_check`), and its
+    stubbed imports matched to a stubs dependency (see `_stub_check`).
 
     Args:
       config: Path to copy.barista.toml (package export config).
@@ -172,7 +183,9 @@ def check(config: Path, *, root: Path = _ROOT) -> str:
         )
         if completed.returncode != 0:
             return completed.stderr.strip() or f"export exited {completed.returncode}"
-        return _format_check(Path(scratch))
+        tree = Path(scratch)
+        errors = (_format_check(tree), _import_check(tree), _stub_check(tree, root))
+        return "\n".join(error for error in errors if error)
 
 
 def main() -> int:
@@ -303,6 +316,27 @@ def _format_check(tree: Path) -> str:
     )
 
 
+def _import_check(tree: Path) -> str:
+    """Return each import of the EXPORTED tree's own code that it does not ship."""
+    unresolved = _unresolved_imports(tree)
+    if not unresolved:
+        return ""
+    return "exported imports of unshipped code:\n" + "\n".join(unresolved)
+
+
+def _stub_check(tree: Path, root: Path) -> str:
+    """Return the stubbed packages the EXPORTED tree imports without their stubs."""
+    stubs = root / "loop" / "typings" / "stubs"
+    stubbed = frozenset(path.name for path in stubs.glob("*") if path.is_dir())
+    undeclared = _undeclared_stubs(tree, stubbed)
+    if not undeclared:
+        return ""
+    return (
+        "exported tree imports stubbed packages without depending on "
+        f"rekursiv-ai-typings: {', '.join(undeclared)}"
+    )
+
+
 class _Flags(Protocol):
     paths: Sequence[str]
     workers: int
@@ -315,3 +349,177 @@ def _touches(changed: set[Path], *, roots: Sequence[Path]) -> bool:
         if path in roots or any(parent in roots for parent in path.parents):
             return True
     return False
+
+
+# A package's ``files.exclude`` can drop a module a shipped file imports, and an
+# ``internal`` fence can strip a name one imports. The leak policy passes on both,
+# because nothing forbidden remains; only the exported tree shows it. An import is the
+# tree's own when its first dotted component names a top-level module or package the
+# tree ships; every other is a dependency.
+def _unresolved_imports(tree: Path) -> list[str]:
+    """Return ``path: dotted`` for each import of the tree's own code it lacks."""
+    module_names: dict[str, set[str]] = {}
+    imports: list[tuple[Path, str, str | None]] = []
+    for path in sorted(tree.rglob("*.py")):
+        relative = path.relative_to(tree)
+        if any(part.startswith(".") for part in relative.parts):
+            continue
+        text = path.read_text(
+            encoding="utf-8",
+        )  # pragma: no mutate -- this host's locale is UTF-8 too.
+        source = ast.parse(text, filename=str(path))
+        module_names.setdefault(_module_name(relative), set()).update(
+            _top_level_names(source),
+        )
+        for node in _statements(source):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module is not None
+                and not node.level
+            ):
+                imports.extend(
+                    (relative, node.module, alias.name) for alias in node.names
+                )
+            elif isinstance(node, ast.Import):
+                imports.extend((relative, alias.name, None) for alias in node.names)
+    shipped = {name.split(".")[0] for name in module_names}
+    module_dirs = {
+        ".".join(directory.relative_to(tree).parts)
+        for directory in tree.rglob("*")
+        if directory.is_dir()
+    }
+    unresolved: list[str] = []
+    for relative, module, name in imports:
+        if module.split(".")[0] not in shipped:
+            continue
+        dotted = _unresolved(module, name, module_names, module_dirs)
+        if dotted is not None:
+            unresolved.append(f"{relative.as_posix()}: {dotted}")
+    return unresolved
+
+
+def _module_name(relative: Path) -> str:
+    """Return a source file's import name, accounting for package initializers."""
+    parts = list(relative.with_suffix("").parts)
+    if parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+# An import is a statement, and statements nest only in statements, handlers and match
+# cases: skipping every expression skips nine nodes in ten of a full ``ast.walk``.
+def _statements(source: ast.Module) -> Iterator[ast.stmt]:
+    """Yield every statement of ``source``, nested ones included."""
+    pending: deque[ast.AST] = deque(source.body)
+    while pending:
+        node = pending.popleft()
+        if isinstance(node, ast.stmt):
+            yield node
+        pending.extend(
+            child
+            for child in ast.iter_child_nodes(node)
+            if isinstance(child, (ast.stmt, ast.ExceptHandler, ast.match_case))
+        )
+
+
+def _unresolved(
+    module: str,
+    name: str | None,
+    module_names: dict[str, set[str]],
+    module_dirs: set[str],
+) -> str | None:
+    """Return the dotted path that fails to resolve, or None when it is shipped."""
+    if name is not None:
+        child = f"{module}.{name}"
+        if child in module_names or child in module_dirs:
+            return None
+    names = module_names.get(module)
+    if names is None:
+        return None if name is None and module in module_dirs else module
+    if name is None or name == "*" or name in names:
+        return None
+    return f"{module}.{name}"
+
+
+def _top_level_names(source: ast.Module) -> set[str]:
+    """Names bound in module scope, including conditional branches."""
+    names: set[str] = set()
+    nodes: list[ast.AST] = list(source.body)
+    while nodes:
+        node = nodes.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+            continue
+        if isinstance(
+            node,
+            (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+        ):
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update(
+                alias.asname or alias.name.split(".")[0] for alias in node.names
+            )
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            names.add(node.id)
+        nodes.extend(ast.iter_child_nodes(node))
+    return names
+
+
+def _undeclared_stubs(tree: Path, stubbed: frozenset[str]) -> list[str]:
+    """Return the stubbed packages ``tree`` imports without declaring their stubs."""
+    pyproject = tree / "pyproject.toml"
+    if not pyproject.is_file() or "rekursiv-ai-typings" in _requirements(pyproject):
+        return []
+    return sorted(_imported_top_level_packages(tree) & stubbed)
+
+
+# A line-anchored regex, not ``ast.parse``: parsing priml's 362 exported modules cost
+# 0.64s for a set the caller intersects with the stub trees, which discards any
+# docstring noise the regex picks up. Stub files count: an exported ``.pyi`` needs its
+# imports' stubs as much as a ``.py``. The tree's own ``typings/`` does not: it holds
+# stubs, not users of them.
+def _imported_top_level_packages(tree: Path) -> set[str]:
+    """Return the top-level names on ``import``/``from`` lines under ``tree``."""
+    typings = tree / "typings"
+    sources = (
+        path
+        for path in (*tree.rglob("*.py"), *tree.rglob("*.pyi"))
+        if not path.is_relative_to(typings)
+    )
+    packages: set[str] = set()
+    for path in sources:
+        text = path.read_text(
+            encoding="utf-8",
+        )  # pragma: no mutate -- this host's locale is UTF-8 too.
+        for match in _IMPORT_LINE.finditer(text):
+            from_name, import_names = match.group(1), match.group(2)
+            if from_name:
+                packages.add(from_name)
+            else:
+                packages.update(
+                    name.split(".")[0].split()[0] for name in import_names.split(",")
+                )
+    return packages
+
+
+# The project's own name counts: the stubs distribution ships its stubs.
+def _requirements(pyproject: Path) -> set[str]:
+    """Return every distribution the project provides or requires."""
+    text = pyproject.read_text(
+        encoding="utf-8",
+    )  # pragma: no mutate -- this host's locale is UTF-8 too.
+    document = tomllib.loads(text)
+    project = cast(Mapping[str, object], document.get("project", {}))
+    lists: list[object] = [[project.get("name")], project.get("dependencies", [])]
+    for table in (
+        project.get("optional-dependencies", {}),
+        document.get("dependency-groups", {}),
+    ):
+        lists.extend(cast(Mapping[str, object], table).values())
+    names: set[str] = set()
+    for entries in lists:
+        for entry in cast(Sequence[object], entries):
+            # A ``{include-group = ...}`` table names no distribution.
+            if isinstance(entry, str) and (match := _REQUIREMENT_NAME.match(entry)):
+                names.add(match.group(1).lower().replace("_", "-"))
+    return names
