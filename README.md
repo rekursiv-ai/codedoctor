@@ -41,10 +41,12 @@ uses the project name for `userdirs-namespace.namespace`; set it explicitly in
 `[tool.codedoctor.lint]` to choose another namespace. `xdg-literal.helper` is unset
 unless the project requires a shared helper.
 
-Setup uses the same hook configuration as this repository, without its
-package-export and Rust-only checks. Commits autofix whitespace, spelling,
-Codedoctor lint, and Ruff formatting; check types with ty, pyrefly, and
-basedpyright; and run paired tests, coverage checks, and sampled mutation tests.
+The hooks come from the package's `install_hooks.yaml`. Commits autofix
+whitespace, spelling, Codedoctor lint, Ruff formatting, Biome formatting of
+TypeScript, JavaScript and CSS, and rustfmt; check types with ty, pyrefly, and
+basedpyright; run clippy once per touched crate; and run paired tests, coverage
+checks, and sampled mutation tests. A project without `biome.json` gets the
+package's Biome settings; an existing one is left alone.
 Pre-push checks are opt-in: install them with `pre-commit install --hook-type
 pre-push` to run repository-wide type checks and all test tiers.
 Dependency-graph setup precedes affected-file checks.
@@ -135,6 +137,7 @@ every gate and is the fullest example.
 | `codedoctor affected` | files and tests reached through CodeGraph |
 | `codedoctor nbstripout` | notebook output stripping |
 | `codedoctor yamlcheck` | YAML validation, including Compose tags |
+| `codedoctor cargo` | `cargo fmt` or `cargo clippy` once per touched crate |
 | `codedoctor export-leaks` | exported-package leak checks |
 | `codedoctor codegraph-sync` | dependency-graph refresh |
 | `codedoctor check-pr-text` | pull-request text validation |

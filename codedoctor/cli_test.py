@@ -209,6 +209,7 @@ def test_install_reports_preserved_overrides(
         ("assert-isinstance", "codedoctor.assert_isinstance.__main__"),
         ("nbstripout", "codedoctor.nbstripout.__main__"),
         ("yamlcheck", "codedoctor.yamlcheck.__main__"),
+        ("cargo", "codedoctor.cargo.__main__"),
         ("export-leaks", "codedoctor.export_leaks.__main__"),
         ("codegraph-sync", "codedoctor.affected.codegraph_sync"),
         ("check-pr-text", "codedoctor.export_leaks.check_pr_text"),

@@ -1,131 +1,31 @@
-# NEVER EDIT THIS FILE!
-
-# Universal Style and Quality Enforcement
-# Pre-commit/pre-push checks _and_ source-of-truth for Github workflows.
+# Codedoctor's pre-commit hooks: the source of truth for every repository that
+# runs them, this package's own monorepo included. `codedoctor install` adds
+# each hook a repository's `.pre-commit-config.yaml` lacks; a repository may
+# then change any hook's arguments, files, or excludes.
 #
-# Usage:
-#   The `pre-commit` dependency group supplies every tool the hooks below
-#   invoke. Naming it explicitly is belt-and-braces, NOT a requirement: uv
-#   defaults `default-groups` to `["dev"]`, and pyproject's `dev` includes
-#   `pre-commit`, so a bare `uv run` already resolves the tools (verified on a
-#   scratch project). Name it anyway so the command does not depend on that
-#   chain staying intact.
+#   uv run --group pre-commit pre-commit run --all-files
+#   uv run --group pre-commit pre-commit run --all-files --hook-stage pre-push
 #
-#     uv --quiet run --frozen --group pre-commit pre-commit install
-#     uv --quiet run --frozen --group pre-commit pre-commit autoupdate
-#     uv --quiet run --frozen --group pre-commit pre-commit run --all-files
+# Always pass --files or --all-files: a bare `run` stashes unstaged changes.
 #
-#   May need: git config --unset-all core.hooksPath
-#     if: [ERROR] Cowardly refusing to install hooks with `core.hooksPath` set.
+# Scope. PRECOMMIT_SCOPE defaults to granular. Any other value overrides
+# every applicable hook's individual setting:
 #
-#   Stages. `default_stages: [pre-commit]` below means a bare `run` sees only
-#   the pre-commit hooks; the heavy ones (ty-check-global, basedpyright-global,
-#   pytest*) declare `stages: [pre-push]` and need it named explicitly:
+#   PRECOMMIT_SCOPE=exact       Supplied files only.
+#   PRECOMMIT_SCOPE=sidecar     Supplied files plus paired source/tests.
+#   PRECOMMIT_SCOPE=affected:3  Sidecars plus three reverse-dependency hops.
 #
-#     uv --quiet run --frozen --group pre-commit pre-commit run --all-files
-#     uv --quiet run --frozen --group pre-commit pre-commit run --all-files --hook-stage pre-push
-#     uv --quiet run --frozen --group pre-commit pre-commit run --all-files --hook-stage commit-msg
-#
-#   Always pass --files or --all-files. Bare `run` (and the hook `git commit`
-#   fires on a dirty tree) STASHES your changes -- a git mutation, and this
-#   worktree is shared.
-#
-#   Scope. PRECOMMIT_SCOPE defaults to granular. Any other value overrides
-#   every applicable hook's individual setting:
-#
-#     PRECOMMIT_SCOPE=exact       Supplied files only.
-#     PRECOMMIT_SCOPE=sidecar     Supplied files plus paired source/tests.
-#     PRECOMMIT_SCOPE=affected:3  Sidecars plus three reverse-dependency hops.
-#
-#   Under granular, PRECOMMIT_SCOPE_<HOOK_ID> overrides that hook's default.
-#   Uppercase the hook ID and replace hyphens with underscores, for example
-#   PRECOMMIT_SCOPE_TY_CHECK=exact or PRECOMMIT_SCOPE_PYTEST=affected:1.
-#   Individual settings accept exact, sidecar, affected:N; never granular.
-#   Defaults: ty-check, pyrefly-check, basedpyright affected:3;
-#   pytest and mutation sidecar. No shell exports are required.
-#   Invalid scopes fail. Missing/unusable graphs warn and fall back to sidecars.
-#   Disable checks with SKIP, not enablement variables.
-#
-#   NUL-delimited, per AGENTS.md: a path containing a space becomes two
-#   arguments under `$(...)` or a bare `xargs`, and a rename record yields the
-#   name that no longer exists.
-#
-#   # Harvest all changed files from the perspective of CWD.
-#     git -C "$(git rev-parse --show-toplevel)" diff -z --name-only --diff-filter=d HEAD \
-#       | xargs -0 --no-run-if-empty uv --quiet run --frozen --group pre-commit pre-commit run --files
-#
-#   # Run only the files from the CWD.
-#     git --no-pager diff -z --name-only --cached --relative \
-#       | xargs -0 --no-run-if-empty uv --quiet run --frozen --group pre-commit pre-commit run --files
-#
-#   # Run all the files from CWD.
-#     uv --quiet run --frozen --group pre-commit pre-commit run --files $(git ls-files .)
-#
-#   One hook at a time, by id (`ruff-check`, `ty-check`, `pytest-global`, ...):
-#     uv --quiet run --frozen --group pre-commit pre-commit run ruff-check --all-files
-#     uv --quiet run --frozen --group pre-commit pre-commit run pytest-global --hook-stage pre-push
-#
-#   Force full pytest tiers despite testmon's warm dependency database:
-#     PYTEST_FORCE_ALL=1 uv --quiet run --frozen --group pre-commit pre-commit run pytest-global --hook-stage pre-push
-#
-#   Individual tests: the pytest hooks take no test selector, so call pytest
-#   directly.
-#
-#     uv --quiet run --frozen --group pre-commit pytest path/to/thing_test.py
-#     uv --quiet run --frozen --group pre-commit pytest path/to/thing_test.py::test_name
-#     uv --quiet run --frozen --group pre-commit pytest -k some_substring path/to/
-#     uv --quiet run --frozen --group pre-commit pytest -n 5 path/to/
-#
-#   Marker tiers mirror the pytest-slow-global / -ci-smoke-global /
-#   -integration-global hooks; the
-#   default `-m` filter lives in pyproject addopts, so ask for them by name:
-#
-#     uv --quiet run --frozen --group pre-commit pytest -m slow path/to/
-#
-#   Skipping. SKIP takes hook ids, comma-separated, and reports "Skipped":
-#
-#     SKIP=ruff-check uv --quiet run --frozen --group pre-commit pre-commit run --all-files
-#     SKIP=pytest-global,pytest-slow-global uv --quiet run --frozen --group pre-commit pre-commit run --hook-stage pre-push --all-files
-#
-#   `git commit --no-verify` / `git push --no-verify` bypass every hook. Both
-#   are a last resort, not a way past a red gate -- the gates are house rules
-#   (see AGENTS.md "Never suppress gates"). Fix the code the hook protects.
-#   The legitimate use is an unrelated pre-existing failure blocking an
-#   urgent unrelated commit; say so in the commit message when you do it.
-#
-#
-# On Source of Truthness:
-#
-#   Preferred location for any tool setting, in order:
-#     pyproject.toml  >  .pre-commit-config.yaml  >  .github/workflows/ci.yml
-#
-#   Put a setting as high in this chain as the tool allows. Only drop to a
-#   lower file when the higher one cannot express it (e.g. a CLI-only flag with
-#   no config key). pyproject.toml holds tool config; .pre-commit-config.yaml
-#   is the sole source for how hooks run (thread/worker counts, heap caps);
-#   .github/workflows/ci.yml only invokes the hooks and must not redefine
-#   any of these.
-#
-#
-# Design Philosophy;
-#
-#   Only fail if there's things which cannot be auto-fixed.
-#   Hooks fix files in place; if anything changes, pre-commit reports
-#   "files were modified" and the commit is aborted. Run `git add -u`
-#   then re-commit -- the second attempt always passes.
-#
-# See also:
-#
-#   https://pre-commit.com
-#   https://pre-commit.com/hooks.html
-#   https://learn.scientific-python.org/development/guides/style/
+# Under granular, PRECOMMIT_SCOPE_<HOOK_ID> overrides that hook's default.
+# Uppercase the hook ID and replace hyphens with underscores, for example
+# PRECOMMIT_SCOPE_TY_CHECK=exact or PRECOMMIT_SCOPE_PYTEST=affected:1.
+# Individual settings accept exact, sidecar, affected:N; never granular.
+# Defaults: ty-check, pyrefly-check, basedpyright affected:3;
+# pytest and mutation sidecar. Invalid scopes fail. Missing/unusable graphs
+# warn and fall back to sidecars. Disable checks with SKIP.
 
 fail_fast: false
 default_stages: [pre-commit]
-
-# ``commit-msg`` for the Copybarista-PR guard below: declared here, one
-# ``pre-commit install`` wires both hook types.
-default_install_hook_types: [pre-commit, commit-msg]
+default_install_hook_types: [pre-commit]
 
 repos:
 
@@ -161,7 +61,6 @@ repos:
             |typings/
             |(.*/)?typings/stubs/
             |(.*/)?\.export/typings/
-            |(.*/)?chrome/chrome_(desktop|android)_useragents\.txt
             |(.*/)?uv\.public\.lock
             |(.*/)?\.export/uv\.lock
             |\.(claude|sagent)/sessions/
@@ -244,7 +143,6 @@ repos:
       # with swap 92% full, inactive was 6.2 GiB but file-backed only 2.5 GiB;
       # counting inactive allowed 3 workers, and a pre-commit run drove free
       # memory to 53 MB.
-
 
       - id: nbstripout
         name: nbstripout
@@ -329,7 +227,6 @@ repos:
             |(.*/)?\.export/typings/
             |(.*/)?third_party/
             |\.(claude|sagent)/sessions/
-            |docs/symbols\.md
           )
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
@@ -369,19 +266,6 @@ repos:
         stages: [pre-commit]
         require_serial: true
         types_or: [python, pyi, jupyter]
-
-  - repo: local
-    hooks:
-      # The Copybarista-PR-Title/Body trailer is replayed into the PUBLIC export
-      # PR, which hard-fails on monorepo references (loop./loop/ ...) AFTER the
-      # commit is pushed and unrewritable. Runs that same forbidden-term check
-      # at commit-msg time, so a leak never reaches main.
-      - id: check-copybarista-pr-text
-        name: check-copybarista-pr-text
-        language: system
-        stages: [commit-msg]
-        always_run: true
-        entry: uv --quiet run --frozen --group pre-commit python -m codedoctor check-pr-text
 
   - repo: local
     hooks:
@@ -562,7 +446,6 @@ repos:
             |(.*/)?typings/stubs/
             |(.*/)?\.export/typings/
             |(.*/)?third_party/
-            |website/rekursiv-ai\.github\.io/_site/
           )
 
       - id: basedpyright
@@ -587,34 +470,45 @@ repos:
           - --fixer
           - codedoctor.assert_isinstance
 
+  # TypeScript, JavaScript and CSS formatting; settings and exclusions live in
+  # biome.json, which `codedoctor install` writes. `files` narrows upstream's
+  # list, which also formats JSON and Markdown. HTML stays out: Biome cannot
+  # parse the template languages HTML files often hold.
+  - repo: https://github.com/biomejs/pre-commit
+    rev: v2.6.7
+    hooks:
+      - id: biome-format
+        name: biome-format
+        stages: [pre-commit]
+        files: \.(tsx?|[cm]ts|jsx?|[cm]js|css)$
+
+  # rustfmt rewrites in place, then clippy denies every warning, each once per
+  # crate a change touches: the nearest `Cargo.toml` above each file.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo-fmt
+        language: system
+        stages: [pre-commit]
+        require_serial: true
+        files: (\.rs|(^|/)Cargo\.toml)$
+        entry: uv --quiet run --frozen --group pre-commit python -m codedoctor cargo fmt
+
+      - id: cargo-clippy
+        name: cargo-clippy
+        language: system
+        stages: [pre-commit]
+        require_serial: true
+        files: (\.rs|(^|/)Cargo\.(toml|lock))$
+        entry: >-
+          nice -n 19 uv --quiet run --frozen --group pre-commit python -m codedoctor
+          cargo clippy
+
   - repo: local
     hooks:
       # Each heavy hook below is a `-spool` twin, which collects pre-commit's
       # file chunks, then the hook, which runs once over all of them through
       # the `gate` or `testing` module at this machine's worker count.
-      #
-      # One export is ~4.5s of mostly-subprocess work, so the pool scales on the
-      # children, not on Python: 8 packages went 27.2s serial -> 5.3s.
-      #
-      # No `files` filter: `touched_configs` picks the packages a change
-      # reaches. A `^loop/` filter skipped the website and every shared file a
-      # package copies (`ops/github/shared/`, this config, `.codespell-ignore`).
-      - id: check-export-leaks-spool
-        name: check-export-leaks-spool
-        # `run check-export-leaks` selects this twin too, so its spool exists.
-        alias: check-export-leaks
-        language: system
-        stages: [pre-commit]
-        require_serial: true
-        entry: uv --quiet run --frozen --group pre-commit python -m codedoctor gate spool check-export-leaks
-
-      - id: check-export-leaks
-        name: check-export-leaks
-        language: system
-        stages: [pre-commit]
-        require_serial: true
-        pass_filenames: false
-        entry: uv --quiet run --frozen --group pre-commit python -m codedoctor gate run check-export-leaks -- codedoctor.export_leaks
 
       # Runs the tests PAIRED with each changed file (`x_test.py`, `test_x.py`,
       # beside it or under `tests/`), then applies `fail_under` to the changed
@@ -817,6 +711,3 @@ repos:
         verbose: true
         entry: uv --quiet run --frozen --group pre-commit python -m codedoctor testing tier pytest-integration-global
         args: [--plugin, codedoctor.testing.listing]
-
-
-# NEVER EDIT THIS FILE!

@@ -9,7 +9,7 @@ import subprocess
 import tomllib
 
 from ruamel.yaml import YAML
-from treekle import MutablePlainTree, from_plain
+from treekle import MutablePlainTree, from_plain, json_loads
 
 import pytest
 import rignore
@@ -180,6 +180,9 @@ def test_hook_config_creates_valid_empty_config(notebooks: bool | None) -> None:
         "codespell",
         "ruff-check",
         "ruff-format",
+        "biome-format",
+        "cargo-fmt",
+        "cargo-clippy",
         "codegraph-sync",
         "ty-check",
         "pyrefly-check",
@@ -195,8 +198,6 @@ def test_hook_config_creates_valid_empty_config(notebooks: bool | None) -> None:
     } <= ids
     assert (
         not {
-            "cargo-fmt",
-            "cargo-clippy",
             "check-export-leaks",
             "check-export-leaks-spool",
             "check-copybarista-pr-text",
@@ -516,6 +517,7 @@ def test_install_locks_dependencies_then_installs_only_pre_commit(
     packaged.parent.mkdir()
     packaged.with_name("install_hooks.yaml").write_text(_PACKAGED_HOOKS)
     packaged.with_name("install_defaults.toml").write_text("[tool.ruff]\n")
+    packaged.with_name("install_biome.json").write_text("{}\n")
     monkeypatch.setattr(install, "_THIS", packaged)
     monkeypatch.setattr(policy, "_THIS", packaged)
     if notebooks is None:
@@ -790,6 +792,27 @@ def test_a_pattern_matches_every_name_a_rule_matches(
     matches: bool,
 ) -> None:
     assert install._matches_every(pattern, rule=rule) is matches
+
+
+@pytest.mark.parametrize("existing", ["", "biome.json", "biome.jsonc"])
+def test_biome_settings_are_written_only_where_none_exist(
+    tmp_path: Path,
+    existing: str,
+) -> None:
+    if existing:
+        (tmp_path / existing).write_text("{}\n")
+    install._write_biome(tmp_path)
+    written = tmp_path / "biome.json"
+    if existing:
+        assert sorted(path.name for path in tmp_path.iterdir()) == [existing]
+        assert (tmp_path / existing).read_text() == "{}\n"
+    else:
+        settings = json_loads(written.read_text(), dict[str, object])
+        assert from_plain(settings["formatter"], dict[str, object]) == {
+            "indentStyle": "space",
+            "indentWidth": 2,
+            "lineWidth": 88,
+        }
 
 
 def test_invalid_config_prevents_partial_setup(tmp_path: Path) -> None:
