@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from inspect import getdoc
 from multiprocessing.context import ForkContext
 from pathlib import Path
 from types import SimpleNamespace
@@ -574,6 +575,106 @@ def test_a_named_rule_reports(
 
     assert checker.main() == 1
     assert "[dataclass]" in capsys.readouterr().out
+
+
+def test_suppressions_counts_each_rules_markers_most_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Inline and file-level markers both count; no rule need be selected."""
+    _write(tmp_path, "x = 1  # house-ignore[globals, digits] -- Why.\n", name="a.py")
+    _write(tmp_path, "# house-ignore[digits] -- Why.\ny = 2\n", name="b.py")
+    _write(tmp_path, '"""# house-ignore[emdash] -- Quoted."""\n', name="c.py")
+    monkeypatch.setattr(sys, "argv", ["checker.py", "--suppressions", str(tmp_path)])
+
+    assert checker.main() == 0
+    assert capsys.readouterr().out == "2 digits\n1 globals\n"
+
+
+def test_suppressions_ties_sort_by_rule_name(tmp_path: Path) -> None:
+    paths = [
+        _write(tmp_path, f"x = 1  # house-ignore[{name}] -- Why.\n", name=f"{n}.py")
+        for n, name in enumerate(("zeta", "beta", "zeta", "alpha"))
+    ]
+
+    assert checker.suppressions(paths, workers=1) == (
+        ("zeta", 2),
+        ("alpha", 1),
+        ("beta", 1),
+    )
+
+
+def test_suppressions_skips_files_lint_would_report_unreadable(
+    tmp_path: Path,
+) -> None:
+    good = _write(tmp_path, "x = 1  # house-ignore[digits] -- Why.\n")
+    bad = tmp_path / "bad.py"
+    bad.write_bytes(b"\xff  # house-ignore[globals] -- Why.\n")
+
+    assert checker.suppressions([good, bad, tmp_path / "gone.py"], workers=1) == (
+        ("digits", 1),
+    )
+
+
+def test_explain_prints_the_rules_reason_and_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["checker.py", "--explain", "digits"])
+
+    assert checker.main() == 0
+    assert capsys.readouterr().out == (
+        "digits (can fix)\n"
+        "\n"
+        "Insert underscore separators into long integer literals.\n"
+        "\n"
+        "Must run before ``ruff format``: grouping lengthens a line, which can\n"
+        "change how the formatter wraps it.\n"
+        "\n"
+        "settings:\n"
+        "  min-digits = 5\n"
+    )
+
+
+def test_explain_omits_settings_for_a_rule_without_any(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["checker.py", "--explain", "test-naming"])
+
+    assert checker.main() == 0
+    out = capsys.readouterr().out
+    assert out.startswith("test-naming (no autofix)\n\n")
+    assert "settings:" not in out
+
+
+def test_explain_lists_each_setting_as_set_takes_it() -> None:
+    assert checker.explanation(rules.FluentNameRule()).endswith(
+        "\n\nsettings:\n  endings = _of _for\n  verbs = wait_for",
+    )
+
+
+def test_explain_rejects_an_unknown_rule(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["checker.py", "--explain", "nope"])
+
+    with pytest.raises(SystemExit) as raised:
+        checker.main()
+
+    assert raised.value.code == 2
+    assert "--explain: unknown rule 'nope'" in capsys.readouterr().err
+
+
+def test_every_shipped_rule_explains_itself_past_its_summary() -> None:
+    """``--explain`` shows the docstring; a summary alone gives no reason."""
+    assert [
+        rule.name
+        for rule in checker.default_rules()
+        if "\n\n" not in (getdoc(type(rule)) or "")
+    ] == []
 
 
 def test_two_rules_can_be_named_together(
@@ -2211,7 +2312,13 @@ def test_help_shows_every_default(
         "Exit status: 0 clean, 1 findings remain, 2 usage error.",
         (
             "[--select RULES] [--fix RULES] [--set RULE.FIELD=VALUE] "
-            "[--exclude GLOBS[=RULES]] [--workers WORKERS] [paths ...]"
+            "[--exclude GLOBS[=RULES]] [--workers WORKERS] [--explain RULE] "
+            "[--suppressions] [paths ...]"
+        ),
+        "--explain RULE print RULE's reason and settings, then exit (default: none)",
+        (
+            "--suppressions count the house-ignore markers naming each rule, "
+            "most first, then exit (default: False)"
         ),
         "paths files and directories to lint (default: .)",
         "--select RULES space-separated rules to run, or ALL (default: none)",

@@ -13,15 +13,19 @@ Examples:
   codedoctor lint --select digits pkg/lib         one rule, one directory
   codedoctor lint --set digits.min-digits=6       change a rule setting
   codedoctor lint --exclude '*_test.py = globals nested-def'
+  codedoctor lint --explain digits                why a rule exists, its settings
+  codedoctor lint --suppressions                  markers per rule, most first
 
 Exit status: 0 clean, 1 findings remain, 2 usage error.
 
 """
 
-from collections.abc import Mapping, Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import Field, dataclass, fields, replace
 from functools import partial
+from inspect import getdoc
 from itertools import compress
 from multiprocessing.context import ForkContext
 from pathlib import Path
@@ -282,29 +286,7 @@ def run(
         exclude=tuple(exclude),
         root=root,
     )
-    # A worker costs ~6 ms to start plus a 40 ms import of the rules, so one
-    # is worth starting only past ~10 files. Measured on the CLI, best of 3:
-    # 5 files 0.16s serial vs 0.30s at 24 workers; 50 files 0.92s vs 0.50s.
-    pool_size = capped_workers(workers, units=len(paths), per_worker=10)
-    if pool_size <= 1:
-        results = list(map(lint, paths))
-    else:
-        # ``fork``, not the default ``forkserver``: the server is exec'd
-        # with the parent's ``sys.argv`` on its own command line, and an
-        # ``--all-files`` run passes ~4000 paths -- past Linux's 128 KB
-        # single-argument cap, so the server died at exec and the parent saw
-        # ``BrokenPipeError``. Forking is safe here: this process has no
-        # threads, and the children inherit the imported rules for free.
-        with ProcessPoolExecutor(
-            max_workers=pool_size,
-            mp_context=ForkContext(),
-        ) as pool:
-            # Small chunks so a directory of large files does not pin one
-            # worker while the rest sit idle; the path list is not sorted by
-            # cost and a contiguous split by count is not a split by work.
-            results = list(
-                pool.map(lint, paths, chunksize=max(1, len(paths) // (pool_size * 8))),
-            )
+    results = _spread(lint, paths, workers=workers)
     findings = sorted(finding for found, _ in results for finding in found)
     return tuple(findings), tuple(compress(paths, (wrote for _, wrote in results)))
 
@@ -395,6 +377,21 @@ def main() -> int:
     # pragma: no mutate start -- a cast is a no-op at runtime.
     flags = cast(_Flags, namespace)
     # pragma: no mutate end
+    if flags.explain:
+        rule = next((rule for rule in rules if rule.name == flags.explain), None)
+        if rule is None:
+            parser.error(
+                f"--explain: unknown rule {flags.explain!r}; "
+                f"known: {sorted(rule.name for rule in rules)}",
+            )
+        print(explanation(rule))
+        return 0
+    paths = walk.expand(flags.paths, suffixes=_KINDS)
+    workers = flags.workers or default_workers()
+    if flags.suppressions:
+        for name, count in suppressions(paths, workers=workers):
+            print(f"{count} {name}")
+        return 0
     try:
         active, fixing = select_rules(
             rules,
@@ -406,7 +403,6 @@ def main() -> int:
             parse_exclusion(spec, known={rule.name for rule in rules})
             for spec in flags.exclude
         )
-        paths = walk.expand(flags.paths, suffixes=_KINDS)
     except ValueError as err:
         # ``parser.error`` prints usage and exits 2. Raising through would
         # print a traceback naming this file, which tells a hook author
@@ -418,7 +414,7 @@ def main() -> int:
         fixing=fixing,
         exclude=exclude,
         root=root,
-        workers=flags.workers or default_workers(),
+        workers=workers,
     )
     for path in written:
         # The hooks this replaced each announced their rewrites. A silent
@@ -551,6 +547,63 @@ def glob_regex(pattern: str, /) -> re.Pattern[str]:
         )
         + r"\Z",
     )
+
+
+def explanation(rule: Rule, /) -> str:
+    """Render ``rule``'s docstring and current settings, as ``--explain`` prints them.
+
+    Args:
+      rule: The rule, carrying the settings to show.
+
+    Returns:
+      text: Name and fixability, the docstring, then one ``--set`` key and its
+        value per setting; no settings block for a rule with none.
+
+    """
+    header = f"{rule.name} ({'can fix' if rule.fixable else 'no autofix'})"
+    settings: list[str] = []
+    for field in fields(rule):
+        value = cast(object, getattr(rule, field.name))
+        # Spelled as ``--set`` takes it: a container is one space-separated value.
+        shown = (
+            " ".join(map(str, cast(tuple[object, ...], value)))
+            if isinstance(value, tuple)
+            else str(value)
+        )
+        settings.append(f"  {field.name.replace('_', '-')} = {shown}")
+    doc = getdoc(type(rule))
+    assert isinstance(doc, str)
+    blocks = [header, doc]
+    if settings:
+        blocks.append("settings:\n" + "\n".join(settings))
+    return "\n\n".join(blocks)
+
+
+def suppressions(
+    paths: Sequence[Path],
+    /,
+    *,
+    workers: int,
+) -> tuple[tuple[str, int], ...]:
+    """Count the ``house-ignore`` markers naming each rule across ``paths``.
+
+    A rule that developers suppress often is one they judge wrong where it
+    fires. The count is the signal to fix that rule or to remove it.
+
+    Args:
+      paths: Files to read, already expanded from any directories.
+      workers: Cap on processes to spread the paths over.
+
+    Returns:
+      counts: ``(rule, markers)`` pairs, most markers first, ties by name.
+
+    """
+    counts = Counter(
+        name
+        for names in _spread(_marker_names, paths, workers=workers)
+        for name in names
+    )
+    return tuple(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
 
 
 def _names(value: str) -> set[str]:
@@ -686,6 +739,60 @@ def _add_arguments(parser: argparse.ArgumentParser, /) -> None:
         type=worker_count,
         help="processes to lint with; empty or below 1 means 1",
     )
+    parser.add_argument(
+        "--explain",
+        default="",
+        metavar="RULE",
+        help="print RULE's reason and settings, then exit",
+    )
+    parser.add_argument(
+        "--suppressions",
+        action="store_true",
+        help="count the house-ignore markers naming each rule, most first, then exit",
+    )
+
+
+def _spread[T](
+    work: Callable[[Path], T],
+    paths: Sequence[Path],
+    /,
+    *,
+    workers: int,
+) -> list[T]:
+    """Apply ``work`` to each path, over up to ``workers`` processes, in order."""
+    # A worker costs ~6 ms to start plus a 40 ms import of the rules, so one
+    # is worth starting only past ~10 files. Measured on the CLI, best of 3:
+    # 5 files 0.16s serial vs 0.30s at 24 workers; 50 files 0.92s vs 0.50s.
+    pool_size = capped_workers(workers, units=len(paths), per_worker=10)
+    if pool_size <= 1:
+        return list(map(work, paths))
+    # ``fork``, not the default ``forkserver``: the server is exec'd with the
+    # parent's ``sys.argv`` on its own command line, and an ``--all-files``
+    # run passes ~4000 paths -- past Linux's 128 KB single-argument cap, so
+    # the server died at exec and the parent saw ``BrokenPipeError``. Forking
+    # is safe here: this process has no threads, and the children inherit the
+    # imported rules for free.
+    with ProcessPoolExecutor(max_workers=pool_size, mp_context=ForkContext()) as pool:
+        # Small chunks so a directory of large files does not pin one worker
+        # while the rest sit idle; the path list is not sorted by cost and a
+        # contiguous split by count is not a split by work.
+        return list(
+            pool.map(work, paths, chunksize=max(1, len(paths) // (pool_size * 8))),
+        )
+
+
+def _marker_names(path: Path, /) -> tuple[str, ...]:
+    """Every rule the ``house-ignore`` markers in ``path`` name, repeats kept."""
+    unit = read_unit(path)
+    # An unreadable file is a finding for the lint run to report, and it has no
+    # tokens to read a marker from.
+    if not isinstance(unit, Unit):
+        return ()
+    return tuple(
+        name
+        for _, match, _ in house_ignore.markers(unit)
+        for name in house_ignore.rule_names(match.group(1))
+    )
 
 
 def _lint_path(
@@ -820,3 +927,5 @@ class _Flags(Protocol):
     exclude: list[str]
     paths: list[Path]
     workers: int | None
+    explain: str
+    suppressions: bool
