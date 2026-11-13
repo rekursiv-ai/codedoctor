@@ -23,17 +23,7 @@ throughput. A line is written as each file finishes, and every surviving
 mutant is reported with its diff. --timeout-sec kills a mutmut run that
 takes longer, failing its file and no other; without it, runs have no limit.
 
-Unaccepted findings and setup failures exit 1. A trailing comment can accept
-survivors after execution: ``# mutmut: accept[diagnostic-text] -- Reason.``
-applies only to wording changes of one string literal on that line, preserving
-format placeholders. Use it only when exact wording is independently
-noncontractual. ``# mutmut: accept[case-insensitive] -- Reason.`` accepts only
-casing changes with equal lowercase values, at a case-insensitive use site;
-added text such as ``XXCookieXX`` remains blocking. Each reason justifies its
-rule, never broadens it. Acceptance never skips execution or hides the diff;
-other mutations remain blocking. No blanket or fingerprint acceptance is supported.
-Malformed markers fail; unused markers fail once the whole owning function
-has been checked. Sampling and partial remainder runs defer unused checks.
+Findings and setup failures exit 1.
 PRECOMMIT_SCOPE and PRECOMMIT_SCOPE_MUTATION select exact, sidecar, or affected:N
 scope. Exact uses only supplied test files; sidecar is the default.
 
@@ -62,7 +52,6 @@ from fractions import Fraction
 from functools import partial
 from multiprocessing.context import ForkContext
 from pathlib import Path
-from string import Formatter
 from typing import TYPE_CHECKING, Final, Protocol, cast
 from unicodedata import normalize
 
@@ -101,7 +90,7 @@ from mutmut.mutation.trampoline_templates import (
     mangle_function_name,
 )
 from mutmut.stats import status_by_exit_code
-from mutmut.utils.format_utils import get_mutant_name, mangled_name_from_mutant_name
+from mutmut.utils.format_utils import get_mutant_name
 from tomlkit.items import Table
 from treekle import ReadError, from_plain, json_loads
 
@@ -131,8 +120,7 @@ def main() -> int:
     """Mutate-test the functions in the named files.
 
     Returns:
-      status: Nonzero for setup failures or unaccepted findings; zero when no
-        blocking findings remain, including locally accepted survivors.
+      status: Nonzero for setup failures or findings; zero when no findings remain.
 
     """
     parser = argparse.ArgumentParser(
@@ -517,22 +505,13 @@ class Remainder:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class Survivor:
-    """One surviving variant's diff and optional local acceptance."""
-
-    diff: str
-    accepted: str = ""
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
 class ShardReport:
     """What one shard found.
 
     Attributes:
       source: The file mutated.
       outcomes: Mutant names, or filters for ``unchecked``, by status.
-      survivors: Surviving mutant names mapped to their evidence and acceptance.
-      acceptance_errors: Invalid or unused markers within the checked scope.
+      diffs: Surviving mutant names mapped to their diffs.
       checked: Mutants with a recorded result, killed or not.
       failure: Why the shard recorded no results; empty when it did.
 
@@ -542,8 +521,7 @@ class ShardReport:
     outcomes: Mapping[str, tuple[str, ...]] = field(
         default_factory=dict[str, tuple[str, ...]],
     )
-    survivors: Mapping[str, Survivor] = field(default_factory=dict[str, Survivor])
-    acceptance_errors: tuple[str, ...] = ()
+    diffs: Mapping[str, str] = field(default_factory=dict[str, str])
     checked: int = 0
     failure: str = ""
 
@@ -1342,7 +1320,7 @@ def _tail(output: str, *, lines: int = 40) -> str:
 
 
 def _print_reports(reports: list[ShardReport]) -> int:
-    """Print every finding; return nonzero for failures or unaccepted findings."""
+    """Print every finding; return nonzero for failures or findings."""
     if failed := sorted(r.source for r in reports if r.failure):
         print("mutation: these files recorded no results; each reason is above:")
         print("".join(f"  {source}\n" for source in failed), end="")
@@ -1364,20 +1342,11 @@ def _print_reports(reports: list[ShardReport]) -> int:
             "\nCheck test coverage of these functions first. Missing test "
             "selection or sandbox imports can also prevent coverage.",
         )
-    survivors = {name: s for r in reports for name, s in r.survivors.items()}
+    diffs = {name: diff for r in reports for name, diff in r.diffs.items()}
     for name in merged["survived"]:
-        survivor = survivors[name]
-        accepted = f", accepted: {survivor.accepted}" if survivor.accepted else ""
-        print(f"# {name}: survived{accepted}")
-        print(f"{survivor.diff}\n")
-    for report in reports:
-        for error in report.acceptance_errors:
-            print(f"mutation: {error}")
-    return int(
-        any(r.failure or r.acceptance_errors for r in reports)
-        or any(merged[status] for status in ("no tests", "inconclusive", "unchecked"))
-        or any(not survivors[name].accepted for name in merged["survived"]),
-    )
+        print(f"# {name}: survived")
+        print(f"{diffs[name]}\n")
+    return int(any(r.failure for r in reports) or any(merged.values()))
 
 
 def _paired_tests(root: Path, *, sources: tuple[str, ...]) -> tuple[str, ...]:
@@ -1436,158 +1405,21 @@ def _collect(snapshot: Path, *, shard: Shard) -> ShardReport:
     mutated = snapshot / "mutants" / shard.source
     context = (snapshot / shard.source).read_text(encoding="utf-8")
     functions = {name: _functions(name, path=mutated) for name in outcomes["survived"]}
-    survivors, errors = _survivors(
-        snapshot,
-        shard=shard,
-        exit_codes=data.exit_code_by_key,
-        functions={
-            name: pair
-            for name, pair in functions.items()
-            if not _only_unobservable(*pair, context=context)
-        },
-    )
+    diffs = {
+        name: _diff(snapshot, name=name, source=shard.source)
+        for name, pair in functions.items()
+        if not _only_unobservable(*pair, context=context)
+    }
     return ShardReport(
         source=shard.source,
-        outcomes={**outcomes, "survived": tuple(survivors)},
-        survivors=survivors,
-        acceptance_errors=errors,
+        outcomes={**outcomes, "survived": tuple(diffs)},
+        diffs=diffs,
         checked=sum(
             code is not None
             and any(fnmatch.fnmatchcase(name, pattern) for pattern in shard.filters)
             for name, code in data.exit_code_by_key.items()
         ),
     )
-
-
-def _survivors(
-    snapshot: Path,
-    *,
-    shard: Shard,
-    exit_codes: Mapping[str, int | None],
-    functions: Mapping[str, tuple[str, str]],
-) -> tuple[dict[str, Survivor], tuple[str, ...]]:
-    survivors = {
-        name: Survivor(diff=_diff(snapshot, name=name, source=shard.source))
-        for name in functions
-    }
-    source = snapshot / shard.source
-    context = source.read_text(encoding="utf-8")
-    selected = {
-        name
-        for name, code in exit_codes.items()
-        if code is not None and any(fnmatch.fnmatchcase(name, f) for f in shard.filters)
-    }
-    owners = _function_lines(source)
-    by_owner: defaultdict[str, set[str]] = defaultdict(set)
-    for name in exit_codes:
-        _, _, owner_name = mangled_name_from_mutant_name(name).rpartition(".")
-        by_owner[owner_name].add(name)
-    errors: list[str] = []
-    for token in tokenize.generate_tokens(io.StringIO(context).readline):
-        if token.type != tokenize.COMMENT or not re.match(
-            r"#\s*mutmut\s*:",
-            token.string,
-        ):
-            continue
-        owner = next(
-            ((name, lines) for name, lines in owners if token.start[0] in lines),
-            None,
-        )
-        names = by_owner[owner[0]] if owner is not None else set[str]()
-        if owner is not None and not names & selected:
-            continue
-        location = f"{shard.source}:{token.start[0]}"
-        match = re.fullmatch(
-            r"# mutmut: accept\[(diagnostic-text|case-insensitive)\] -- (\S.*)",
-            token.string,
-        )
-        if owner is None or match is None or not token.line[: token.start[1]].strip():
-            errors.append(
-                f"{location}: invalid mutation acceptance; require a trailing rule and reason",
-            )
-            continue
-        rule, reason = match.groups()
-        matched = {
-            name: replace(survivors[name], accepted=f"{rule} -- {reason}")
-            for name in names & survivors.keys()
-            for original, mutant in [functions[name]]
-            if _accepted_string_change(
-                original,
-                mutant=mutant,
-                rule=rule,
-                line=token.start[0]
-                - owner[1].stop
-                + cast(int, ast.parse(original).body[0].end_lineno)
-                + 1,
-            )
-        }
-        survivors.update(matched)
-        if not matched and names <= selected:
-            errors.append(f"{location}: unused mutation acceptance [{rule}]")
-    return survivors, tuple(errors)
-
-
-def _accepted_string_change(
-    original: str,
-    *,
-    mutant: str,
-    line: int,
-    rule: str,
-) -> bool:
-    """Match a local rule against one changed literal and otherwise identical tokens."""
-    before, after = (
-        [
-            t
-            for t in tokenize.generate_tokens(io.StringIO(text).readline)
-            if t.type != tokenize.COMMENT
-        ]
-        for text in (original, mutant)
-    )
-    literals = [
-        i
-        for i, t in enumerate(before)
-        if t.type == tokenize.STRING and t.end[0] == line
-    ]
-    if len(literals) != 1 or len(before) != len(after):
-        return False
-    (index,) = literals
-    old, new = before[index], after[index]
-    if new.type != tokenize.STRING or old.string == new.string:
-        return False
-    after[index] = old
-    if [(t.type, t.string) for t in before] != [(t.type, t.string) for t in after]:
-        return False
-    old_value = cast(object, ast.literal_eval(old.string))
-    new_value = cast(object, ast.literal_eval(new.string))
-    if not isinstance(old_value, str) or not isinstance(new_value, str):
-        return False
-    if rule == "case-insensitive":
-        return old_value != new_value and old_value.lower() == new_value.lower()
-    fields = _diagnostic_fields(old_value)
-    return fields is not None and fields == _diagnostic_fields(new_value)
-
-
-def _diagnostic_fields(
-    value: str,
-) -> tuple[list[tuple[str, str | None, str | None]], list[str]] | None:
-    """Return brace and percent fields; reject malformed or unparsed placeholders."""
-    parts = cast(
-        list[str],
-        re.split(
-            r"(%(?:\([^()]+\))?[#0 +\-]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlL]?[a-zA-Z%])",
-            value,
-        ),
-    )
-    if any("%" in literal for literal in parts[::2]):
-        return None
-    try:
-        return [
-            (name, spec, conversion)
-            for _, name, spec, conversion in Formatter().parse(value)
-            if name is not None
-        ], parts[1::2]
-    except ValueError:
-        return None
 
 
 def _diff(snapshot: Path, *, name: str, source: str) -> str:

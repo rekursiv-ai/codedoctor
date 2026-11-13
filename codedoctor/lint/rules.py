@@ -5301,7 +5301,6 @@ _EXEMPT_PREFIXES: Final = (
     "NOTE",
     "isort:",
     "pragma:",
-    "mutmut:",
     "shellcheck",
     "mypy:",
     "ty:",
