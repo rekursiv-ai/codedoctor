@@ -96,6 +96,7 @@ def install(root: Path, *, notebooks: bool = False) -> tuple[str, ...]:
     codegraph.install()
     _bootstrap_hooks(root)
     _update_gitignore(root)
+    _write_biome(root)
     return policy.overrides(tomlkit.parse(configured_project))
 
 
@@ -308,30 +309,12 @@ def _hook_identity(
 
 
 def _hook_repos() -> list[dict[str, object]]:
-    """Read the same hook configuration this package uses itself."""
-    template = _THIS.with_name("install_hooks.yaml")
-    content = template.read_text()
-    config = from_plain(yaml.safe_load(content), dict[str, object])
-    repos = from_plain(config["repos"], list[dict[str, object]])
-    portable: list[dict[str, object]] = []
-    for repo in repos:
-        hooks = [
-            hook
-            for hook in from_plain(repo["hooks"], list[dict[str, object]])
-            if hook["id"]
-            not in {
-                "cargo-fmt",
-                "cargo-clippy",
-                "check-copybarista-pr-text",
-                "check-export-leaks-spool",
-                "check-export-leaks",
-                "priml-golden-owners",
-                "arcagi3-gold-isolation",
-            }
-        ]
-        if hooks:
-            portable.append({**repo, "hooks": hooks})
-    return portable
+    """Read Codedoctor's hooks, the source of truth for every installed repository."""
+    config = from_plain(
+        yaml.safe_load(_THIS.with_name("install_hooks.yaml").read_text()),
+        dict[str, object],
+    )
+    return from_plain(config["repos"], list[dict[str, object]])
 
 
 def _append_repos(text: str, *, repos: list[dict[str, object]]) -> str:
@@ -420,6 +403,12 @@ def _bootstrap_hooks(root: Path) -> None:
         + "--config=.pre-commit-config.yaml --hook-type=pre-commit "
         + '--hook-dir="$(dirname "$0")" -- "$@"\n',
     )
+
+
+def _write_biome(root: Path) -> None:
+    """Give the biome-format hook Codedoctor's settings unless the project has its own."""
+    if not any((root / name).exists() for name in ("biome.json", "biome.jsonc")):
+        shutil.copyfile(_THIS.with_name("install_biome.json"), root / "biome.json")
 
 
 def _update_gitignore(root: Path) -> None:
