@@ -180,7 +180,7 @@ def test_hook_config_creates_valid_empty_config(notebooks: bool | None) -> None:
         "codespell",
         "ruff-check",
         "ruff-format",
-        "biome-format",
+        "biome-check",
         "cargo-fmt",
         "cargo-clippy",
         "codegraph-sync",
