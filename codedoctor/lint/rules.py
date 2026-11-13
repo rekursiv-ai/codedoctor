@@ -1032,6 +1032,107 @@ class LazyImportBindingRule:
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
+class LazyDataclassFieldRule:
+    """A dataclass field's annotation names no ``lazy_import`` proxy.
+
+    ``@dataclass`` inspects each field's annotation for ``ClassVar``. A string
+    annotation (quoted, or every one under ``from __future__ import annotations``)
+    is probed by the name it starts with, looked up among the module's names; any
+    other is evaluated whole. A proxy either finds is resolved, importing the
+    module it defers as the dataclass's own module loads. A name bound only under
+    ``TYPE_CHECKING``, or a string spelled through a module proxy, ``module.Name``,
+    is never resolved.
+    """
+
+    name: ClassVar[str] = "lazy-dataclass-field"
+    kinds: ClassVar[frozenset[str]] = frozenset({"python"})
+    fixable: ClassVar[bool] = False
+
+    def check(self, unit: Unit, /) -> Sequence[Finding]:
+        """Report each dataclass field whose annotation resolves a lazy proxy.
+
+        Args:
+          unit: The file under inspection.
+
+        Returns:
+          findings: One per field, in source order.
+
+        """
+        if "lazy_import" not in unit.source:
+            return ()
+        tree = unit.tree
+        if tree is None:
+            return ()
+        proxies = frozenset(
+            target.id
+            for node in _module_scope_statements(tree)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and (node.value.func.id == "lazy_import")
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        )
+        if not proxies:
+            return ()
+        bound = _dataclass_bindings(tree)
+        deferred = _has_future_annotations(unit)
+        findings: list[Finding] = []
+        for node in unit.nodes(ast.ClassDef):
+            if not any(
+                _is_dataclass_decorator(
+                    dec.func if isinstance(dec, ast.Call) else dec,
+                    bound,
+                )
+                for dec in node.decorator_list
+            ):
+                continue
+            for stmt in node.body:
+                if not (
+                    isinstance(stmt, ast.AnnAssign)
+                    and isinstance(stmt.target, ast.Name)
+                ):
+                    continue
+                probed = _probed_text(stmt.annotation, deferred=deferred)
+                named = _probed_proxy(stmt.annotation, proxies, probed=probed)
+                if not named:
+                    continue
+                field_of = f"field `{stmt.target.id}` of dataclass {node.name}"
+                findings.append(
+                    Finding(
+                        path=unit.path,
+                        line=stmt.lineno,
+                        rule=self.name,
+                        message=(
+                            f"{field_of} evaluates `{named}`, a lazy_import proxy, "
+                            "which imports its module as the module loads; add "
+                            "`from __future__ import annotations`, then spell the "
+                            "type through a lazy module, `module.Name`"
+                            if probed is None
+                            else f"{field_of} starts with `{named}`, a lazy_import "
+                            "proxy, which @dataclass resolves as the module loads; "
+                            "bind the name only under TYPE_CHECKING and spell the "
+                            "type through a lazy module, `module.Name`"
+                        ),
+                    ),
+                )
+        return tuple(findings)
+
+    def fix(self, unit: Unit, /) -> str | None:
+        """No autofix: which module reaches the type is a judgement call.
+
+        Args:
+          unit: The file under inspection.
+
+        Returns:
+          rewritten: The full new source, or None when nothing changes.
+
+        """
+        del unit
+        return None
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
 class TmpLiteralRule:
     """Reject ``/tmp`` literals; ``tempfile`` owns temporary locations."""
 
@@ -7123,6 +7224,43 @@ def _xdg_violation(node: ast.expr) -> str:
     return ""
 
 
+# Under the future import a quoted annotation is quoted again, which the probe never
+# matches; without it, a quoted one is the string itself.
+def _probed_text(annotation: ast.expr, *, deferred: bool) -> str | None:
+    """Return the string ``@dataclass`` probes for ``annotation``; None if evaluated."""
+    if deferred:
+        return ast.unparse(annotation)
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        return annotation.value
+    return None
+
+
+# The pattern is ``dataclasses._MODULE_IDENTIFIER_RE``. Its match of a qualified
+# name is then compared by identity, which a module proxy answers unresolved.
+def _probed_proxy(
+    annotation: ast.expr,
+    proxies: AbstractSet[str],
+    *,
+    probed: str | None,
+) -> str:
+    """Return the proxy ``@dataclass`` resolves for ``annotation``; "" for none."""
+    if probed is None:
+        names = [node.id for node in ast.walk(annotation) if isinstance(node, ast.Name)]
+    else:
+        match = re.match(r"^(?:\s*(\w+)\s*\.)?\s*(\w+)", probed)
+        names = [match[2]] if match is not None and match[1] is None else []
+    return next((name for name in names if name in proxies), "")
+
+
+def _has_future_annotations(unit: Unit) -> bool:
+    """Whether ``from __future__ import annotations`` keeps annotations from running."""
+    return any(
+        node.module == "__future__"
+        and any(alias.name == "annotations" for alias in node.names)
+        for node in unit.nodes(ast.ImportFrom)
+    )
+
+
 def _lazy_finding(unit: Unit, line: int, rule: str) -> Finding:
     """Build the one lazy_import finding shape."""
     return Finding(
@@ -7692,11 +7830,7 @@ class _DottedImports:
             dotted=tuple(dotted),
             paths=paths,
             chains=chains,
-            lazy_annotations=any(
-                node.module == "__future__"
-                and any(alias.name == "annotations" for alias in node.names)
-                for node in unit.nodes(ast.ImportFrom)
-            ),
+            lazy_annotations=_has_future_annotations(unit),
         )
 
     def verdicts(self) -> list[tuple[ast.Import, ast.alias, str, bool]]:

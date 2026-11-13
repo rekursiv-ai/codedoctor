@@ -40,6 +40,7 @@ from codedoctor.lint.rules import (
     ImportAliasRule,
     ImportHoistRule,
     InitFacadeRule,
+    LazyDataclassFieldRule,
     LazyImportBindingRule,
     LazyImportCostRule,
     LoggingFstringRule,
@@ -665,6 +666,103 @@ def test_canonical_lazy_import_is_clean(tmp_path: Path) -> None:
         LazyImportBindingRule(),
         "from wrapt import lazy_import\nnp = lazy_import('numpy')\n",
     )
+
+
+_LAZY_FIELDS: Final = (
+    "from dataclasses import dataclass\n"
+    "from typing import TYPE_CHECKING\n"
+    "if TYPE_CHECKING:\n"
+    "    from xml.dom.minidom import Text\n"
+    "else:\n"
+    "    from wrapt import lazy_import\n"
+    "    minidom = lazy_import('xml.dom.minidom')\n"
+    "    Document = lazy_import('xml.dom.minidom', 'Document')\n"
+    "class Plain:\n"
+    "    bare: Document\n"
+    "@dataclass(kw_only=True, slots=True)\n"
+    "class C:\n"
+    "    'Doc.'\n"
+    "    checked: Text\n"
+    "    bare: Document | None\n"
+    "    nested: list[Document]\n"
+    "    qualified: minidom.Element\n"
+    "@dataclass\n"
+    "class D:\n"
+    "    bare: Document\n"
+)
+
+
+def test_a_dataclass_field_naming_a_lazy_proxy_is_reported(tmp_path: Path) -> None:
+    """``@dataclass`` probes the name a string annotation starts with."""
+    findings = _findings(
+        tmp_path,
+        LazyDataclassFieldRule(),
+        "from __future__ import annotations\n" + _LAZY_FIELDS,
+    )
+    assert [f.line for f in findings] == [16, 21]
+    assert [(f.line, f.message) for f in findings[:1]] == [
+        (
+            16,
+            (
+                "field `bare` of dataclass C starts with `Document`, a lazy_import "
+                "proxy, which @dataclass resolves as the module loads; bind the name "
+                "only under TYPE_CHECKING and spell the type through a lazy module, "
+                "`module.Name`"
+            ),
+        ),
+    ]
+
+
+def test_every_lazy_proxy_an_evaluated_annotation_names_is_reported(
+    tmp_path: Path,
+) -> None:
+    """Without the future import, ``@dataclass`` evaluates every annotation."""
+    findings = _findings(tmp_path, LazyDataclassFieldRule(), _LAZY_FIELDS)
+    assert [f.line for f in findings] == [15, 16, 17, 20]
+    assert findings[2].message == (
+        "field `qualified` of dataclass C evaluates `minidom`, a lazy_import proxy, "
+        "which imports its module as the module loads; add `from __future__ import "
+        "annotations`, then spell the type through a lazy module, `module.Name`"
+    )
+    # Another future feature defers nothing.
+    other = _findings(
+        tmp_path,
+        LazyDataclassFieldRule(),
+        "from __future__ import generator_stop\n" + _LAZY_FIELDS,
+    )
+    assert [f.line for f in other] == [16, 17, 18, 21]
+
+
+def test_a_quoted_field_is_probed_by_its_first_name(tmp_path: Path) -> None:
+    """A string is probed, never evaluated; under the future import it is quoted twice."""
+    body = (
+        "from dataclasses import dataclass\n"
+        "from wrapt import lazy_import\n"
+        "minidom = lazy_import('xml.dom.minidom')\n"
+        "Document = lazy_import('xml.dom.minidom', 'Document')\n"
+        "@dataclass(kw_only=True, slots=True)\n"
+        "class C:\n"
+        "    bare: 'Document | None'\n"
+        "    qualified: 'minidom.Element'\n"
+    )
+    findings = _findings(tmp_path, LazyDataclassFieldRule(), body)
+    assert [f.line for f in findings] == [7]
+    assert "starts with `Document`" in findings[0].message
+    deferred = "from __future__ import annotations\n" + body
+    assert not _findings(tmp_path, LazyDataclassFieldRule(), deferred)
+
+
+def test_a_file_with_no_lazy_proxy_or_no_dataclass_is_clean(tmp_path: Path) -> None:
+    assert not _findings(
+        tmp_path,
+        LazyDataclassFieldRule(),
+        "from dataclasses import dataclass\n"
+        "@dataclass(kw_only=True, slots=True)\n"
+        "class C:\n"
+        "    lazy_import: int\n",
+    )
+    assert not _findings(tmp_path, LazyDataclassFieldRule(), "lazy_import\nclass (:\n")
+    assert _fixed(tmp_path, LazyDataclassFieldRule(), _LAZY_FIELDS) is None
 
 
 # -- tmp-literal -------------------------------------------------------------
