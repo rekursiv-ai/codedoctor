@@ -470,15 +470,26 @@ repos:
           - --fixer
           - codedoctor.assert_isinstance
 
-  # TypeScript, JavaScript and CSS formatting; settings and exclusions live in
-  # biome.json, which `codedoctor install` writes. `files` narrows upstream's
-  # list, which also formats JSON and Markdown. HTML stays out: Biome cannot
-  # parse the template languages HTML files often hold.
+  # TypeScript, JavaScript and CSS: `biome check --write` formats, applies the
+  # safe lint fixes, and fails on any lint error left. Settings and exclusions
+  # live in biome.json, which `codedoctor install` writes. `files` narrows
+  # upstream's list, which also covers JSON and Markdown. HTML stays out: Biome
+  # cannot parse the template languages HTML files often hold.
+  #
+  # Rules biome.json turns off, each wrong for this code:
+  #   noDescendingSpecificity  stylesheets group rules by component; a later,
+  #                            more specific rule is a deliberate override.
+  #   useOptionalChain         `x && x.y` keeps x's falsy value (0, "", false),
+  #                            which `x?.y` turns into undefined.
+  #   noImportantStyles        `!important` beats the inline styles libraries
+  #                            (xterm, d3, resizable panels) set.
+  #   useSemanticElements      the native twin cannot hold the content: an
+  #                            <option> holds only text, an <hr> no children.
   - repo: https://github.com/biomejs/pre-commit
     rev: v2.6.7
     hooks:
-      - id: biome-format
-        name: biome-format
+      - id: biome-check
+        name: biome-check
         stages: [pre-commit]
         files: \.(tsx?|[cm]ts|jsx?|[cm]js|css)$
 

@@ -406,7 +406,7 @@ def _bootstrap_hooks(root: Path) -> None:
 
 
 def _write_biome(root: Path) -> None:
-    """Give the biome-format hook Codedoctor's settings unless the project has its own."""
+    """Give the biome-check hook Codedoctor's settings unless the project has its own."""
     if not any((root / name).exists() for name in ("biome.json", "biome.jsonc")):
         shutil.copyfile(_THIS.with_name("install_biome.json"), root / "biome.json")
 
