@@ -8400,6 +8400,8 @@ def test_inlineable_binding(source: str, binding: tuple[str, str] | None) -> Non
     [
         ("noqa: E501", True),
         ("pyrefly: ignore[bad-return] -- upstream bug.", True),
+        ("pragma: no mutate[diagnostic-text]", True),
+        ("pragma: no mutate[case-insensitive]", True),
         ("https://example.com/x", True),
         ("http://example.com", True),
         ("HTTPS://example.com", False),
