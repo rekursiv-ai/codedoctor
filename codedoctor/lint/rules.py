@@ -500,7 +500,12 @@ class DigitsRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class EmDashRule:
-    """Reject U+2014; STYLE.md Markdown/Comments: ``--`` is the house dash."""
+    """Reject U+2014; STYLE.md Markdown/Comments: ``--`` is the house dash.
+
+    Many fonts draw an em dash like a hyphen, and few keyboards type it. A
+    search for ``--`` misses it, and an edit cannot easily reproduce it. One
+    ASCII dash keeps text searchable and diffs plain.
+    """
 
     name: ClassVar[str] = "emdash"
     kinds: ClassVar[frozenset[str]] = frozenset({"python", "pyi", "jupyter"})
@@ -647,7 +652,13 @@ class PytestFooterRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class PytestNamingRule:
-    """Tests are ``<module>_test.py``; ``test_*.py`` only under ``tools/tests``."""
+    """Tests are ``<module>_test.py``; ``test_*.py`` only under ``tools/tests``.
+
+    The commit-time test hook finds a module's tests by the ``_test.py``
+    suffix. It cannot pair a ``test_*.py`` file with its module, so that file
+    runs only in the whole-suite tier, and a change to its module goes
+    untested at commit.
+    """
 
     name: ClassVar[str] = "test-naming"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -697,7 +708,13 @@ class PytestNamingRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class XdgLiteralRule:
-    """Reject re-deriving the userdirs layout (AGENTS.md Per-User Directories)."""
+    """Reject re-deriving the userdirs layout (AGENTS.md Per-User Directories).
+
+    One module owns where per-user config, caches, and state live. A path
+    built from ``Path.home()``, ``$HOME``, or an ``XDG_*`` literal drifts from
+    that module. The test fixture that redirects the module cannot redirect
+    it, so tests write into the real home directory.
+    """
 
     name: ClassVar[str] = "xdg-literal"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -771,7 +788,12 @@ class XdgLiteralRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class UserdirsNamespaceRule:
-    """First segment after a userdirs helper is ``namespace`` (or a vendor's)."""
+    """First segment after a userdirs helper is ``namespace`` (or a vendor's).
+
+    With one namespace, everything the project writes for a user sits in one
+    directory, which a person can find, back up, or delete as a unit. A
+    per-tool root scatters the project across the home directory.
+    """
 
     name: ClassVar[str] = "userdirs-namespace"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -852,7 +874,12 @@ class UserdirsNamespaceRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class UserdirsWrapperRule:
-    """No wrapper around ``<x>_dir() / leaf``: inline it at every call site."""
+    """No wrapper around ``<x>_dir() / leaf``: inline it at every call site.
+
+    The path expression is the API: at the call site, a reader sees where the
+    data goes. A one-line wrapper or a module global hides the path behind a
+    second name and gives the layout two places to change.
+    """
 
     name: ClassVar[str] = "userdirs-wrapper"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -919,7 +946,13 @@ class UserdirsWrapperRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class CacheKwargRule:
-    """Reject ``cache_dir=``/``model_dir=``/``torch.hub.set_dir`` (AGENTS.md)."""
+    """Reject ``cache_dir=``/``model_dir=``/``torch.hub.set_dir`` (AGENTS.md).
+
+    Library caches are set once, through the environment variables each
+    library reads. A location passed at one call site splits the cache: that
+    caller downloads a second copy, and the environment no longer controls
+    where the data goes.
+    """
 
     name: ClassVar[str] = "cache-kwarg"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -982,7 +1015,12 @@ class CacheKwargRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class LazyImportBindingRule:
-    """``lazy_import`` is bound only by ``from wrapt import lazy_import``."""
+    """``lazy_import`` is bound only by ``from wrapt import lazy_import``.
+
+    Readers and tools find deferred imports by this one spelling. An alias,
+    or ``wrapt.lazy_import`` spelled as an attribute, hides the deferral from
+    that search.
+    """
 
     name: ClassVar[str] = "lazy-import-binding"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -1134,7 +1172,13 @@ class LazyDataclassFieldRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class TmpLiteralRule:
-    """Reject ``/tmp`` literals; ``tempfile`` owns temporary locations."""
+    """Reject ``/tmp`` literals; ``tempfile`` owns temporary locations.
+
+    ``/tmp`` is one fixed, shared directory. Two runs collide on a fixed
+    name, other users can read or replace the file, and the path ignores
+    ``TMPDIR``. ``tempfile`` makes a unique, private path where the system
+    wants it.
+    """
 
     name: ClassVar[str] = "tmp-literal"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -1182,7 +1226,12 @@ class TmpLiteralRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class TempfilePrefixRule:
-    """Every tempfile allocation names itself with ``prefix=``."""
+    """Every tempfile allocation names itself with ``prefix=``.
+
+    A crash leaves temporary files behind. Without a prefix, a full disk
+    shows many ``tmpXXXX`` entries that no one can attribute to a program or
+    safely delete.
+    """
 
     name: ClassVar[str] = "tempfile-prefix"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -1505,7 +1554,13 @@ class ImportAliasRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class ImportHoistRule:
-    """Move unsuppressed nested imports into the module import block."""
+    """Move unsuppressed nested imports into the module import block.
+
+    Imports at the top show every dependency in one place, and a missing one
+    fails when the module loads, not on the first call of a rare branch. A
+    deferral that saves measured time says so with a ``PLC0415``
+    suppression; this rule moves every other nested import up.
+    """
 
     name: ClassVar[str] = "import-hoist"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -1839,7 +1894,12 @@ class GetLoggerNameRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class NestedTryRule:
-    """Sequential try blocks, never nested (STYLE.md Error Handling)."""
+    """Sequential try blocks, never nested (STYLE.md Error Handling).
+
+    In nested handlers it is unclear which ``except`` catches which failure,
+    and the inner one can hide an error the outer one must see. Sequential
+    blocks give each failure one handler, in one place.
+    """
 
     name: ClassVar[str] = "nested-try"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -1895,7 +1955,12 @@ class NestedTryRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class NegativeBoolParamRule:
-    """Affirmative boolean names (STYLE.md Function Design)."""
+    """Affirmative boolean names (STYLE.md Function Design).
+
+    A negative name makes callers read a double negative: ``no_cache=False``
+    means "use the cache". With an affirmative name, True does the thing, so
+    each call reads directly.
+    """
 
     name: ClassVar[str] = "negative-bool-param"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -2010,7 +2075,13 @@ class FluentNameRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class AllReexportRule:
-    """A non-``__init__`` ``__all__`` lists only names the module defines."""
+    """A non-``__init__`` ``__all__`` lists only names the module defines.
+
+    Each name has one import path: the module that defines it. A re-export
+    gives it a second path, callers split across the two, and a move breaks
+    the callers of the path nobody knew about. Only a package ``__init__``
+    may form a facade.
+    """
 
     name: ClassVar[str] = "all-reexport"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -2077,7 +2148,12 @@ class AllReexportRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class InitFacadeRule:
-    """A package ``__init__`` holds only a docstring, imports, and ``__all__``."""
+    """A package ``__init__`` holds only a docstring, imports, and ``__all__``.
+
+    An ``__init__`` runs on each import of any submodule in its package, and
+    readers do not look there for logic. Kept to imports, it makes the
+    package cheap to import and its behavior easy to find.
+    """
 
     name: ClassVar[str] = "init-facade"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -2142,7 +2218,12 @@ class InitFacadeRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class DefOrderRule:
-    """Public API before private helpers (STYLE.md Code Organization)."""
+    """Public API before private helpers (STYLE.md Code Organization).
+
+    A reader opens a module to learn what it offers. With the public
+    definitions first, the API reads from the top, and the helpers come
+    after the code that uses them.
+    """
 
     name: ClassVar[str] = "def-order"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -2628,7 +2709,12 @@ class UnderscoreParamRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class NegatedCompareRule:
-    """``x < 0 or x > 1``, never ``not 0 <= x <= 1`` (STYLE.md Code Style)."""
+    """``x < 0 or x > 1``, never ``not 0 <= x <= 1`` (STYLE.md Code Style).
+
+    A negated range hides which bound fails. It also rejects NaN only by
+    accident, because each comparison with NaN is False. The positive form
+    states each bound; reject NaN explicitly with ``math.isnan``.
+    """
 
     name: ClassVar[str] = "negated-compare"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -2702,7 +2788,12 @@ class NegatedCompareRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class NegatedTernaryRule:
-    """``bar if x else foo``, never ``foo if not x else bar``."""
+    """``bar if x else foo``, never ``foo if not x else bar``.
+
+    A negated condition makes the reader invert it before either branch
+    makes sense. Swapping the branches removes the ``not`` and gives the same
+    result.
+    """
 
     name: ClassVar[str] = "negated-ternary"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -2757,7 +2848,12 @@ class NegatedTernaryRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class SuperOnlyRule:
-    """No ``super()``-only overrides; rely on inheritance (STYLE.md)."""
+    """No ``super()``-only overrides; rely on inheritance (STYLE.md).
+
+    A method that only forwards to ``super()`` does what inheritance already
+    does. It adds a definition to read and a signature that can drift from
+    the parent's.
+    """
 
     name: ClassVar[str] = "super-only"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -2823,7 +2919,13 @@ class SuperOnlyRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class TensorValueGuardRule:
-    """Never inspect tensor VALUES to validate (STYLE.md Error Handling)."""
+    """Never inspect tensor VALUES to validate (STYLE.md Error Handling).
+
+    Reading values (``.item()``, ``.all()``, ``.any()``) makes the host wait
+    for the device. As a guard on each call, that wait can cost as much as
+    the kernel. Out-of-domain input already gives NaN or inf, which is cheap
+    to see later. Shapes, dtypes, and devices are metadata and free to check.
+    """
 
     name: ClassVar[str] = "tensor-value-guard"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -2882,7 +2984,20 @@ class TensorValueGuardRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class MkdirModeRule:
-    """Secrets are 0o700/0o600; scratch takes the umask; umask is restored."""
+    """Secrets are 0o700/0o600; scratch takes the umask; umask is restored.
+
+    The four cases:
+
+    1. Under a userdirs path, ``mkdir`` takes ``mode=0o700`` and
+       ``atomic_write_bytes`` takes ``file_mode=0o600``: these paths hold
+       credentials that other users must not read.
+    2. A ``/opt/scratch`` path takes no ``mode=``: scratch is shared, and the
+       provisioned umask keeps it open to the team.
+    3. ``chmod`` to an owner-only mode happens only under a userdirs path: a
+       private file is a secret, and secrets live there.
+    4. ``os.umask`` is restored in a ``finally``: a changed mask alters every
+       file the process writes after it.
+    """
 
     name: ClassVar[str] = "mkdir-mode"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -2952,7 +3067,11 @@ class MkdirModeRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class ReturnsNamedRule:
-    """``Returns:``/``Yields:`` entries are ``name: description`` (STYLE.md)."""
+    """``Returns:``/``Yields:`` entries are ``name: description`` (STYLE.md).
+
+    The signature already gives the type. A name says what the value is, and
+    for a tuple, what each part is.
+    """
 
     name: ClassVar[str] = "returns-named"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -3137,7 +3256,12 @@ class ReturnsSectionRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class PrivateOnelinerRule:
-    """Private defs get a one-line docstring or none (STYLE.md Documentation)."""
+    """Private defs get a one-line docstring or none (STYLE.md Documentation).
+
+    A private helper has no outside callers to document for. A long
+    docstring there repeats the code and goes stale as the code changes. One
+    line is enough, or none when the name says it.
+    """
 
     name: ClassVar[str] = "private-oneliner"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -3294,7 +3418,11 @@ class AttrBlankLineRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class AttrDocFormRule:
-    """One attribute-doc form per class: inline strings or ``Attributes:``."""
+    """One attribute-doc form per class: inline strings or ``Attributes:``.
+
+    Two forms split the documentation. A reader who finds ``Attributes:``
+    takes it as complete and misses the inline strings.
+    """
 
     name: ClassVar[str] = "attr-doc-form"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -3352,7 +3480,11 @@ class AttrDocFormRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class CommentSentenceRule:
-    """Comments are sentences: capitalized, punctuated (STYLE.md Comments)."""
+    """Comments are sentences: capitalized, punctuated (STYLE.md Comments).
+
+    A sentence reads as an explanation. A fragment is often a note the
+    author left for themselves, which a later reader cannot interpret.
+    """
 
     name: ClassVar[str] = "comment-sentence"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})
@@ -4523,7 +4655,19 @@ class SleepRule:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class CliShapeRule:
-    """Mechanical checks from the ``cli`` skill, one lettered finding each."""
+    """Mechanical checks from the ``cli`` skill, one lettered finding each.
+
+    Every entry point has one shape, so each runs, tests, and reads the same
+    way:
+
+    (a) A polyglot script has the exact header lines and the executable bit.
+    (b) A guard that launches ``main`` sits in a polyglot script.
+    (c) ``__main__.py`` holds only ``from X import main`` and the guard.
+    (d) ``main`` returns an ``int`` exit code on every path.
+    (e) Flags are added outside ``main``.
+    (f) ``description=`` uses the module-docstring idiom.
+    (g) The ``T201`` suppression fits the number of prints.
+    """
 
     name: ClassVar[str] = "cli-shape"
     kinds: ClassVar[frozenset[str]] = frozenset({"python"})

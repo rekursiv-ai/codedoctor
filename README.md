@@ -132,7 +132,7 @@ every gate and is the fullest example.
 | `codedoctor testing` | paired tests and whole-suite tiers |
 | `codedoctor coverage-floor` | per-source coverage from the pytest gate |
 | `codedoctor mutation` | changed-function mutation tests (`codedoctor[mutation]`) |
-| `codedoctor lint` | AST rules configured in `[tool.codedoctor.lint]` |
+| `codedoctor lint` | AST rules configured in `[tool.codedoctor.lint]`; `--explain RULE` says why a rule exists; `--suppressions` counts the `house-ignore` markers for each rule |
 | `codedoctor assert-isinstance` | redundant `assert isinstance` removal |
 | `codedoctor affected` | files and tests reached through CodeGraph |
 | `codedoctor nbstripout` | notebook output stripping |
