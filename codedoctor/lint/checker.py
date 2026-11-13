@@ -190,6 +190,7 @@ def default_rules() -> tuple[Rule, ...]:
             rules.UserdirsWrapperRule(),
             rules.CacheKwargRule(),
             rules.LazyImportBindingRule(),
+            rules.LazyDataclassFieldRule(),
             rules.TmpLiteralRule(),
             rules.TempfilePrefixRule(),
             rules.CwdFinalRule(),
