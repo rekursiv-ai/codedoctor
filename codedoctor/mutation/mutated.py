@@ -23,7 +23,13 @@ throughput. A line is written as each file finishes, and every surviving
 mutant is reported with its diff. --timeout-sec kills a mutmut run that
 takes longer, failing its file and no other; without it, runs have no limit.
 
-Findings and setup failures exit 1.
+Findings and setup failures exit 1. Selective ``# pragma: no mutate[rule]``
+comments skip matching candidates before IDs, rendering, and execution.
+``diagnostic-text`` preserves brace and percent field signatures;
+``case-insensitive`` permits only distinct strings with equal lowercase values.
+Labels form a match-any set, and native line, block, and region scopes apply.
+Unrelated mutations remain active. Invalid or unused labels fail; unexamined
+scopes defer unused checks. The failure guide documents declarations and examples.
 PRECOMMIT_SCOPE and PRECOMMIT_SCOPE_MUTATION select exact, sidecar, or affected:N
 scope. Exact uses only supplied test files; sidecar is the default.
 
@@ -84,7 +90,6 @@ from mutmut.mutation.diff_apply import (
     read_mutant_function,
     read_original_function,
 )
-from mutmut.mutation.file_mutation import create_mutations, mutate_file_contents
 from mutmut.mutation.trampoline_templates import (
     CLASS_NAME_SEPARATOR,
     mangle_function_name,
@@ -105,11 +110,18 @@ from codedoctor.lib.kernel_pins import kernel_pins
 from codedoctor.lib.worker_count import capped_workers, default_workers, worker_count
 
 
+_THIS: Final[Path] = Path(__file__).resolve()
+_CWD: Final[Path] = _THIS.parent
+
 if TYPE_CHECKING:
     import numpy as np
+
+    from codedoctor.mutation import mutmut_adapter
 else:
     from wrapt import lazy_import
 
+    # Native CLI imports read cwd configuration before argument parsing.
+    mutmut_adapter = lazy_import("codedoctor.mutation.mutmut_adapter")
     np = lazy_import("numpy")
 
 
@@ -117,110 +129,21 @@ _DESCRIPTION: Final = (__doc__ or "").strip()
 
 
 def main() -> int:
-    """Mutate-test the functions in the named files.
+    """Run the mutation gate, linking failures to the installed guide.
 
     Returns:
       status: Nonzero for setup failures or findings; zero when no findings remain.
 
     """
-    parser = argparse.ArgumentParser(
-        description=_DESCRIPTION,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        # The gate hands every path as one @argfile; argv overflows ARG_MAX.
-        fromfile_prefix_chars="@",  # pragma: no mutate -- holds "@" either way.
-    )
-    flags, root = _parse_args(parser)
-    seed, workers = flags.seed, flags.workers or default_workers()
-    if flags.remainder is not None and flags.paths != [Path()]:
-        parser.error("remainder manifests cannot be combined with paths")
     try:
-        if flags.remainder is not None:
-            shard = _read_remainder(flags.remainder)
-            shards = (shard,)
-            named, filters = [shard.source], shard.filters
-            candidates = len(filters)
-        else:
-            named = _project_relative(
-                walk.expand(flags.paths, suffixes={".py"}),
-                root=root,
-            )
-            depth = scope("mutation", environ=os.environ)
-            tests = tuple(path for path in named if sidecars.is_test(root / path))
-            if depth >= 0:
-                named = list(
-                    dict.fromkeys(
-                        [
-                            *named,
-                            *(
-                                p.as_posix()
-                                for path in named
-                                for p in sidecars.related(path, root=root)
-                                if not sidecars.is_test(root / p)
-                            ),
-                            *_affected(root, files=named, depth=depth, emit="files"),
-                        ],
-                    ),
-                )
-            preferred = (
-                frozenset[str]()
-                if flags.prefer_changed is None
-                else changed_functions(root, base=flags.prefer_changed, files=named)
-            )
-            filters, candidates = select_functions(
-                root,
-                files=named,
-                sources=mutable_sources(root),
-                seed=seed,
-                rate=flags.function_sample_rate,
-                most=flags.max_functions_sampled,
-                workers=workers,
-                preferred=preferred,
-            )
-            shards = plan_shards(_filters_by_source(filters, files=named))
-            if depth < 0:
-                shards = tuple(replace(shard, tests=tests) for shard in shards)
-    except (OSError, ValueError, subprocess.CalledProcessError) as error:
-        sys.stderr.write(f"mutation: cannot select functions: {error}\n")
-        return 1
-    if skipped := candidates - len(filters):
-        sys.stderr.write(
-            f"[mutated] {len(filters)} selected; {skipped} skipped (seed {seed!r})\n",
-        )
-    if flags.explain:
-        sys.stderr.write(
-            f"[mutated] {len(named)} file(s) -> {len(filters)} function(s)\n",
-        )
-        for mutant_filter in filters:
-            sys.stderr.write(f"  {mutant_filter}\n")
-    if flags.emit == "filters":
-        for mutant_filter in filters:
-            print(mutant_filter)
-        return 0
-    if not filters:
-        return 0
-    # Measured on 1178 mutants: one mutmut parent records 34 mutants/s with 8
-    # children and 37/s with 64. Past 8 children, only more parents help, so
-    # the budget is split across shards first: 24 workers ran 4 shards 3 at a
-    # time at 8 children each, the fourth waiting for a whole shard's run.
-    children = max(1, min(8, workers // len(shards)))
-    parallel = min(len(shards), max(1, workers // children))
-    if flags.explain:
-        sys.stderr.write(
-            f"[mutated] {len(shards)} file(s), {parallel} at a time x "
-            f"{children} worker(s)\n",
-        )
-    try:
-        reports = _run_shards(
-            root,
-            shards=shards,
-            children=children,
-            parallel=parallel,
-            timeout_sec=flags.timeout_sec,
-        )
-    except (OSError, subprocess.CalledProcessError) as error:
-        sys.stderr.write(f"mutation: cannot prepare the snapshot: {error}\n")
-        return 1
-    return _print_reports(reports)
+        status = _main()
+    except SystemExit as error:
+        if error.code is not None and error.code != 0:
+            _failure_guide()
+        raise
+    if status:
+        _failure_guide()
+    return status
 
 
 def mutable_sources(root: Path) -> tuple[str, ...]:
@@ -1096,7 +1019,7 @@ def _mutate(
         [
             sys.executable,
             "-m",
-            "mutmut",
+            "codedoctor.mutation.mutmut_cli",
             "run",
             "--max-children",
             str(workers),
@@ -1196,7 +1119,7 @@ def _prepare_remainder(snapshot: Path, *, shard: Shard) -> ShardReport | None:
     with chdir(snapshot):
         reset_config()
         try:
-            generated = mutate_file_contents(
+            generated = mutmut_adapter.mutate_file_contents(
                 shard.source,
                 (snapshot / shard.source).read_bytes().decode(),
             )
@@ -1263,7 +1186,15 @@ def _retry_inconclusive(
     if names:
         with contextlib.suppress(subprocess.TimeoutExpired):
             _ = _run_mutmut(
-                [sys.executable, "-m", "mutmut", "run", "--max-children", "1", *names],
+                [
+                    sys.executable,
+                    "-m",
+                    "codedoctor.mutation.mutmut_cli",
+                    "run",
+                    "--max-children",
+                    "1",
+                    *names,
+                ],
                 cwd=snapshot,
                 env=fork_safe_env(single_threaded_env(os.environ)),
                 timeout_sec=timeout_sec,
@@ -2103,7 +2034,7 @@ def _file_filters(path: str, *, root: Path) -> tuple[str, ...]:
 # functions. A trailing comment keeps line numbers, which mutmut's coverage
 # lookup and diffs depend on.
 def _skip_unselected(path: Path, *, name: str, filters: tuple[str, ...]) -> None:
-    """Append ``# pragma: no mutate block`` to each unselected def's header line."""
+    """Blanket-skip unselected defs before their original header comments."""
     module = get_mutant_name(Path(name), mutant_method_name="").removesuffix(".")
     selected = {
         mangled
@@ -2116,13 +2047,15 @@ def _skip_unselected(path: Path, *, name: str, filters: tuple[str, ...]) -> None
     # ``splitlines`` also breaks at U+2028 and form feeds, which Python's
     # tokenizer does not count, and the line numbers below are the tokenizer's.
     lines = source.split("\n")
+    tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    comments = {
+        token.start[0]: token.start[1]
+        for token in tokens
+        if token.type == tokenize.COMMENT
+    }
     # The pragma must trail the header's colon, which a multi-line signature
     # moves below the ``def`` and a comment can separate from the body.
-    ends = sorted(
-        token.end[0]
-        for token in tokenize.generate_tokens(io.StringIO(source).readline)
-        if token.type == tokenize.NEWLINE
-    )
+    ends = sorted(token.end[0] for token in tokens if token.type == tokenize.NEWLINE)
     for top in ast.parse(source).body:
         if isinstance(top, ast.FunctionDef | ast.AsyncFunctionDef):
             defs = [(f"x_{top.name}", top)]
@@ -2140,10 +2073,13 @@ def _skip_unselected(path: Path, *, name: str, filters: tuple[str, ...]) -> None
                 continue
             index = ends[bisect.bisect_left(ends, node.lineno)] - 1
             text = lines[index].removesuffix("\r")
-            joiner = " " if "#" in text else "  "
-            lines[index] = (
-                f"{text}{joiner}# pragma: no mutate block{lines[index][len(text) :]}"
-            )
+            ending = lines[index][len(text) :]
+            column = comments.get(index + 1)
+            if column is None:
+                text += "  # pragma: no mutate block"
+            else:
+                text = f"{text[:column]}# pragma: no mutate block {text[column:]}"
+            lines[index] = text + ending
     path.write_bytes("\n".join(lines).encode())
 
 
@@ -2224,7 +2160,10 @@ def _is_declaration(function: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
 
 def _mutable_function_names(path: Path, *, source: str) -> set[str]:
     """Enumerate mutmut's generating functions without rendering mutant source."""
-    module, mutations, _, _ = create_mutations(filename=str(path), code=source)
+    module, mutations, _, _ = mutmut_adapter.create_mutations(
+        filename=str(path),
+        code=source,
+    )
     functions = {mutation.contained_by_top_level_function for mutation in mutations}
     names: set[str] = set()
     for statement in module.body:
@@ -2258,3 +2197,112 @@ def _mutant_function_name(
         qualified = f"{class_name}.{name}" if class_name else name
         raise ValueError(f"{path}: mutmut does not support identifier {qualified!r}")
     return mangled
+
+
+def _failure_guide() -> None:
+    sys.stdout.flush()
+    sys.stderr.write(
+        f"mutation: guide: {_THIS.with_name('README.md').resolve().as_uri()}\n",
+    )
+
+
+def _main() -> int:
+    """Select functions, execute isolated shards, and report their findings."""
+    parser = argparse.ArgumentParser(
+        description=_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        # The gate hands every path as one @argfile; argv overflows ARG_MAX.
+        fromfile_prefix_chars="@",  # pragma: no mutate -- holds "@" either way.
+    )
+    flags, root = _parse_args(parser)
+    seed, workers = flags.seed, flags.workers or default_workers()
+    if flags.remainder is not None and flags.paths != [Path()]:
+        parser.error("remainder manifests cannot be combined with paths")
+    try:
+        if flags.remainder is not None:
+            shard = _read_remainder(flags.remainder)
+            shards = (shard,)
+            named, filters = [shard.source], shard.filters
+            candidates = len(filters)
+        else:
+            named = _project_relative(
+                walk.expand(flags.paths, suffixes={".py"}),
+                root=root,
+            )
+            depth = scope("mutation", environ=os.environ)
+            tests = tuple(path for path in named if sidecars.is_test(root / path))
+            if depth >= 0:
+                named = list(
+                    dict.fromkeys(
+                        [
+                            *named,
+                            *(
+                                p.as_posix()
+                                for path in named
+                                for p in sidecars.related(path, root=root)
+                                if not sidecars.is_test(root / p)
+                            ),
+                            *_affected(root, files=named, depth=depth, emit="files"),
+                        ],
+                    ),
+                )
+            preferred = (
+                frozenset[str]()
+                if flags.prefer_changed is None
+                else changed_functions(root, base=flags.prefer_changed, files=named)
+            )
+            filters, candidates = select_functions(
+                root,
+                files=named,
+                sources=mutable_sources(root),
+                seed=seed,
+                rate=flags.function_sample_rate,
+                most=flags.max_functions_sampled,
+                workers=workers,
+                preferred=preferred,
+            )
+            shards = plan_shards(_filters_by_source(filters, files=named))
+            if depth < 0:
+                shards = tuple(replace(shard, tests=tests) for shard in shards)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        sys.stderr.write(f"mutation: cannot select functions: {error}\n")
+        return 1
+    if skipped := candidates - len(filters):
+        sys.stderr.write(
+            f"[mutated] {len(filters)} selected; {skipped} skipped (seed {seed!r})\n",
+        )
+    if flags.explain:
+        sys.stderr.write(
+            f"[mutated] {len(named)} file(s) -> {len(filters)} function(s)\n",
+        )
+        for mutant_filter in filters:
+            sys.stderr.write(f"  {mutant_filter}\n")
+    if flags.emit == "filters":
+        for mutant_filter in filters:
+            print(mutant_filter)
+        return 0
+    if not filters:
+        return 0
+    # Measured on 1178 mutants: one mutmut parent records 34 mutants/s with 8
+    # children and 37/s with 64. Past 8 children, only more parents help, so
+    # the budget is split across shards first: 24 workers ran 4 shards 3 at a
+    # time at 8 children each, the fourth waiting for a whole shard's run.
+    children = max(1, min(8, workers // len(shards)))
+    parallel = min(len(shards), max(1, workers // children))
+    if flags.explain:
+        sys.stderr.write(
+            f"[mutated] {len(shards)} file(s), {parallel} at a time x "
+            f"{children} worker(s)\n",
+        )
+    try:
+        reports = _run_shards(
+            root,
+            shards=shards,
+            children=children,
+            parallel=parallel,
+            timeout_sec=flags.timeout_sec,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        sys.stderr.write(f"mutation: cannot prepare the snapshot: {error}\n")
+        return 1
+    return _print_reports(reports)

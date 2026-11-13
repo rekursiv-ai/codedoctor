@@ -454,7 +454,7 @@ def still_needed(
                     match = _ASSERT.fullmatch(source[line - 1])
                     if match is None:
                         raise ValueError(
-                            "Expected match is not None.",  # pragma: no mutate
+                            "Expected match is not None.",  # pragma: no mutate[diagnostic-text]
                         )
                     source[line - 1] = f"{match['indent']}pass"
             target.write_text("\n".join(source))

@@ -16,6 +16,7 @@ import ast
 import fnmatch
 import hashlib
 import importlib
+import io
 import json
 import os
 import re
@@ -32,7 +33,6 @@ import tomllib
 from mutmut import configuration
 from mutmut.mutation.data import LineSpan, MutantLineSpans, SourceFileMutationData
 from mutmut.mutation.file_mutation import create_mutations, mutate_file_contents
-from mutmut.mutation.pragma_handling import PragmaParseError
 from mutmut.mutation.trampoline_templates import CLASS_NAME_SEPARATOR
 from mutmut.state import state
 from mutmut.utils.format_utils import get_mutant_name
@@ -42,7 +42,7 @@ import libcst as cst
 import numpy as np
 import pytest
 
-from codedoctor.mutation import mutated
+from codedoctor.mutation import mutated, mutmut_adapter
 
 
 if TYPE_CHECKING:
@@ -514,7 +514,7 @@ def test_invalid_mutation_directives_name_the_source_file(tmp_path: Path) -> Non
     path = tmp_path / "mod.py"
     path.write_text("# pragma: no mutate end\ndef first():\n    return 1\n")
 
-    with pytest.raises(PragmaParseError, match=re.escape(str(path))):
+    with pytest.raises(ValueError, match=re.escape(str(path))):
         _functions_in(path)
 
 
@@ -3422,9 +3422,10 @@ def test_an_unparsable_paired_test_fails_its_file_in_one_line(
 
     assert mutated.main() == 1
 
-    assert capsys.readouterr().err.endswith(
+    assert capsys.readouterr().err == (
         "[mutated] 1/1 pkg/mod.py: FAILED\n"
-        "mutation: pkg/mod.py: t_test.py:1: invalid syntax\n",
+        "mutation: pkg/mod.py: t_test.py:1: invalid syntax\n"
+        f"mutation: guide: {Path(mutated.__file__).with_name('README.md').resolve().as_uri()}\n"
     )
     snapshot.assert_not_called()
 
@@ -3452,6 +3453,7 @@ def test_main_fails_when_the_template_cannot_be_copied(
     assert mutated.main() == 1
     assert capsys.readouterr().err == (
         f"mutation: cannot prepare the snapshot: {error}\n"
+        f"mutation: guide: {Path(mutated.__file__).with_name('README.md').resolve().as_uri()}\n"
     )
 
 
@@ -3831,7 +3833,7 @@ def test_mutmut_retries_segfaulted_and_unrun_mutants_once(
     assert run.call_args_list[1].args[0] == [
         sys.executable,
         "-m",
-        "mutmut",
+        "codedoctor.mutation.mutmut_cli",
         "run",
         "--max-children",
         "1",
@@ -3905,7 +3907,14 @@ def test_a_mutmut_crash_reports_the_tail_of_its_output(
         "its output is above."
     )
     argv = cast("list[str]", run.call_args.args[0])
-    assert argv[:6] == [sys.executable, "-m", "mutmut", "run", "--max-children", "5"]
+    assert argv[:6] == [
+        sys.executable,
+        "-m",
+        "codedoctor.mutation.mutmut_cli",
+        "run",
+        "--max-children",
+        "5",
+    ]
     assert run.call_args.kwargs == {
         "cwd": tmp_path / "snapshot",
         "env": fork_safe_env(single_threaded_env(os.environ)),
@@ -3954,7 +3963,7 @@ def test_the_snapshot_mutates_only_the_selected_functions(tmp_path: Path) -> Non
     lines = (snapshot / "pkg/mod.py").read_text().splitlines()
     assert len(lines) == len(body.splitlines())
     skip = "# pragma: no mutate block"
-    assert lines[0] == f"def first(value):  # noqa: ANN001 -- kept. {skip}"
+    assert lines[0] == f"def first(value):  {skip} # noqa: ANN001 -- kept."
     assert lines[5] == "    def other(self):"
     assert lines[8] == f"    def method(self):    {skip}"
     assert lines[12] == "def second(value):"
@@ -3971,6 +3980,38 @@ def test_the_snapshot_mutates_only_the_selected_functions(tmp_path: Path) -> Non
         "second",
     }
     assert None not in owners
+
+
+@pytest.mark.parametrize("mode", ["", " block"])
+def test_snapshot_selection_precedes_selective_header_explanations(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    comment = f"# pragma: no mutate[case-insensitive]{mode} -- Explanation."
+    root = _repo(
+        tmp_path / "repo",
+        body=(
+            f"def unselected():  {comment}\n    return 1\n\n"
+            "def selected():\n    return 2\n"
+        ),
+    )
+    snapshot = tmp_path / "snapshot"
+    copy_snapshot(
+        root,
+        template=_template(root, tmp_path),
+        snapshot=snapshot,
+        sources=("pkg/mod.py",),
+        tests=(),
+        filters=("pkg.mod.x_selected__mutmut_*",),
+    )
+    source = (snapshot / "pkg/mod.py").read_text()
+    generated = mutmut_adapter.mutate_file_contents("pkg/mod.py", source)
+    assert generated.mutant_names
+    assert all(
+        name.startswith("x_selected__mutmut_") for name in generated.mutant_names
+    )
+    assert comment in source
+    assert "# pragma: no mutate block" in source.partition("--")[0]
 
 
 def test_the_skip_pragma_keeps_each_line_ending(tmp_path: Path) -> None:
@@ -4205,7 +4246,7 @@ def test_exact_retry_does_not_execute_longer_numeric_suffixes(
     assert run.call_args.args[0] == [
         sys.executable,
         "-m",
-        "mutmut",
+        "codedoctor.mutation.mutmut_cli",
         "run",
         "--max-children",
         "1",
@@ -4300,7 +4341,7 @@ def test_shard_runs_real_snapshot_and_collection_around_the_process_boundary(
         [
             sys.executable,
             "-m",
-            "mutmut",
+            "codedoctor.mutation.mutmut_cli",
             "run",
             "--max-children",
             "3",
@@ -4882,7 +4923,7 @@ def test_remainder_cli_executes_only_requested_null_ids(
     assert run.call_args.args[0] == [
         sys.executable,
         "-m",
-        "mutmut",
+        "codedoctor.mutation.mutmut_cli",
         "run",
         "--max-children",
         "1",
@@ -5076,7 +5117,7 @@ def test_remainder_compares_the_canonical_snapshot_configuration(
     manifest = tmp_path / "remainder.json"
     manifest.write_text(json.dumps(to_plain(spec)))
     generate = Mock(wraps=mutate_file_contents)
-    monkeypatch.setattr(mutated, "mutate_file_contents", generate)
+    monkeypatch.setattr(mutmut_adapter, "mutate_file_contents", generate)
     run = Mock(side_effect=_finish_exact_remainder)
     monkeypatch.setattr(mutated, "_run_mutmut", run)
     monkeypatch.setattr(mutated, "copy_template", _copy_remainder_template)
@@ -5140,8 +5181,9 @@ def test_remainder_requires_retained_identity(
     assert mutated.main() == 1
 
     run.assert_not_called()
-    assert capsys.readouterr().err.endswith(
-        ": remainder manifest must include retained identity\n",
+    assert capsys.readouterr().err == (
+        "mutation: cannot select functions: remainder manifest must include retained identity\n"
+        f"mutation: guide: {Path(mutated.__file__).with_name('README.md').resolve().as_uri()}\n"
     )
 
 
@@ -5166,7 +5208,8 @@ def test_remainder_cannot_be_combined_with_paths(
     assert exited.value.code == 2
     run.assert_not_called()
     assert capsys.readouterr().err.endswith(
-        "error: remainder manifests cannot be combined with paths\n",
+        "error: remainder manifests cannot be combined with paths\n"
+        f"mutation: guide: {Path(mutated.__file__).with_name('README.md').resolve().as_uri()}\n",
     )
 
 
@@ -5361,6 +5404,138 @@ def _finish_exact_remainder(
         data.exit_code_by_key[name] = 1
     data.save()
     return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["selection", "snapshot", "execution", "findings", "arguments", "success"],
+)
+def test_failure_guide_is_installed_relative_and_printed_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    root = _repo(tmp_path / "repo", body="def f(value):\n    return value + 1\n")
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py"])
+    if failure == "selection":
+        monkeypatch.setattr(
+            mutated,
+            "select_functions",
+            Mock(side_effect=ValueError("selection detail")),
+        )
+    elif failure == "snapshot":
+        monkeypatch.setattr(
+            mutated,
+            "_run_shards",
+            Mock(side_effect=OSError("snapshot detail")),
+        )
+    elif failure == "execution":
+        monkeypatch.setattr(
+            mutated,
+            "_run_shards",
+            Mock(
+                return_value=[
+                    ShardReport(source="pkg/mod.py", failure="execution detail"),
+                ],
+            ),
+        )
+    elif failure == "findings":
+        monkeypatch.setattr(
+            mutated,
+            "_run_shards",
+            Mock(
+                return_value=[
+                    ShardReport(
+                        source="pkg/mod.py",
+                        outcomes={"unchecked": ("pkg.mod.x_f__mutmut_*",)},
+                    ),
+                ],
+            ),
+        )
+    elif failure == "arguments":
+        monkeypatch.setattr(sys, "argv", ["mutated", "--not-a-flag"])
+    else:
+        monkeypatch.setattr(
+            mutated,
+            "_run_shards",
+            Mock(return_value=[ShardReport(source="pkg/mod.py")]),
+        )
+    if failure == "arguments":
+        with pytest.raises(SystemExit) as stopped:
+            mutated.main()
+        assert stopped.value.code == 2
+    else:
+        assert mutated.main() == (0 if failure == "success" else 1)
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    guide = Path(mutated.__file__).with_name("README.md").resolve()
+    assert guide.is_file()
+    assert output.count(guide.as_uri()) == (0 if failure == "success" else 1)
+    if failure in {"selection", "snapshot"}:
+        assert f"{failure} detail" in output
+
+
+@pytest.mark.parametrize(
+    ("flag", "status"),
+    [("--help", 0), ("--invalid-packaging-proof", 2)],
+)
+def test_arguments_do_not_require_mutmut_configuration(
+    tmp_path: Path,
+    flag: str,
+    status: int,
+) -> None:
+    module = mutated.__name__
+    root = Path(mutated.__file__).resolve().parents[len(module.split(".")) - 1]
+    completed = subprocess.run(  # noqa: S603 -- Interpreter, package, and flags are test-owned.
+        [sys.executable, "-m", module.rpartition(".")[0], flag],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(root), "MUTANT_UNDER_TEST": ""},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == status, completed.stderr
+    assert "usage:" in completed.stdout + completed.stderr
+    assert "Traceback" not in completed.stderr
+    guide = Path(mutated.__file__).with_name("README.md").resolve().as_uri()
+    assert completed.stderr.count(guide) == (1 if status else 0)
+    if status:
+        assert "unrecognized arguments: --invalid-packaging-proof" in completed.stderr
+        assert completed.stderr.endswith(f"mutation: guide: {guide}\n")
+
+
+def test_failure_guide_follows_buffered_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with (
+        io.BytesIO() as output,
+        io.TextIOWrapper(output, encoding="utf-8") as stdout,
+        io.TextIOWrapper(output, encoding="utf-8", write_through=True) as stderr,
+        monkeypatch.context() as patched,
+    ):
+        patched.setattr(sys, "stdout", stdout)
+        patched.setattr(sys, "stderr", stderr)
+        stdout.write("survivor diagnostic\n")
+        mutated._failure_guide()
+        stdout.flush()
+        guide = Path(mutated.__file__).with_name("README.md").resolve().as_uri()
+        assert output.getvalue().decode() == (
+            f"survivor diagnostic\nmutation: guide: {guide}\n"
+        )
+
+
+def test_selection_retains_nonmatching_candidates_under_selective_policy(
+    tmp_path: Path,
+) -> None:
+    root = _repo(
+        tmp_path,
+        body='def f():\n    return read("Cookie", 1)  # pragma: no mutate[case-insensitive]\n',
+    )
+    assert function_filters(root, files=["pkg/mod.py"], sources=("pkg",)) == (
+        "pkg.mod.x_f__mutmut_*",
+    )
 
 
 if __name__ == "__main__":

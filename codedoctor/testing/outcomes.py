@@ -72,10 +72,10 @@ def save(data: Path, *, events: Path, tests: Sequence[str], status: int) -> None
         invalid.update(set(tests) - completed_files)
     with closing(sqlite3.connect(data)) as connection, connection:
         connection.execute(
-            "CREATE TABLE codedoctor_invalid_tests (path TEXT PRIMARY KEY)",  # pragma: no mutate -- SQLite SQL keywords are case-insensitive.
+            "CREATE TABLE codedoctor_invalid_tests (path TEXT PRIMARY KEY)",  # pragma: no mutate[case-insensitive]
         )
         connection.executemany(
-            "INSERT INTO codedoctor_invalid_tests VALUES (?)",  # pragma: no mutate -- SQLite SQL keywords and identifiers are case-insensitive.
+            "INSERT INTO codedoctor_invalid_tests VALUES (?)",  # pragma: no mutate[case-insensitive]
             [(path,) for path in sorted(invalid)],
         )
 
@@ -102,7 +102,7 @@ def invalid_tests(data: Path) -> set[str]:
         rows = cast(
             list[tuple[str]],
             connection.execute(
-                "SELECT path FROM codedoctor_invalid_tests",  # pragma: no mutate -- SQLite SQL keywords and identifiers are case-insensitive.
+                "SELECT path FROM codedoctor_invalid_tests",  # pragma: no mutate[case-insensitive]
             ).fetchall(),
         )
         return {row[0] for row in rows}
