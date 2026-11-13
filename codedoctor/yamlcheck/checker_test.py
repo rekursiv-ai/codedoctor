@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import patch
 
 import sys
 
@@ -87,21 +86,31 @@ def test_does_not_change_other_yaml_loaders(tmp_path: Path) -> None:
         YAML(typ="safe").load("ports: !reset []")
 
 
-def test_uses_pure_safe_loader_and_explicit_utf8(tmp_path: Path) -> None:
+def test_uses_pure_safe_loader_and_explicit_utf8(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     path = tmp_path / "unicode.yml"
     path.write_text("label: café\n", encoding="utf-8")
-    with (
-        patch.object(checker, "YAML", wraps=YAML) as loader,
-        patch.object(
-            Path,
-            "read_text",
-            autospec=True,
-            side_effect=Path.read_text,
-        ) as read_text,
-    ):
+    loaders: list[tuple[str, bool]] = []
+
+    def loader(*, typ: str, pure: bool) -> YAML:
+        loaders.append((typ, pure))
+        return YAML(typ=typ, pure=pure)
+
+    reads: list[tuple[Path, str | None]] = []
+    read = Path.read_text
+
+    def read_text(self: Path, encoding: str | None = None) -> str:
+        reads.append((self, encoding))
+        return read(self, encoding=encoding)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(checker, "YAML", loader)
+        patch.setattr(Path, "read_text", read_text)
         assert checker.check([path]) == 0
-    loader.assert_called_once_with(typ="safe", pure=True)
-    read_text.assert_called_once_with(path, encoding="utf-8")
+    assert loaders == [("safe", True)]
+    assert reads == [(path, "utf-8")]
 
 
 def test_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -588,6 +588,9 @@ runtime-evaluated-decorators = [
 "os.environ.setdefault".msg = "Assign, never setdefault: a deferred default writes a different tree per caller (AGENTS.md Provisioned Paths)."
 "pathlib.Path.home".msg = "Per-user paths require shared userdirs helpers (XDG base directories)."
 
+[tool.ruff.lint.flake8-tidy-imports.banned-api."unittest.mock"]
+msg = "Write a fake or a plain function; a mock answers calls no test scripted."
+
 [tool.ruff.lint.isort]
 case-sensitive = false
 combine-as-imports = true
