@@ -6,8 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Final, cast
-from unittest.mock import Mock
+from typing import TYPE_CHECKING, Final, NoReturn, cast
 
 import argparse
 import os
@@ -44,10 +43,14 @@ def in_tmp_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(codegraph, "executable", lambda: "codegraph")
+
+    def sync_worktree(*_args: object, **_kwargs: object) -> object:
+        return "index unavailable"
+
     monkeypatch.setattr(
         backbone,
         "sync_worktree",
-        Mock(return_value="index unavailable"),
+        sync_worktree,
     )
 
 
@@ -1244,12 +1247,12 @@ def test_the_command_line_never_runs_a_subprocess(
     """Changed lines and the file universe come from the caller and the tree, not git."""
     database = _index(tmp_path)
     _tree(tmp_path)
-    monkeypatch.setattr(subprocess, "run", Mock(side_effect=AssertionError("spawned")))
-    monkeypatch.setattr(
-        subprocess,
-        "Popen",
-        Mock(side_effect=AssertionError("spawned")),
-    )
+
+    def spawned(*args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError(f"spawned: {args} {kwargs}")
+
+    monkeypatch.setattr(subprocess, "run", spawned)
+    monkeypatch.setattr(subprocess, "Popen", spawned)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -2195,7 +2198,12 @@ def test_a_missing_cli_selects_without_indexing_or_diagnostics(
     (tmp_path / "lib_test.py").touch()
     monkeypatch.delenv("SKIP", raising=False)
     monkeypatch.setattr(codegraph, "executable", lambda: None)
-    sync = Mock(side_effect=AssertionError("missing CodeGraph was invoked"))
+    synced: list[object] = []
+
+    def sync(*args: object, **kwargs: object) -> NoReturn:
+        synced.append((args, kwargs))
+        raise AssertionError("missing CodeGraph was invoked")
+
     monkeypatch.setattr(backbone, "sync_worktree", sync)
     monkeypatch.setattr(
         sys,
@@ -2206,7 +2214,7 @@ def test_a_missing_cli_selects_without_indexing_or_diagnostics(
     assert affected.main() == 0
     expected = "lib.py\n" if emit == "files" else "lib_test.py\n"
     assert capsys.readouterr() == (expected, "")
-    sync.assert_not_called()
+    assert synced == []
 
 
 def test_a_missing_index_cli_exits_127_like_a_shell(

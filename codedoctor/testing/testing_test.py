@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast, override
-from unittest.mock import Mock, call
+from typing import TYPE_CHECKING, NoReturn, cast, override
 
 import argparse
 import importlib
@@ -34,46 +32,38 @@ pytest_plugins = ("pytester",)
 
 @pytest.mark.parametrize("worker", [False, True])
 def test_only_the_controller_registers_the_recorder(
-    tmp_path: Path,
+    pytester: pytest.Pytester,
+    monkeypatch: pytest.MonkeyPatch,
     worker: bool,
 ) -> None:
-    registered: list[tuple[object, str]] = []
-
-    def register(plugin: object, name: str) -> None:
-        registered.append((plugin, name))
-
-    config = Mock(
-        spec=pytest.Config,
-        getoption=Mock(return_value=tmp_path / "events"),
-        pluginmanager=SimpleNamespace(register=register),
+    config = pytester.parseconfig(
+        "-p",
+        testing.__name__,
+        f"--gate-outcomes={pytester.path / 'events'}",
     )
     if worker:
-        config.workerinput = dict[str, object]()
+        # Xdist marks a worker's config with this attribute; pytest declares none.
+        monkeypatch.setattr(config, "workerinput", {}, raising=False)
     testing.pytest_configure(config)
-    assert len(registered) == int(not worker)
-    if not worker:
-        recorder, name = registered[0]
-        assert name == "gate-outcomes"
+    recorder = config.pluginmanager.get_plugin("gate-outcomes")
+    if worker:
+        assert recorder is None
+    else:
         assert isinstance(recorder, outcomes.Outcomes)
-        assert recorder.destination == tmp_path / "events"
+        assert recorder.destination == pytester.path / "events"
 
 
-def test_no_recorder_without_the_gate_option() -> None:
-    register = Mock()
-    config = Mock(
-        spec=pytest.Config,
-        getoption=Mock(return_value=None),
-        pluginmanager=SimpleNamespace(register=register),
-    )
+def test_no_recorder_without_the_gate_option(pytester: pytest.Pytester) -> None:
+    config = pytester.parseconfig("-p", testing.__name__)
     testing.pytest_configure(config)
-    register.assert_not_called()
+    assert config.pluginmanager.get_plugin("gate-outcomes") is None
 
 
-def test_option_registers_a_path() -> None:
-    addoption = Mock()
-    parser = Mock(addoption=addoption)
-    testing.pytest_addoption(parser)
-    assert addoption.call_args == call("--gate-outcomes", type=Path, default=None)
+def test_option_registers_a_path(pytester: pytest.Pytester) -> None:
+    given = pytester.parseconfig("-p", testing.__name__, "--gate-outcomes=out")
+    omitted = pytester.parseconfig("-p", testing.__name__)
+    assert given.getoption("gate_outcomes") == Path("out")
+    assert omitted.getoption("gate_outcomes") is None
 
 
 def test_runner_registers_as_a_pytest_plugin() -> None:
@@ -205,7 +195,12 @@ def test_pytest_runs_each_changed_files_pairs_with_its_directory_measured(
     skip: str,
 ) -> None:
     tools = fakes.Recorder()
-    installed = Mock(wraps=tools.has)
+    asked: list[str] = []
+
+    def installed(module: str) -> bool:
+        asked.append(module)
+        return True
+
     monkeypatch.setattr(tools, "has", installed)
 
     _pytest(
@@ -218,7 +213,7 @@ def test_pytest_runs_each_changed_files_pairs_with_its_directory_measured(
 
     [test] = tools.calls
     assert "--no-cov" not in test
-    installed.assert_any_call("xdist")
+    assert "xdist" in asked
     assert test[2:7] == [
         "COVERAGE_CORE=ctrace",
         sys.executable,
@@ -418,12 +413,19 @@ def test_skipping_the_floor_disables_coverage_but_keeps_pytest(
     status: int,
 ) -> None:
     tools = fakes.Recorder(status=status)
-    installed = Mock(wraps=tools.has)
+    asked: list[str] = []
+
+    def installed(module: str) -> bool:
+        asked.append(module)
+        return True
+
     monkeypatch.setattr(tools, "has", installed)
-    summary = Mock(side_effect=AssertionError("Skipped coverage must not be analyzed"))
-    saved = Mock(side_effect=AssertionError("Skipped coverage needs no outcomes"))
-    monkeypatch.setattr(coverage_summary, "shortfall", summary)
-    monkeypatch.setattr(outcomes, "save", saved)
+
+    def refuse(*args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError(f"unexpected call: {args} {kwargs}")
+
+    monkeypatch.setattr(coverage_summary, "shortfall", refuse)
+    monkeypatch.setattr(outcomes, "save", refuse)
 
     assert _pytest(
         tmp_path,
@@ -438,13 +440,7 @@ def test_skipping_the_floor_disables_coverage_but_keeps_pytest(
     assert "COVERAGE_CORE=ctrace" not in run
     assert not any(arg.startswith("--gate-outcomes=") for arg in run)
     assert tools.argfiles == [["a_test.py"]]
-    assert installed.call_args_list == [
-        call("pytest_cov"),
-        call("xdist"),
-        call("pytest_cov"),
-    ]
-    summary.assert_not_called()
-    saved.assert_not_called()
+    assert asked == ["pytest_cov", "xdist", "pytest_cov"]
     assert (tmp_path / "spool" / "coverage.9").read_text() == (
         f"pytest exited {status}\n"
         if status in {1, 2}
@@ -1362,14 +1358,23 @@ def test_handoff_cleanup_survives_a_concurrent_floor_removing_the_file(
     stale = tmp_path / "coverage.1"
     stale.touch()
     os.utime(stale, (0, 0))
-    missing = Mock(side_effect=FileNotFoundError)
-    with monkeypatch.context() as patch:
-        patch.setattr(Path, "glob", Mock(return_value=(stale,)))
-        patch.setattr(Path, operation, missing)
 
+    vanished: list[Path] = []
+
+    def glob(self: Path, pattern: str) -> tuple[Path, ...]:
+        del self, pattern
+        return (stale,)
+
+    def vanish(self: Path) -> NoReturn:
+        vanished.append(self)
+        raise FileNotFoundError
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "glob", glob)
+        patch.setattr(Path, operation, vanish)
         testing._drop_stale_handoffs(tmp_path, now=24 * 60 * 60 + 1)
 
-    missing.assert_called_once_with()
+    assert vanished == [stale]
 
 
 def test_a_spooled_test_file_named_test_first_runs_itself(tmp_path: Path) -> None:

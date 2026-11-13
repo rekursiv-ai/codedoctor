@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
-from unittest.mock import Mock
 
 import coverage
 import pytest
@@ -15,20 +14,27 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+pytest_plugins = ("pytester",)
+
+
 @pytest.mark.parametrize("distributed", [False, True])
 def test_collection_records_the_final_selected_nodeids(
-    tmp_path: Path,
+    pytester: pytest.Pytester,
     distributed: bool,
 ) -> None:
-    destination = tmp_path / "events"
+    destination = pytester.path / "events"
     recorder = outcomes.Outcomes(destination)
-    nodeids = ["a_test.py::test_a", "b_test.py::test_b"]
+    # Collection loads every installed plugin; pytest-asyncio warns unless set.
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function\n")
+    items = pytester.getitems("def test_a(): pass\ndef test_b(): pass\n")
+    nodeids = [item.nodeid for item in items]
     if distributed:
         recorder.pytest_xdist_node_collection_finished(nodeids)
     else:
-        session = Mock(spec=pytest.Session)
-        session.items = [Mock(nodeid=nodeid) for nodeid in nodeids]
+        session = items[0].session
+        session.items = items
         recorder.pytest_collection_finish(session)
+    assert len(nodeids) == 2
     assert destination.read_text().splitlines() == [
         "selected",
         *(f"selected\t{nodeid}" for nodeid in nodeids),

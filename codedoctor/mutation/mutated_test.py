@@ -5,10 +5,10 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import partial
-from multiprocessing.context import ForkContext
+from multiprocessing.context import BaseContext, ForkContext
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Protocol, TypedDict, cast
-from unittest.mock import Mock
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Final, NoReturn, Protocol, Self, TypedDict, cast
 from urllib import request
 
 import argparse
@@ -32,7 +32,11 @@ import tomllib
 
 from mutmut import configuration
 from mutmut.mutation.data import LineSpan, MutantLineSpans, SourceFileMutationData
-from mutmut.mutation.file_mutation import create_mutations, mutate_file_contents
+from mutmut.mutation.file_mutation import (
+    MutatedFile,
+    create_mutations,
+    mutate_file_contents,
+)
 from mutmut.mutation.trampoline_templates import CLASS_NAME_SEPARATOR
 from mutmut.state import state
 from mutmut.utils.format_utils import get_mutant_name
@@ -93,12 +97,6 @@ def _runnable(root: Path, *, source_paths: str = '["pkg"]') -> None:
         '[tool.pytest.ini_options]\npythonpath = ["."]\n',
     )
     (root / ".gitignore").write_text("runtime/\n")
-
-
-def _empty_report(root: Path, *, shard: Shard, **_: object) -> ShardReport:
-    """Stand in for ``run_shard``: an empty report for ``shard``'s file."""
-    del root
-    return ShardReport(source=shard.source)
 
 
 def _git(root: Path, *args: str) -> None:
@@ -264,13 +262,18 @@ def test_parallel_selection_matches_serial(
     files = ["pkg/mod.py", "pkg/mod.py"]
     (root / "pkg/a.py").write_text("def a():\n    return 1\n")
     files.append("pkg/a.py")
-    pool = Mock(wraps=_selection_thread_pool)
+    sizes: list[int] = []
+
+    def pool(*, max_workers: int, mp_context: ForkContext) -> ThreadPoolExecutor:
+        sizes.append(max_workers)
+        return _selection_thread_pool(max_workers=max_workers, mp_context=mp_context)
+
     monkeypatch.setattr(mutated, "ProcessPoolExecutor", pool)
 
     serial = function_filters(root, files=files, sources=("pkg",))
-    pool.assert_not_called()
+    assert sizes == []
     assert function_filters(root, files=files, sources=("pkg",), workers=2) == serial
-    pool.assert_called_once()
+    assert sizes == [2]
     assert serial == (
         "pkg.a.x_a__mutmut_*",
         "pkg.mod.x_first__mutmut_*",
@@ -295,8 +298,8 @@ def test_selection_never_runs_a_subprocess(
 ) -> None:
     root = _repo(tmp_path, body=_TWO_FUNCTIONS)
 
-    def refuse(*args: object, **kwargs: object) -> None:
-        raise AssertionError(f"ran a subprocess: {args} {kwargs}")
+    def refuse(*args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError(f"unexpected call: {args} {kwargs}")
 
     monkeypatch.setattr(subprocess, "run", refuse)
 
@@ -829,11 +832,24 @@ def test_selectors_run_clean_tests_for_only_the_exact_function(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run = Mock(return_value=subprocess.CompletedProcess([], 1, "", ""))
+    run_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def run(*args: object, **kwargs: object) -> object:
+        run_calls.append((args, kwargs))
+        return subprocess.CompletedProcess([], 1, "", "")
+
     with monkeypatch.context() as patch:
         patch.setattr(mutated, "_run_mutmut", run)
-        patch.setattr(mutated, "copy_snapshot", Mock())
-        patch.setattr(mutated, "_paired_tests", Mock(return_value=("t.py",)))
+
+        def copy_snapshot(*_args: object, **_kwargs: object) -> object:
+            return None
+
+        patch.setattr(mutated, "copy_snapshot", copy_snapshot)
+
+        def paired_tests(*_args: object, **_kwargs: object) -> object:
+            return ("t.py",)
+
+        patch.setattr(mutated, "_paired_tests", paired_tests)
         run_shard(
             tmp_path,
             shard=Shard(source="pkg/mod.py", filters=("pkg.mod.x_foo__mutmut_*",)),
@@ -842,7 +858,7 @@ def test_selectors_run_clean_tests_for_only_the_exact_function(
             workers=1,
             timeout_sec=None,
         )
-    argv = cast("list[str]", run.call_args.args[0])
+    argv = cast("list[str]", run_calls[-1][0][0])
     # Importing mutmut's CLI reads its config from the cwd, so it waits for the
     # fixture's project rather than running wherever pytest collects.
     cli = cast(_MutmutCli, importlib.import_module("mutmut.__main__"))
@@ -912,7 +928,13 @@ def test_the_snapshot_mutates_sources_and_copies_the_rest_once(
     (root / "pkg/link.py").symlink_to("mod.py")
     template = _template(root, tmp_path)
     snapshot = tmp_path / "snapshot"
-    run = Mock(wraps=subprocess.run)
+    argvs: list[list[str]] = []
+    real = subprocess.run
+
+    def run(argv: list[str], *, check: bool) -> subprocess.CompletedProcess[bytes]:
+        argvs.append(argv)
+        return real(argv, check=check)
+
     monkeypatch.setattr(subprocess, "run", run)
 
     copy_snapshot(
@@ -923,8 +945,8 @@ def test_the_snapshot_mutates_sources_and_copies_the_rest_once(
         template=template,
     )
 
-    (copy,) = run.call_args_list
-    assert cast("list[str]", copy.args[0])[0] == shutil.which("cp")
+    (copy,) = argvs
+    assert copy[0] == shutil.which("cp")
     assert (snapshot / "pkg/mod.py").is_file()
     assert not (snapshot / "mutants/pkg/mod.py").exists()
     assert (snapshot / "mutants/support.txt").read_text() == "support"
@@ -1014,7 +1036,12 @@ def test_emitting_filters_samples_without_running(
 
     monkeypatch.setattr(mutated, "_file_filters", file_filters)
     monkeypatch.chdir(root)
-    run = Mock()
+    run_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def run(*args: object, **kwargs: object) -> NoReturn:
+        run_calls.append((args, kwargs))
+        raise AssertionError(f"unexpected call: {args} {kwargs}")
+
     monkeypatch.setattr(mutated, "run_shard", run)
     monkeypatch.setattr(
         sys,
@@ -1038,7 +1065,7 @@ def test_emitting_filters_samples_without_running(
     candidates = function_filters(root, files=paths, sources=(".",))
     assert tuple(output.out.splitlines()) == sample(candidates, seed="", size=4)
     assert "4 selected; 2 skipped" in output.err
-    run.assert_not_called()
+    assert run_calls == []
     assert not (root / "mutants").exists()
 
     monkeypatch.setattr(
@@ -2199,14 +2226,17 @@ def test_arange_integer_ranges_check_the_lower_bound() -> None:
 def test_unobservable_comparison_defaults_to_no_module_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    erase = Mock(wraps=mutated._erase_unobservable)
+    contexts: list[str] = []
+    real = mutated._erase_unobservable
+
+    def erase(code: str, *, context: str) -> str:
+        contexts.append(context)
+        return real(code, context=context)
+
     monkeypatch.setattr(mutated, "_erase_unobservable", erase)
 
     assert not _only_unobservable("return 1", "return 2")
-    assert [call.kwargs for call in erase.call_args_list] == [
-        {"context": ""},
-        {"context": ""},
-    ]
+    assert contexts == ["", ""]
 
 
 @pytest.mark.parametrize("docstring", ["", '    """Contract."""\n'])
@@ -2432,11 +2462,19 @@ def test_main_emits_selected_filters_without_running_mutmut(
 ) -> None:
     """The explain and emit branches report selected candidates."""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(mutated, "mutable_sources", Mock(return_value=("pkg",)))
+
+    def mutable_sources(*_args: object, **_kwargs: object) -> object:
+        return ("pkg",)
+
+    monkeypatch.setattr(mutated, "mutable_sources", mutable_sources)
+
+    def function_filters(*_args: object, **_kwargs: object) -> object:
+        return ("pkg.mod.x_f__mutmut_*",)
+
     monkeypatch.setattr(
         mutated,
         "function_filters",
-        Mock(return_value=("pkg.mod.x_f__mutmut_*",)),
+        function_filters,
     )
     monkeypatch.setattr(
         sys,
@@ -2492,14 +2530,52 @@ def test_main_runs_each_file_alone_within_the_worker_budget(
     """Every file is its own shard; the budget splits across shards, at most 8 each."""
     workers, children, parallel = budget
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(mutated, "mutable_sources", Mock(return_value=("pkg",)))
+
+    def mutable_sources(*_args: object, **_kwargs: object) -> object:
+        return ("pkg",)
+
+    monkeypatch.setattr(mutated, "mutable_sources", mutable_sources)
     filters = ("pkg.a.x_f__mutmut_*", "pkg.b.x_f__mutmut_*", "pkg.b.x_g__mutmut_*")
-    select = Mock(return_value=filters)
+    selected: list[tuple[Path, list[str], tuple[str, ...], int]] = []
+
+    def select(
+        root: Path,
+        *,
+        files: list[str],
+        sources: tuple[str, ...],
+        workers: int,
+    ) -> tuple[str, ...]:
+        selected.append((root, files, sources, workers))
+        return filters
+
     monkeypatch.setattr(mutated, "function_filters", select)
-    run = Mock(side_effect=_empty_report)
+    shards: list[tuple[Path, Shard, Path, int, float | None]] = []
+
+    def run(
+        root: Path,
+        *,
+        shard: Shard,
+        snapshot: Path,
+        template: Path,
+        workers: int,
+        timeout_sec: float | None,
+    ) -> ShardReport:
+        del template
+        shards.append((root, shard, snapshot, workers, timeout_sec))
+        return ShardReport(source=shard.source)
+
     monkeypatch.setattr(mutated, "run_shard", run)
-    monkeypatch.setattr(mutated, "copy_template", Mock())
-    pool = Mock(wraps=ThreadPoolExecutor)
+
+    def copy_template(*_args: object, **_kwargs: object) -> object:
+        return None
+
+    monkeypatch.setattr(mutated, "copy_template", copy_template)
+    sizes: list[int] = []
+
+    def pool(*, max_workers: int) -> ThreadPoolExecutor:
+        sizes.append(max_workers)
+        return ThreadPoolExecutor(max_workers=max_workers)
+
     monkeypatch.setattr(mutated, "ThreadPoolExecutor", pool)
     monkeypatch.setattr(
         sys,
@@ -2517,31 +2593,24 @@ def test_main_runs_each_file_alone_within_the_worker_budget(
     )
 
     assert mutated.main() == 0
-    assert {call.kwargs["timeout_sec"] for call in run.call_args_list} == {12.0}
+    assert {timeout for *_, timeout in shards} == {12.0}
 
     assert (
         f"[mutated] 2 file(s), {parallel} at a time x {children} worker(s)\n"
         in capsys.readouterr().err
     )
-    assert all(c.args == (tmp_path,) for c in run.call_args_list)
-    select.assert_called_once_with(
-        tmp_path,
-        files=["pkg/a.py", "pkg/b.py"],
-        sources=("pkg",),
-        workers=workers,
-    )
-    shards = [cast(Shard, c.kwargs["shard"]) for c in run.call_args_list]
-    assert sorted(shards, key=lambda shard: shard.source) == [
+    assert {root for root, *_ in shards} == {tmp_path}
+    assert selected == [(tmp_path, ["pkg/a.py", "pkg/b.py"], ("pkg",), workers)]
+    assert sorted((shard for _, shard, *_ in shards), key=lambda s: s.source) == [
         Shard(source="pkg/a.py", filters=("pkg.a.x_f__mutmut_*",)),
         Shard(
             source="pkg/b.py",
             filters=("pkg.b.x_f__mutmut_*", "pkg.b.x_g__mutmut_*"),
         ),
     ]
-    assert {call.kwargs["workers"] for call in run.call_args_list} == {children}
-    pool.assert_called_once_with(max_workers=parallel)
-    snapshots = {cast(Path, c.kwargs["snapshot"]) for c in run.call_args_list}
-    assert len(snapshots) == 2
+    assert {used for *_, used, _ in shards} == {children}
+    assert sizes == [parallel]
+    assert len({snapshot for _, _, snapshot, *_ in shards}) == 2
 
 
 def test_paired_tests_are_the_sidecars_under_the_root(
@@ -2562,8 +2631,8 @@ def test_paired_tests_are_the_sidecars_under_the_root(
         (root / "pkg" / name).touch()
     monkeypatch.chdir(tmp_path)
 
-    def refuse(*args: object, **kwargs: object) -> None:
-        raise AssertionError(f"ran a subprocess: {args} {kwargs}")
+    def refuse(*args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError(f"unexpected call: {args} {kwargs}")
 
     monkeypatch.setattr(subprocess, "run", refuse)
 
@@ -2602,12 +2671,17 @@ def test_an_unavailable_graph_reports_the_sidecar_fallback(
     capsys: pytest.CaptureFixture[str],
     output: str | None,
 ) -> None:
-    query = Mock(return_value=output)
+    query_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def query(*args: object, **kwargs: object) -> object:
+        query_calls.append((args, kwargs))
+        return output
+
     monkeypatch.setattr(mutated, "output_argv", query)
 
     assert mutated._affected(tmp_path, files=["a.py"], depth=1, emit="nodeids") == []
-    query.assert_called_once()
-    assert query.call_args.args[0][:-1] == [
+    (call,) = query_calls
+    assert cast(list[str], call[0][0])[:-1] == [
         sys.executable,
         "-m",
         "codedoctor.affected",
@@ -3032,19 +3106,24 @@ def test_parallel_selection_forks_one_process_per_file_up_to_the_cap(
     # Two files are the minimum that distinguishes serial, per-file, and capped pools.
     root = _repo(tmp_path, body="def first():\n    return 1\n")
     (root / "pkg/other.py").write_text("def second():\n    return 2\n")
-    pool = Mock(wraps=ProcessPoolExecutor)
+    pools: list[tuple[int, BaseContext]] = []
+
+    def pool(*, max_workers: int, mp_context: BaseContext) -> ProcessPoolExecutor:
+        pools.append((max_workers, mp_context))
+        return ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_context)
+
     monkeypatch.setattr(mutated, "ProcessPoolExecutor", pool)
     files = ["pkg/mod.py", "pkg/other.py"]
 
     function_filters(root, files=files, sources=("pkg",))
-    pool.assert_not_called()
+    assert pools == []
     function_filters(root, files=files[:1], sources=("pkg",), workers=4)
-    pool.assert_not_called()
+    assert pools == []
     function_filters(root, files=files, sources=("pkg",), workers=4)
 
-    (call,) = pool.call_args_list
-    assert call.kwargs["max_workers"] == 2
-    assert isinstance(call.kwargs["mp_context"], ForkContext)
+    ((size, context),) = pools
+    assert size == 2
+    assert isinstance(context, ForkContext)
 
 
 def test_copy_snapshot_writes_both_configurations(tmp_path: Path) -> None:
@@ -3116,8 +3195,18 @@ def test_the_snapshot_finds_cp_off_the_path(
 ) -> None:
     root = _repo(tmp_path / "repo", body=_TWO_FUNCTIONS)
     template = _template(root, tmp_path)
-    run = Mock(side_effect=subprocess.CalledProcessError(1, "cp"))
-    monkeypatch.setattr(shutil, "which", Mock(return_value=None))
+
+    argvs: list[list[str]] = []
+
+    def run(argv: list[str], *, check: bool) -> NoReturn:
+        del check
+        argvs.append(argv)
+        raise subprocess.CalledProcessError(1, "cp")
+
+    def which(name: str) -> None:
+        del name
+
+    monkeypatch.setattr(shutil, "which", which)
     monkeypatch.setattr(subprocess, "run", run)
 
     with pytest.raises(subprocess.CalledProcessError):
@@ -3129,7 +3218,7 @@ def test_the_snapshot_finds_cp_off_the_path(
             template=template,
         )
 
-    assert cast("list[str]", run.call_args.args[0])[0] == "cp"
+    assert argvs[-1][0] == "cp"
 
 
 def test_a_failed_copy_stops_the_snapshot(tmp_path: Path) -> None:
@@ -3279,11 +3368,16 @@ def test_failed_mutation_graph_retains_sidecars_and_warns(
     root = _repo(tmp_path, body=_TWO_FUNCTIONS)
     (root / "pkg/mod_test.py").touch()
     monkeypatch.setenv("PRECOMMIT_SCOPE_MUTATION", "affected:2")
-    reader = Mock(return_value=output)
+    reader_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def reader(*args: object, **kwargs: object) -> object:
+        reader_calls.append((args, kwargs))
+        return output
+
     monkeypatch.setattr(mutated, "output_argv", reader)
 
     assert mutated._paired_tests(root, sources=("pkg/mod.py",)) == ("pkg/mod_test.py",)
-    assert reader.call_count == 1
+    assert len(reader_calls) == 1
     assert capsys.readouterr().err == (
         "mutation: dependency graph unavailable; using sidecars\n"
     )
@@ -3304,24 +3398,39 @@ def test_mutation_scope_selects_sources_and_tests(
         ["pkg/mod.py", "pkg/mod_test.py"] if mode == "exact" else ["pkg/mod_test.py"]
     )
     monkeypatch.setattr(sys, "argv", ["mutated", *paths])
-    select = Mock(return_value=(("pkg.mod.x_first__mutmut_*",), 1))
+    select_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def select(*args: object, **kwargs: object) -> object:
+        select_calls.append((args, kwargs))
+        return (("pkg.mod.x_first__mutmut_*",), 1)
+
     monkeypatch.setattr(mutated, "select_functions", select)
-    run = Mock(return_value=[])
+    run_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def run(*args: object, **kwargs: object) -> object:
+        run_calls.append((args, kwargs))
+        return list[ShardReport]()
+
     monkeypatch.setattr(mutated, "_run_shards", run)
-    output = Mock(return_value="pkg/other.py\n")
+    output_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def output(*args: object, **kwargs: object) -> object:
+        output_calls.append((args, kwargs))
+        return "pkg/other.py\n"
+
     monkeypatch.setattr(mutated, "output_argv", output)
 
     assert mutated.main() == 0
-    shard = cast(tuple[Shard, ...], run.call_args.kwargs["shards"])[0]
+    shard = cast(tuple[Shard, ...], run_calls[-1][1]["shards"])[0]
     assert shard.tests == (("pkg/mod_test.py",) if mode == "exact" else None)
-    assert set(cast(list[str], select.call_args.kwargs["files"])) == {
+    assert set(cast(list[str], select_calls[-1][1]["files"])) == {
         "pkg/mod.py",
         "pkg/mod_test.py",
         *(["pkg/other.py"] if mode == "affected:2" else []),
     }
-    assert output.called is (mode == "affected:2")
+    assert bool(output_calls) is (mode == "affected:2")
     if mode == "affected:2":
-        argv = cast(list[str], output.call_args.args[0])
+        argv = cast(list[str], output_calls[-1][0][0])
         assert argv[argv.index("--emit") + 1] == "files"
 
 
@@ -3332,16 +3441,19 @@ def test_main_handles_selection_error_and_empty_selection(
 ) -> None:
     """Selection errors fail cleanly, while no candidates succeed."""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(
-        mutated,
-        "function_filters",
-        Mock(side_effect=ValueError("bad identifier")),
-    )
+
+    def unsupported(*_args: object, **_kwargs: object) -> NoReturn:
+        raise ValueError("bad identifier")
+
+    monkeypatch.setattr(mutated, "function_filters", unsupported)
     monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py"])
     assert mutated.main() == 1
     assert "bad identifier" in capsys.readouterr().err
 
-    monkeypatch.setattr(mutated, "function_filters", Mock(return_value=()))
+    def function_filters(*_args: object, **_kwargs: object) -> object:
+        return ()
+
+    monkeypatch.setattr(mutated, "function_filters", function_filters)
     assert mutated.main() == 0
 
 
@@ -3376,18 +3488,30 @@ def test_a_finding_always_fails_the_run(
 def _unusable_snapshot(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Select one function of ``pkg/mod.py`` whose snapshot cannot be laid out."""
     monkeypatch.chdir(root)
-    monkeypatch.setattr(mutated, "copy_template", Mock())
-    monkeypatch.setattr(mutated, "_paired_tests", Mock(return_value=("t.py",)))
+
+    def copy_template(*_args: object, **_kwargs: object) -> object:
+        return None
+
+    monkeypatch.setattr(mutated, "copy_template", copy_template)
+
+    def paired_tests(*_args: object, **_kwargs: object) -> object:
+        return ("t.py",)
+
+    monkeypatch.setattr(mutated, "_paired_tests", paired_tests)
+
+    def function_filters(*_args: object, **_kwargs: object) -> object:
+        return ("pkg.mod.x_f__mutmut_*",)
+
     monkeypatch.setattr(
         mutated,
         "function_filters",
-        Mock(return_value=("pkg.mod.x_f__mutmut_*",)),
+        function_filters,
     )
-    monkeypatch.setattr(
-        mutated,
-        "copy_snapshot",
-        Mock(side_effect=OSError("no snapshot")),
-    )
+    monkeypatch.setattr(mutated, "copy_snapshot", _no_snapshot)
+
+
+def _no_snapshot(*_args: object, **_kwargs: object) -> NoReturn:
+    raise OSError("no snapshot")
 
 
 def test_an_unparsable_paired_test_fails_its_file_in_one_line(
@@ -3398,25 +3522,40 @@ def test_an_unparsable_paired_test_fails_its_file_in_one_line(
     """Mutmut never starts: one line names the file, not pytest's traceback."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "t_test.py").write_text("from m import a, b | c\n")
-    monkeypatch.setattr(mutated, "copy_template", Mock())
+
+    def copy_template(*_args: object, **_kwargs: object) -> object:
+        return None
+
+    monkeypatch.setattr(mutated, "copy_template", copy_template)
+
+    def paired_tests(*_args: object, **_kwargs: object) -> object:
+        return (
+            "gone_test.py::test_a",
+            "t_test.py::test_a",
+            "t_test.py::test_b",
+        )
+
     monkeypatch.setattr(
         mutated,
         "_paired_tests",
         # A deleted test file ahead of the broken one must not end the scan.
-        Mock(
-            return_value=(
-                "gone_test.py::test_a",
-                "t_test.py::test_a",
-                "t_test.py::test_b",
-            ),
-        ),
+        paired_tests,
     )
+
+    def function_filters(*_args: object, **_kwargs: object) -> object:
+        return ("pkg.mod.x_f__mutmut_*",)
+
     monkeypatch.setattr(
         mutated,
         "function_filters",
-        Mock(return_value=("pkg.mod.x_f__mutmut_*",)),
+        function_filters,
     )
-    snapshot = Mock()
+    snapshot_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def snapshot(*args: object, **kwargs: object) -> NoReturn:
+        snapshot_calls.append((args, kwargs))
+        raise AssertionError(f"unexpected call: {args} {kwargs}")
+
     monkeypatch.setattr(mutated, "copy_snapshot", snapshot)
     monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py"])
 
@@ -3427,7 +3566,7 @@ def test_an_unparsable_paired_test_fails_its_file_in_one_line(
         "mutation: pkg/mod.py: t_test.py:1: invalid syntax\n"
         f"mutation: guide: {Path(mutated.__file__).with_name('README.md').resolve().as_uri()}\n"
     )
-    snapshot.assert_not_called()
+    assert snapshot_calls == []
 
 
 @pytest.mark.parametrize(
@@ -3442,12 +3581,20 @@ def test_main_fails_when_the_template_cannot_be_copied(
 ) -> None:
     """A disk error, or a root git cannot list, fails the run without a traceback."""
     monkeypatch.chdir(tmp_path)
+
+    def function_filters(*_args: object, **_kwargs: object) -> object:
+        return ("pkg.mod.x_f__mutmut_*",)
+
     monkeypatch.setattr(
         mutated,
         "function_filters",
-        Mock(return_value=("pkg.mod.x_f__mutmut_*",)),
+        function_filters,
     )
-    monkeypatch.setattr(mutated, "copy_template", Mock(side_effect=error))
+
+    def fail(*_args: object, **_kwargs: object) -> NoReturn:
+        raise error
+
+    monkeypatch.setattr(mutated, "copy_template", fail)
     monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py"])
 
     assert mutated.main() == 1
@@ -3497,7 +3644,11 @@ def test_a_failing_file_does_not_stop_the_others(
         )
 
     monkeypatch.setattr(mutated, "_mutate", mutate)
-    monkeypatch.setattr(mutated, "copy_template", Mock())
+
+    def copy_template(*_args: object, **_kwargs: object) -> object:
+        return None
+
+    monkeypatch.setattr(mutated, "copy_template", copy_template)
 
     reports = mutated._run_shards(
         tmp_path,
@@ -3525,12 +3676,19 @@ def test_each_file_reports_as_it_finishes(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    def mutate(*_args: object, **_kwargs: object) -> object:
+        return ShardReport(source="a.py", checked=4)
+
     monkeypatch.setattr(
         mutated,
         "_mutate",
-        Mock(return_value=ShardReport(source="a.py", checked=4)),
+        mutate,
     )
-    monkeypatch.setattr(mutated, "copy_template", Mock())
+
+    def copy_template(*_args: object, **_kwargs: object) -> object:
+        return None
+
+    monkeypatch.setattr(mutated, "copy_template", copy_template)
 
     mutated._run_shards(
         tmp_path,
@@ -3559,7 +3717,10 @@ def test_a_killed_runs_snapshot_is_swept_by_the_next_run(
         seen.extend(path.name for path in isolate_mutation_environment.iterdir())
         return ShardReport(source=snapshot.name)
 
-    monkeypatch.setattr(mutated, "copy_template", Mock())
+    def copy_template(*_args: object, **_kwargs: object) -> object:
+        return None
+
+    monkeypatch.setattr(mutated, "copy_template", copy_template)
     monkeypatch.setattr(mutated, "_mutate", record)
 
     mutated._run_shards(
@@ -3770,8 +3931,16 @@ def test_a_shard_past_its_limit_is_reported_and_costs_no_other(
         raise subprocess.TimeoutExpired(argv, 900.0)
 
     monkeypatch.setattr(mutated, "_run_mutmut", hangs)
-    monkeypatch.setattr(mutated, "copy_snapshot", Mock())
-    monkeypatch.setattr(mutated, "_paired_tests", Mock(return_value=("t.py",)))
+
+    def copy_snapshot(*_args: object, **_kwargs: object) -> object:
+        return None
+
+    monkeypatch.setattr(mutated, "copy_snapshot", copy_snapshot)
+
+    def paired_tests(*_args: object, **_kwargs: object) -> object:
+        return ("t.py",)
+
+    monkeypatch.setattr(mutated, "_paired_tests", paired_tests)
 
     report = run_shard(
         tmp_path,
@@ -3795,9 +3964,19 @@ def test_mutmut_retries_segfaulted_and_unrun_mutants_once(
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
     filters = ("pkg.mod.x_f__mutmut_*",)
-    run = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
-    load = Mock()
-    data = Mock(
+    run_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def run(*args: object, **kwargs: object) -> object:
+        run_calls.append((args, kwargs))
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    load_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def load(*args: object, **kwargs: object) -> object:
+        load_calls.append((args, kwargs))
+        return None
+
+    data = SimpleNamespace(
         load=load,
         exit_code_by_key={
             "pkg.mod.x_f__mutmut_1": -11,
@@ -3806,15 +3985,32 @@ def test_mutmut_retries_segfaulted_and_unrun_mutants_once(
             "pkg.mod.x_other__mutmut_1": -11,
         },
     )
-    loaded = Mock(return_value=data)
+    loaded_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def loaded(*args: object, **kwargs: object) -> object:
+        loaded_calls.append((args, kwargs))
+        return data
+
     monkeypatch.setattr(mutated, "_run_mutmut", run)
-    monkeypatch.setattr(mutated, "copy_snapshot", Mock())
-    monkeypatch.setattr(mutated, "_paired_tests", Mock(return_value=("t.py",)))
+
+    def copy_snapshot(*_args: object, **_kwargs: object) -> object:
+        return None
+
+    monkeypatch.setattr(mutated, "copy_snapshot", copy_snapshot)
+
+    def paired_tests(*_args: object, **_kwargs: object) -> object:
+        return ("t.py",)
+
+    monkeypatch.setattr(mutated, "_paired_tests", paired_tests)
     monkeypatch.setitem(mutated.__dict__, "SourceFileMutationData", loaded)
+
+    def collect(*_args: object, **_kwargs: object) -> object:
+        return ShardReport(source="pkg/mod.py")
+
     monkeypatch.setattr(
         mutated,
         "_collect",
-        Mock(return_value=ShardReport(source="pkg/mod.py")),
+        collect,
     )
 
     mutated._mutate(
@@ -3826,11 +4022,11 @@ def test_mutmut_retries_segfaulted_and_unrun_mutants_once(
         timeout_sec=7.0,
     )
 
-    assert run.call_count == 2
+    assert len(run_calls) == 2
     single = fork_safe_env(single_threaded_env(os.environ))
-    assert [call.kwargs["env"] for call in run.call_args_list] == [single, single]
-    assert [call.kwargs["timeout_sec"] for call in run.call_args_list] == [7.0, 7.0]
-    assert run.call_args_list[1].args[0] == [
+    assert [call[1]["env"] for call in run_calls] == [single, single]
+    assert [call[1]["timeout_sec"] for call in run_calls] == [7.0, 7.0]
+    assert run_calls[1][0][0] == [
         sys.executable,
         "-m",
         "codedoctor.mutation.mutmut_cli",
@@ -3840,13 +4036,15 @@ def test_mutmut_retries_segfaulted_and_unrun_mutants_once(
         "pkg.mod.x_f__mutmut_1",
         "pkg.mod.x_f__mutmut_2",
     ]
-    assert run.call_args_list[1].kwargs == {
+    assert run_calls[1][1] == {
         "cwd": snapshot,
         "env": single,
         "timeout_sec": 7.0,
     }
-    loaded.assert_called_once_with(path=snapshot / "mutants" / "pkg/mod.py")
-    load.assert_called_once_with()
+    assert loaded_calls == [
+        ((), {"path": snapshot / "mutants" / "pkg/mod.py"}),
+    ]
+    assert load_calls == [((), {})]
 
 
 def test_a_retry_past_its_limit_keeps_what_the_first_run_recorded(
@@ -3854,19 +4052,40 @@ def test_a_retry_past_its_limit_keeps_what_the_first_run_recorded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The mutants it retried stay inconclusive; every other result stands."""
-    first = subprocess.CompletedProcess[str]([], 0, "", "")
-    run = Mock(side_effect=[first, subprocess.TimeoutExpired(["mutmut"], 7.0)])
-    data = Mock(exit_code_by_key={"pkg.mod.x_f__mutmut_1": None})
+    argvs: list[list[str]] = []
+
+    def run(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        argvs.append(argv)
+        if len(argvs) == 1:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        raise subprocess.TimeoutExpired(argv, 7.0)
+
+    data = SimpleNamespace(
+        load=lambda: None,
+        exit_code_by_key={"pkg.mod.x_f__mutmut_1": None},
+    )
     collected = ShardReport(source="pkg/mod.py", checked=3)
     monkeypatch.setattr(mutated, "_run_mutmut", run)
-    monkeypatch.setattr(mutated, "copy_snapshot", Mock())
-    monkeypatch.setattr(mutated, "_paired_tests", Mock(return_value=("t.py",)))
-    monkeypatch.setitem(
-        mutated.__dict__,
-        "SourceFileMutationData",
-        Mock(return_value=data),
-    )
-    monkeypatch.setattr(mutated, "_collect", Mock(return_value=collected))
+
+    def copy_snapshot(*_args: object, **_kwargs: object) -> object:
+        return None
+
+    monkeypatch.setattr(mutated, "copy_snapshot", copy_snapshot)
+
+    def paired_tests(*_args: object, **_kwargs: object) -> object:
+        return ("t.py",)
+
+    monkeypatch.setattr(mutated, "_paired_tests", paired_tests)
+
+    def load_data(*_args: object, **_kwargs: object) -> object:
+        return data
+
+    monkeypatch.setitem(mutated.__dict__, "SourceFileMutationData", load_data)
+
+    def collect(*_args: object, **_kwargs: object) -> object:
+        return collected
+
+    monkeypatch.setattr(mutated, "_collect", collect)
 
     report = run_shard(
         tmp_path,
@@ -3878,7 +4097,7 @@ def test_a_retry_past_its_limit_keeps_what_the_first_run_recorded(
     )
 
     assert report == collected
-    assert run.call_count == 2
+    assert len(argvs) == 2
 
 
 def test_a_mutmut_crash_reports_the_tail_of_its_output(
@@ -3886,10 +4105,23 @@ def test_a_mutmut_crash_reports_the_tail_of_its_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stdout = "".join(f"out {n}\n" for n in range(60))
-    run = Mock(return_value=subprocess.CompletedProcess([], 3, stdout, "err\n"))
+    run_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def run(*args: object, **kwargs: object) -> object:
+        run_calls.append((args, kwargs))
+        return subprocess.CompletedProcess([], 3, stdout, "err\n")
+
     monkeypatch.setattr(mutated, "_run_mutmut", run)
-    monkeypatch.setattr(mutated, "copy_snapshot", Mock())
-    monkeypatch.setattr(mutated, "_paired_tests", Mock(return_value=("t.py",)))
+
+    def copy_snapshot(*_args: object, **_kwargs: object) -> object:
+        return None
+
+    monkeypatch.setattr(mutated, "copy_snapshot", copy_snapshot)
+
+    def paired_tests(*_args: object, **_kwargs: object) -> object:
+        return ("t.py",)
+
+    monkeypatch.setattr(mutated, "_paired_tests", paired_tests)
 
     report = run_shard(
         tmp_path,
@@ -3906,7 +4138,7 @@ def test_a_mutmut_crash_reports_the_tail_of_its_output(
         + "err\nmutation: pkg/mod.py: mutmut exited 3 before recording results; "
         "its output is above."
     )
-    argv = cast("list[str]", run.call_args.args[0])
+    argv = cast("list[str]", run_calls[-1][0][0])
     assert argv[:6] == [
         sys.executable,
         "-m",
@@ -3915,7 +4147,7 @@ def test_a_mutmut_crash_reports_the_tail_of_its_output(
         "--max-children",
         "5",
     ]
-    assert run.call_args.kwargs == {
+    assert run_calls[-1][1] == {
         "cwd": tmp_path / "snapshot",
         "env": fork_safe_env(single_threaded_env(os.environ)),
         "timeout_sec": None,
@@ -4234,7 +4466,12 @@ def test_exact_retry_does_not_execute_longer_numeric_suffixes(
         "pkg.mod.x_f__mutmut_100": None,
     }
     data.save()
-    run = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+    argvs: list[list[str]] = []
+
+    def run(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        argvs.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
     monkeypatch.setattr(mutated, "_run_mutmut", run)
 
     mutated._retry_inconclusive(
@@ -4243,7 +4480,8 @@ def test_exact_retry_does_not_execute_longer_numeric_suffixes(
         timeout_sec=7.0,
     )
 
-    assert run.call_args.args[0] == [
+    (argv,) = argvs
+    assert argv == [
         sys.executable,
         "-m",
         "codedoctor.mutation.mutmut_cli",
@@ -4252,7 +4490,6 @@ def test_exact_retry_does_not_execute_longer_numeric_suffixes(
         "1",
         "pkg.mod.x_f__mutmut_1",
     ]
-    assert run.call_count == 1
 
 
 @pytest.mark.parametrize("indexed", [False, True])
@@ -4280,24 +4517,31 @@ def test_template_copy_uses_the_listing_and_preserves_bytes_and_links(
     (root / "pkg/link.py").symlink_to("mod.py")
     (root / ".hidden").write_bytes(b"\x00\xff")
     (root / "ignored").write_text("not listed")
-    listing = Mock(
-        return_value=subprocess.CompletedProcess(
+    listing_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def listing(*args: object, **kwargs: object) -> object:
+        listing_calls.append((args, kwargs))
+        return subprocess.CompletedProcess(
             [],
             0,
             "missing\0pkg/mod.py\0pkg/link.py\0.hidden\0",
             "",
-        ),
-    )
+        )
+
     monkeypatch.setattr(subprocess, "run", listing)
     template = tmp_path / "template"
     mutated.copy_template(root, template=template)
-    listing.assert_called_once_with(
-        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-        cwd=root,
-        stdout=subprocess.PIPE,
-        check=True,
-        text=True,
-    )
+    assert listing_calls == [
+        (
+            (["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],),
+            {
+                "cwd": root,
+                "stdout": subprocess.PIPE,
+                "check": True,
+                "text": True,
+            },
+        ),
+    ]
     assert (template / "pkg/mod.py").read_bytes() == (root / "pkg/mod.py").read_bytes()
     assert (template / "pkg/link.py").is_symlink()
     assert (template / "pkg/link.py").readlink() == Path("mod.py")
@@ -4319,7 +4563,18 @@ def test_shard_runs_real_snapshot_and_collection_around_the_process_boundary(
     snapshot = tmp_path / "snapshot"
     template = _template(root, tmp_path)
     shard = Shard(source="pkg/mod.py", filters=("pkg.mod.x_f__mutmut_*",))
-    run = Mock(side_effect=_finish_recorded_run)
+    runs: list[tuple[list[str], Path, dict[str, str], float | None]] = []
+
+    def run(
+        argv: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        timeout_sec: float | None,
+    ) -> subprocess.CompletedProcess[str]:
+        runs.append((argv, cwd, env, timeout_sec))
+        return _finish_recorded_run(argv, cwd=cwd, env=env, timeout_sec=timeout_sec)
+
     monkeypatch.setattr(mutated, "_run_mutmut", run)
     report = run_shard(
         root,
@@ -4335,9 +4590,8 @@ def test_shard_runs_real_snapshot_and_collection_around_the_process_boundary(
     assert report.outcomes["survived"] == ("pkg.mod.x_f__mutmut_2",)
     assert report.diffs["pkg.mod.x_f__mutmut_2"].startswith("--- pkg/mod.py\n")
     assert not snapshot.exists()
-    assert run.call_count == 2
-    first = run.call_args_list[0]
-    assert first.args == (
+    first, _ = runs
+    assert first == (
         [
             sys.executable,
             "-m",
@@ -4348,12 +4602,10 @@ def test_shard_runs_real_snapshot_and_collection_around_the_process_boundary(
             "pkg.mod.x_f__mutmut_*",
             "pkg.mod.x_f__mutmut_1",
         ],
+        snapshot,
+        fork_safe_env(single_threaded_env(os.environ)),
+        7.0,
     )
-    assert first.kwargs == {
-        "cwd": snapshot,
-        "env": fork_safe_env(single_threaded_env(os.environ)),
-        "timeout_sec": 7.0,
-    }
 
 
 def _finish_recorded_run(
@@ -4402,11 +4654,15 @@ def test_shards_share_one_real_template_and_remove_their_snapshots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = _repo(tmp_path / "repo", body="def f():\n    return 1\n")
-    listing = Mock(return_value=subprocess.CompletedProcess([], 0, "pkg/mod.py\0", ""))
+    listings: list[list[str]] = []
+
+    def listing(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        listings.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "pkg/mod.py\0", "")
+
     monkeypatch.setattr(subprocess, "run", listing)
     seen: list[tuple[Path, Path, Path, int, float | None]] = []
-    run = Mock(side_effect=partial(_inspect_shard_template, seen=seen))
-    monkeypatch.setattr(mutated, "_mutate", run)
+    monkeypatch.setattr(mutated, "_mutate", partial(_inspect_shard_template, seen=seen))
     shards = tuple(Shard(source=f"{n}.py", filters=(f"{n}.x_f*",)) for n in "ab")
     reports = mutated._run_shards(
         root,
@@ -4416,7 +4672,7 @@ def test_shards_share_one_real_template_and_remove_their_snapshots(
         timeout_sec=3.0,
     )
     assert len(reports) == 2
-    listing.assert_called_once()
+    assert len(listings) == 1
     assert len(seen) == 2
     assert {item[0] for item in seen} == {root}
     assert len({item[1] for item in seen}) == 2
@@ -4473,7 +4729,7 @@ def test_capped_selection_restores_configuration_even_after_failure(
     root = _repo(tmp_path, body=_MANY)
     before = configuration.config()
     if fails:
-        monkeypatch.setattr(mutated, "_declared", Mock(side_effect=ValueError("parse")))
+        monkeypatch.setattr(mutated, "_declared", _unparsable)
         with pytest.raises(ValueError, match=r"^parse$"):
             mutated.select_functions(
                 root,
@@ -4493,6 +4749,10 @@ def test_capped_selection_restores_configuration_even_after_failure(
             most=1,
         )[0]
     assert configuration.config() is before
+
+
+def _unparsable(*_args: object, **_kwargs: object) -> NoReturn:
+    raise ValueError("parse")
 
 
 def test_shard_priority_is_count_then_source_not_insertion_or_filter_order() -> None:
@@ -4579,33 +4839,65 @@ def test_timed_out_process_is_drained_even_if_its_group_already_exited(
     *,
     already_gone: bool,
 ) -> None:
-    process = Mock(pid=123, returncode=-9)
     expired = subprocess.TimeoutExpired(["job"], 0.1)
-    communicate = Mock(side_effect=[expired, ("tail", "err")])
-    process.communicate = communicate
-    process.__enter__ = Mock(return_value=process)
-    process.__exit__ = Mock(return_value=False)
-    popen = Mock(return_value=process)
-    kill = Mock(side_effect=ProcessLookupError if already_gone else None)
+    process = _TimedOutProcess(expired)
+    popen_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def popen(*args: object, **kwargs: object) -> object:
+        popen_calls.append((args, kwargs))
+        return process
+
+    killed: list[tuple[int, int]] = []
+
+    def killpg(pid: int, sig: int) -> None:
+        killed.append((pid, sig))
+        if already_gone:
+            raise ProcessLookupError
+
     monkeypatch.setattr(subprocess, "Popen", popen)
-    monkeypatch.setattr(os, "killpg", kill)
+    monkeypatch.setattr(os, "killpg", killpg)
     with pytest.raises(subprocess.TimeoutExpired) as raised:
         mutated._run_mutmut(["job"], cwd=tmp_path, env={}, timeout_sec=0.1)
     assert raised.value is expired
-    kill.assert_called_once_with(123, signal.SIGKILL)
-    assert [call.kwargs for call in communicate.call_args_list] == [
-        {"timeout": 0.1},
-        {},
+    assert killed == [(123, signal.SIGKILL)]
+    assert process.timeouts == [0.1, None]
+    assert popen_calls == [
+        (
+            (["job"],),
+            {
+                "cwd": tmp_path,
+                "env": {},
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "start_new_session": True,
+            },
+        ),
     ]
-    popen.assert_called_once_with(
-        ["job"],
-        cwd=tmp_path,
-        env={},
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
+
+
+class _TimedOutProcess:
+    """Stands in for a ``Popen`` whose first wait expires and second drains."""
+
+    pid = 123
+    returncode = -9
+
+    def __init__(self, expired: subprocess.TimeoutExpired) -> None:
+        self.expired = expired
+        self.timeouts: list[float | None] = []
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        """Expire on the first wait; drain on the second."""
+        self.timeouts.append(timeout)
+        if len(self.timeouts) == 1:
+            raise self.expired
+        return ("tail", "err")
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_: object) -> bool:
+        return False
 
 
 def test_report_includes_all_failed_files_and_the_full_attention_message(
@@ -4680,8 +4972,11 @@ def test_change_selection_checks_each_subprocess_failure(
     monkeypatch: pytest.MonkeyPatch,
     command: str,
 ) -> None:
-    run = Mock(side_effect=partial(_failing_git_command, command=command))
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        partial(_failing_git_command, command=command),
+    )
     with pytest.raises(subprocess.CalledProcessError) as raised:
         mutated.changed_functions(tmp_path, base="BASE", files=["mod.py"])
     assert raised.value.returncode == 128
@@ -4714,18 +5009,23 @@ def test_changed_functions_parses_multiple_line_hunks_deletions_and_untracked_fi
     (tmp_path / "XXXX").write_text("def unrelated(): return 5\n")
     (tmp_path / "+++ /dev").mkdir(parents=True)
     (tmp_path / "+++ /dev/null").write_text("def unrelated(): return 6\n")
-    run = Mock(
-        side_effect=[
-            subprocess.CompletedProcess(
-                [],
-                0,
-                "+++ b/mod.py\n@@ -1,2 +1,2 @@\n@@ -5 +5,0 @@\n"
-                "+++ /dev/null\n@@ -1 +1 @@\n+++ b/last.py\n@@ -1 +1 @@\n",
-                "",
-            ),
-            subprocess.CompletedProcess([], 0, "mod.py last.py", ""),
-        ],
-    )
+    answers = [
+        subprocess.CompletedProcess(
+            [],
+            0,
+            "+++ b/mod.py\n@@ -1,2 +1,2 @@\n@@ -5 +5,0 @@\n"
+            "+++ /dev/null\n@@ -1 +1 @@\n+++ b/last.py\n@@ -1 +1 @@\n",
+            "",
+        ),
+        subprocess.CompletedProcess([], 0, "mod.py last.py", ""),
+    ]
+
+    argvs: list[list[str]] = []
+
+    def run(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        argvs.append(argv)
+        return answers.pop(0)
+
     monkeypatch.setattr(subprocess, "run", run)
     assert mutated.changed_functions(
         tmp_path,
@@ -4737,9 +5037,7 @@ def test_changed_functions_parses_multiple_line_hunks_deletions_and_untracked_fi
         "new.x_inline__mutmut_*",
         "last.x_last__mutmut_*",
     }
-    assert run.call_args_list[1].args == (
-        ["git", "ls-files", "--", "mod.py", "new.py", "last.py"],
-    )
+    assert argvs[1] == ["git", "ls-files", "--", "mod.py", "new.py", "last.py"]
 
 
 def test_unsupported_bare_identifier_message_has_no_empty_class_prefix(
@@ -4783,7 +5081,19 @@ def test_capped_selection_checks_only_until_the_rate_can_fill_the_cap(
 
     monkeypatch.setattr(mutated, "_file_filters", file_filters)
     full = function_filters(root, files=files, sources=("pkg",))
-    check = Mock(wraps=mutated.function_filters)
+    checked: list[tuple[list[str], int]] = []
+    real = mutated.function_filters
+
+    def check(
+        root: Path,
+        *,
+        files: list[str],
+        sources: tuple[str, ...],
+        workers: int = 1,
+    ) -> tuple[str, ...]:
+        checked.append((files, workers))
+        return real(root, files=files, sources=sources, workers=workers)
+
     monkeypatch.setattr(mutated, "function_filters", check)
     selected, _ = mutated.select_functions(
         root,
@@ -4795,11 +5105,9 @@ def test_capped_selection_checks_only_until_the_rate_can_fill_the_cap(
         preferred=frozenset(full),
     )
     assert selected == sample(full, seed="", size=size)
-    assert check.call_count == checks
-    assert all(call.kwargs["workers"] == 1 for call in check.call_args_list)
-    assert all(
-        len(cast(list[str], call.kwargs["files"])) == 1 for call in check.call_args_list
-    )
+    assert len(checked) == checks
+    assert all(workers == 1 for _, workers in checked)
+    assert all(len(files) == 1 for files, _ in checked)
 
 
 def test_multiple_broken_sidecars_are_reported_on_separate_lines(
@@ -4828,17 +5136,26 @@ def test_parallel_shard_count_is_an_integer_below_the_file_count(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     names = [f"pkg/m{n}.py" for n in range(5)]
+
+    def function_filters(*_args: object, **_kwargs: object) -> object:
+        return tuple(f"pkg.m{n}.x_f__mutmut_*" for n in range(5))
+
     monkeypatch.setattr(
         mutated,
         "function_filters",
-        Mock(return_value=tuple(f"pkg.m{n}.x_f__mutmut_*" for n in range(5))),
+        function_filters,
     )
-    run = Mock(return_value=[])
+    parallels: list[object] = []
+
+    def run(*_args: object, parallel: object, **_kwargs: object) -> list[ShardReport]:
+        parallels.append(parallel)
+        return []
+
     monkeypatch.setattr(mutated, "_run_shards", run)
     monkeypatch.setattr(sys, "argv", ["mutated", "--workers", "3", *names])
     assert mutated.main() == 0
-    assert run.call_args.kwargs["parallel"] == 3
-    assert isinstance(run.call_args.kwargs["parallel"], int)
+    assert parallels == [3]
+    assert isinstance(parallels[0], int)
 
 
 def test_parallel_file_mapping_keeps_large_batches_runnable(
@@ -4857,17 +5174,20 @@ def test_indexed_function_reads_do_not_parse_the_whole_generated_module(
 ) -> None:
     _recorded_results(tmp_path, indexed=True)
     path = tmp_path / "mutants/pkg/mod.py"
-    parse = Mock(wraps=cst.parse_module)
+    parsed: list[str] = []
+    real = cst.parse_module
+
+    def parse(source: str) -> cst.Module:
+        parsed.append(source)
+        return real(source)
+
     monkeypatch.setattr(cst, "parse_module", parse)
     assert mutated._functions("pkg.mod.x_f__mutmut_2", path=path) == (
         "def f():\n    return cast(int, value)\n",
         "def f():\n    return cast(int, value) + 1\n",
     )
-    assert parse.call_count == 2
-    assert all(
-        len(cast(str, call.args[0])) < path.stat().st_size
-        for call in parse.call_args_list
-    )
+    assert len(parsed) == 2
+    assert all(len(source) < path.stat().st_size for source in parsed)
 
 
 def test_result_collection_reads_utf8_source_under_an_ascii_default(
@@ -4907,7 +5227,18 @@ def test_remainder_cli_executes_only_requested_null_ids(
     before = configuration.config()
     reference = Path(spec["remainder"]["reference"])
     retained = reference.read_bytes(), reference.with_suffix(".py.meta").read_bytes()
-    run = Mock(side_effect=_finish_exact_remainder)
+    argvs: list[list[str]] = []
+
+    def run(
+        argv: list[str],
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+        timeout_sec: float | None,
+    ) -> subprocess.CompletedProcess[str]:
+        argvs.append(argv)
+        return _finish_exact_remainder(argv, cwd=cwd, env=env, timeout_sec=timeout_sec)
+
     monkeypatch.setattr(mutated, "_run_mutmut", run)
     monkeypatch.setattr(mutated, "copy_template", _copy_remainder_template)
     monkeypatch.chdir(root)
@@ -4919,8 +5250,8 @@ def test_remainder_cli_executes_only_requested_null_ids(
 
     assert mutated.main() == 0
 
-    assert run.call_count == 1
-    assert run.call_args.args[0] == [
+    (argv,) = argvs
+    assert argv == [
         sys.executable,
         "-m",
         "codedoctor.mutation.mutmut_cli",
@@ -5056,7 +5387,12 @@ def test_remainder_rejects_invalid_identity_before_execution(
         remainder["fingerprints"][path] = remainder["fingerprints"]["pkg/mod.py"]
     manifest = tmp_path / "remainder.json"
     manifest.write_text(json.dumps(to_plain(spec)))
-    run = Mock()
+    run_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def run(*args: object, **kwargs: object) -> NoReturn:
+        run_calls.append((args, kwargs))
+        raise AssertionError(f"unexpected call: {args} {kwargs}")
+
     monkeypatch.setattr(mutated, "_run_mutmut", run)
     monkeypatch.setattr(mutated, "copy_template", _copy_remainder_template)
     monkeypatch.chdir(root)
@@ -5068,7 +5404,7 @@ def test_remainder_rejects_invalid_identity_before_execution(
 
     assert mutated.main() == 1
 
-    run.assert_not_called()
+    assert run_calls == []
     captured = capsys.readouterr()
     error = captured.err
     expected = reason.format(name=remainder["mutants"][0])
@@ -5116,9 +5452,25 @@ def test_remainder_compares_the_canonical_snapshot_configuration(
         )
     manifest = tmp_path / "remainder.json"
     manifest.write_text(json.dumps(to_plain(spec)))
-    generate = Mock(wraps=mutate_file_contents)
+    generated: list[str] = []
+
+    def generate(filename: str, code: str) -> MutatedFile:
+        generated.append(filename)
+        return mutate_file_contents(filename, code)
+
     monkeypatch.setattr(mutmut_adapter, "mutate_file_contents", generate)
-    run = Mock(side_effect=_finish_exact_remainder)
+    argvs: list[list[str]] = []
+
+    def run(
+        argv: list[str],
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+        timeout_sec: float | None,
+    ) -> subprocess.CompletedProcess[str]:
+        argvs.append(argv)
+        return _finish_exact_remainder(argv, cwd=cwd, env=env, timeout_sec=timeout_sec)
+
     monkeypatch.setattr(mutated, "_run_mutmut", run)
     monkeypatch.setattr(mutated, "copy_template", _copy_remainder_template)
     monkeypatch.chdir(root)
@@ -5130,8 +5482,8 @@ def test_remainder_compares_the_canonical_snapshot_configuration(
 
     assert mutated.main() == (1 if config_change else 0)
 
-    assert run.call_count == (0 if config_change else 1)
-    assert generate.call_count == (0 if config_change else 1)
+    assert len(argvs) == (0 if config_change else 1)
+    assert len(generated) == (0 if config_change else 1)
     if config_change:
         assert ": remainder input changed: pyproject.toml\n" in capsys.readouterr().err
 
@@ -5173,14 +5525,19 @@ def test_remainder_requires_retained_identity(
     manifest.write_text(
         json.dumps({"source": spec["source"], "filters": spec["filters"]}),
     )
-    run = Mock()
+    run_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def run(*args: object, **kwargs: object) -> NoReturn:
+        run_calls.append((args, kwargs))
+        raise AssertionError(f"unexpected call: {args} {kwargs}")
+
     monkeypatch.setattr(mutated, "_run_mutmut", run)
     monkeypatch.chdir(root)
     monkeypatch.setattr(sys, "argv", ["mutated", "--remainder", str(manifest)])
 
     assert mutated.main() == 1
 
-    run.assert_not_called()
+    assert run_calls == []
     assert capsys.readouterr().err == (
         "mutation: cannot select functions: remainder manifest must include retained identity\n"
         f"mutation: guide: {Path(mutated.__file__).with_name('README.md').resolve().as_uri()}\n"
@@ -5193,7 +5550,12 @@ def test_remainder_cannot_be_combined_with_paths(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A manifest names its own source; paths beside it would be silently dropped."""
-    run = Mock()
+    run_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def run(*args: object, **kwargs: object) -> NoReturn:
+        run_calls.append((args, kwargs))
+        raise AssertionError(f"unexpected call: {args} {kwargs}")
+
     monkeypatch.setattr(mutated, "_run_mutmut", run)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
@@ -5206,7 +5568,7 @@ def test_remainder_cannot_be_combined_with_paths(
         mutated.main()
 
     assert exited.value.code == 2
-    run.assert_not_called()
+    assert run_calls == []
     assert capsys.readouterr().err.endswith(
         "error: remainder manifests cannot be combined with paths\n"
         f"mutation: guide: {Path(mutated.__file__).with_name('README.md').resolve().as_uri()}\n",
@@ -5249,7 +5611,12 @@ def test_empty_remainder_does_not_launch_a_whole_function(
     spec["remainder"]["mutants"] = []
     manifest = tmp_path / "remainder.json"
     manifest.write_text(json.dumps(to_plain(spec)))
-    run = Mock()
+    run_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def run(*args: object, **kwargs: object) -> NoReturn:
+        run_calls.append((args, kwargs))
+        raise AssertionError(f"unexpected call: {args} {kwargs}")
+
     monkeypatch.setattr(mutated, "_run_mutmut", run)
     monkeypatch.setattr(mutated, "copy_template", _copy_remainder_template)
     monkeypatch.chdir(root)
@@ -5261,7 +5628,7 @@ def test_empty_remainder_does_not_launch_a_whole_function(
 
     assert mutated.main() == 0
 
-    run.assert_not_called()
+    assert run_calls == []
 
 
 @pytest.mark.parametrize(
@@ -5297,7 +5664,18 @@ def test_remainder_reference_keeps_its_adjacent_metadata(
     spec["remainder"]["reference"] = alias.name
     manifest = tmp_path / "remainder.json"
     manifest.write_text(json.dumps(to_plain(spec)))
-    run = Mock(side_effect=_finish_exact_remainder)
+    argvs: list[list[str]] = []
+
+    def run(
+        argv: list[str],
+        *,
+        cwd: Path,
+        env: Mapping[str, str],
+        timeout_sec: float | None,
+    ) -> subprocess.CompletedProcess[str]:
+        argvs.append(argv)
+        return _finish_exact_remainder(argv, cwd=cwd, env=env, timeout_sec=timeout_sec)
+
     monkeypatch.setattr(mutated, "_run_mutmut", run)
     monkeypatch.setattr(mutated, "copy_template", _copy_remainder_template)
     monkeypatch.chdir(root)
@@ -5309,7 +5687,7 @@ def test_remainder_reference_keeps_its_adjacent_metadata(
 
     assert mutated.main() == (0 if identity == "matching" else 1)
 
-    assert run.call_count == (1 if identity == "matching" else 0)
+    assert len(argvs) == (1 if identity == "matching" else 0)
 
 
 class _RemainderInput(TypedDict):
@@ -5419,49 +5797,31 @@ def test_failure_guide_is_installed_relative_and_printed_once(
     root = _repo(tmp_path / "repo", body="def f(value):\n    return value + 1\n")
     monkeypatch.chdir(root)
     monkeypatch.setattr(sys, "argv", ["mutated", "pkg/mod.py"])
+    reports = {
+        "execution": [ShardReport(source="pkg/mod.py", failure="execution detail")],
+        "findings": [
+            ShardReport(
+                source="pkg/mod.py",
+                outcomes={"unchecked": ("pkg.mod.x_f__mutmut_*",)},
+            ),
+        ],
+        "success": [ShardReport(source="pkg/mod.py")],
+    }
+
+    def select(*_args: object, **_kwargs: object) -> NoReturn:
+        raise ValueError("selection detail")
+
+    def run(*_args: object, **_kwargs: object) -> list[ShardReport]:
+        if failure == "snapshot":
+            raise OSError("snapshot detail")
+        return reports[failure]
+
     if failure == "selection":
-        monkeypatch.setattr(
-            mutated,
-            "select_functions",
-            Mock(side_effect=ValueError("selection detail")),
-        )
-    elif failure == "snapshot":
-        monkeypatch.setattr(
-            mutated,
-            "_run_shards",
-            Mock(side_effect=OSError("snapshot detail")),
-        )
-    elif failure == "execution":
-        monkeypatch.setattr(
-            mutated,
-            "_run_shards",
-            Mock(
-                return_value=[
-                    ShardReport(source="pkg/mod.py", failure="execution detail"),
-                ],
-            ),
-        )
-    elif failure == "findings":
-        monkeypatch.setattr(
-            mutated,
-            "_run_shards",
-            Mock(
-                return_value=[
-                    ShardReport(
-                        source="pkg/mod.py",
-                        outcomes={"unchecked": ("pkg.mod.x_f__mutmut_*",)},
-                    ),
-                ],
-            ),
-        )
+        monkeypatch.setattr(mutated, "select_functions", select)
     elif failure == "arguments":
         monkeypatch.setattr(sys, "argv", ["mutated", "--not-a-flag"])
     else:
-        monkeypatch.setattr(
-            mutated,
-            "_run_shards",
-            Mock(return_value=[ShardReport(source="pkg/mod.py")]),
-        )
+        monkeypatch.setattr(mutated, "_run_shards", run)
     if failure == "arguments":
         with pytest.raises(SystemExit) as stopped:
             mutated.main()

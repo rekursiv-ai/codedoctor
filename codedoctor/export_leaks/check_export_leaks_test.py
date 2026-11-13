@@ -11,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
-from unittest.mock import Mock
 
 import ast
 import subprocess
@@ -210,7 +209,11 @@ def test_main_returns_zero_when_no_packages_are_touched(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A path with no export owner is a successful no-op."""
-    monkeypatch.setattr(check_export_leaks, "touched_configs", Mock(return_value=[]))
+
+    def touched_configs(*_args: object, **_kwargs: object) -> list[Path]:
+        return []
+
+    monkeypatch.setattr(check_export_leaks, "touched_configs", touched_configs)
     monkeypatch.setattr(sys, "argv", ["check_export_leaks", "docs/none.md"])
     assert check_export_leaks.main() == 0
 
@@ -271,10 +274,14 @@ def test_check_returns_export_stderr_on_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Export failures are returned without attempting formatting."""
+
+    def run(*_args: object, **_kwargs: object) -> object:
+        return subprocess.CompletedProcess([], 2, "", "bad export\n")
+
     monkeypatch.setattr(
         subprocess,
         "run",
-        Mock(return_value=subprocess.CompletedProcess([], 2, "", "bad export\n")),
+        run,
     )
     assert check_export_leaks.check(_package(tmp_path, "loop/a"), root=tmp_path) == (
         "bad export"
@@ -287,15 +294,20 @@ def test_check_exports_into_scratch_then_format_checks_that_tree(
 ) -> None:
     """The export command, and the tree the format check then reads, exactly."""
     config = _package(tmp_path, "loop/a")
-    run = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+    run_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def run(*args: object, **kwargs: object) -> object:
+        run_calls.append((args, kwargs))
+        return subprocess.CompletedProcess([], 0, "", "")
+
     monkeypatch.setattr(subprocess, "run", run)
 
     assert check_export_leaks.check(config, root=tmp_path) == ""
 
-    export, fmt = run.call_args_list
-    scratch = Path(cast("list[str]", export.args[0])[7])
+    export, fmt = run_calls
+    scratch = Path(cast("list[str]", export[0][0])[7])
     assert scratch.name.startswith("leak-check-")
-    assert export.args == (
+    assert export[0] == (
         [
             sys.executable,
             "-m",
@@ -308,14 +320,14 @@ def test_check_exports_into_scratch_then_format_checks_that_tree(
             "--force",
         ],
     )
-    assert export.kwargs == {
+    assert export[1] == {
         "cwd": tmp_path,
         "capture_output": True,
         "text": True,
         "check": False,
     }
-    assert fmt.args == ([sys.executable, "-m", "ruff", "format", "--check", "."],)
-    assert fmt.kwargs == {
+    assert fmt[0] == ([sys.executable, "-m", "ruff", "format", "--check", "."],)
+    assert fmt[1] == {
         "cwd": scratch,
         "capture_output": True,
         "text": True,
@@ -368,10 +380,13 @@ def test_export_exit_is_failure_even_without_diagnostics(
     monkeypatch: pytest.MonkeyPatch,
     stderr: str,
 ) -> None:
+    def run(*_args: object, **_kwargs: object) -> object:
+        return subprocess.CompletedProcess([], 1, "", stderr)
+
     monkeypatch.setattr(
         subprocess,
         "run",
-        Mock(return_value=subprocess.CompletedProcess([], 1, "", stderr)),
+        run,
     )
     assert (
         check_export_leaks.check(_package(tmp_path, "loop/a"), root=tmp_path)
@@ -384,10 +399,14 @@ def test_format_check_reports_ruff_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Formatting failures include the exported-tree explanation and output."""
+
+    def run(*_args: object, **_kwargs: object) -> object:
+        return subprocess.CompletedProcess([], 1, "bad.py\n", "")
+
     monkeypatch.setattr(
         subprocess,
         "run",
-        Mock(return_value=subprocess.CompletedProcess([], 1, "bad.py\n", "")),
+        run,
     )
     assert check_export_leaks._format_check(tmp_path) == (
         "exported tree is not format-clean (the export rewrites line lengths; "
@@ -401,10 +420,14 @@ def test_format_check_accepts_clean_tree(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A clean exported tree returns no diagnostic."""
+
+    def run(*_args: object, **_kwargs: object) -> object:
+        return subprocess.CompletedProcess([], 0, "", "")
+
     monkeypatch.setattr(
         subprocess,
         "run",
-        Mock(return_value=subprocess.CompletedProcess([], 0, "", "")),
+        run,
     )
     assert check_export_leaks._format_check(tmp_path) == ""
 

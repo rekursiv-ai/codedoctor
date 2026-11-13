@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, cast
-from unittest.mock import Mock
 
 import argparse
 import sys
@@ -285,7 +284,13 @@ def test_reporting_uses_only_file_scoped_context_queries(
         raise AssertionError("Global context scans must not run per source")
 
     monkeypatch.setattr(coverage.CoverageData, "set_query_contexts", global_query)
-    reader = Mock(wraps=coverage.CoverageData)
+    opened: list[tuple[str, bool]] = []
+    real = coverage.CoverageData
+
+    def reader(*, basename: str, read_only: bool) -> coverage.CoverageData:
+        opened.append((basename, read_only))
+        return real(basename=basename, read_only=read_only)
+
     monkeypatch.setattr(coverage, "CoverageData", reader)
     assert coverage_floor.report(
         data,
@@ -297,7 +302,7 @@ def test_reporting_uses_only_file_scoped_context_queries(
     assert capsys.readouterr().out == (
         "coverage-floor: pkg/m.py at 75% is below 100%; missed 4\n"
     )
-    reader.assert_called_once_with(basename=str(data), read_only=True)
+    assert opened == [(str(data), True)]
     assert data.read_bytes() == before
 
 

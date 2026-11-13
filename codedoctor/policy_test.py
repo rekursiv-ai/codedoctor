@@ -40,6 +40,11 @@ def test_defaults_use_the_canonical_checker_policy() -> None:
         "pathlib.Path.home"
         not in defaults["ruff"]["lint"]["flake8-tidy-imports"]["banned-api"]
     )
+    assert defaults["ruff"]["lint"]["flake8-tidy-imports"]["banned-api"][
+        "unittest.mock"
+    ] == {
+        "msg": "Write a fake or a plain function; a mock answers calls no test scripted.",
+    }
     assert defaults["codedoctor"]["lint"]["set"] == [
         "import-alias.first-party=netv",
         "test-footer.runner=codedoctor.lib.testing.runner",
