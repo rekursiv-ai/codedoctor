@@ -167,6 +167,11 @@ exclude = [".github/**", ".codespell-ignore"]
 [tool.hatch.version]
 source = "vcs"
 
+# The checker tables (ruff, ty, basedpyright, pyrefly, mutmut, pytest, coverage)
+# ship as every client's policy, so this delta leaves them as the monorepo's:
+# config/tests/install_parity_test.py fails on any override here. The one
+# exception is a warning filter whose category this package does not install,
+# which the policy drops for every client too (`policy._portable_filter`).
 [tool.pytest.ini_options]
 python_files = ["*_test.py", "test_*.py"]
 markers = [
@@ -249,7 +254,6 @@ filterwarnings = [
     # and the warning becomes an InternalTorchDynamoError. The warning is
     # raised from C++, so no module scope can narrow it further.
     "ignore:The .grad attribute of a Tensor that is not a leaf Tensor:UserWarning",
-    "ignore:Using .httpx. with .starlette.testclient. is deprecated:starlette.exceptions.StarletteDeprecationWarning",
     "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning",  # starlette 1.6.0 issue.
     "ignore:'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16:DeprecationWarning:zendriver.core.connection",
     # NEVER ADD MORE FILTERWARNINGS!
