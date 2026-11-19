@@ -3,6 +3,18 @@
 All notable codedoctor changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.1.6 - 2026-11-18
+
+### Added
+
+- `biome-check` hook formats and lints TypeScript, JavaScript and CSS;
+  `codedoctor install` writes a `biome.json` when the project has none.
+- `codedoctor cargo` stage for Rust projects.
+
+### Changed
+
+- Update lint rules, mutation testing, typecheck, and affected-file selection.
+
 ## 0.1.5 - 2026-11-08
 
 ### Changed
