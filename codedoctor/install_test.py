@@ -454,14 +454,15 @@ def test_hook_config_upgrades_every_field_of_an_owned_hook(
 
     configured = install.hook_config(original)
 
-    # Arguments included: an older release's hook without `--check` gains it.
+    # Arguments included: an older release's hook without `--check` gains it. The
+    # paths a project skips are its own, so its `exclude` stays.
     assert yaml.safe_load(configured) == {
         "repos": [
             {
                 "repo": "checks",
                 "rev": "v2",
                 "hooks": [
-                    {"id": "size", "exclude": "new", "args": ["--maxkb=800"]},
+                    {"id": "size", "exclude": "old\n", "args": ["--maxkb=800"]},
                     {"id": "mine", "entry": "mine"},
                     {"id": "fmt", "name": "fmt-pre", "stages": ["pre-commit"]},
                     {"id": "fmt", "name": "fmt-mid"},
@@ -494,6 +495,41 @@ def test_replacing_a_hook_ending_in_a_block_list_keeps_the_next_key(last: str) -
             {"repo": "other"},
         ],
     }
+
+
+def test_a_project_exclude_is_kept_and_a_missing_one_is_not_added(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected: list[dict[str, object]] = [
+        {
+            "repo": "checks",
+            "hooks": [
+                {"id": "a", "name": "new", "exclude": "pkg"},
+                {"id": "b", "name": "new", "exclude": "pkg"},
+            ],
+        },
+    ]
+    original = (
+        "repos:\n- repo: checks\n  hooks:\n"
+        "  - id: a\n    name: old\n    exclude: mine\n"
+        "  - id: b\n    name: old\n"
+    )
+    monkeypatch.setattr(install, "_hook_repos", lambda: expected)
+
+    configured = install.hook_config(original)
+
+    assert yaml.safe_load(configured) == {
+        "repos": [
+            {
+                "repo": "checks",
+                "hooks": [
+                    {"id": "a", "name": "new", "exclude": "mine"},
+                    {"id": "b", "name": "new"},
+                ],
+            },
+        ],
+    }
+    assert install.hook_config(configured) == configured
 
 
 def test_replacing_owned_hooks_skips_what_it_cannot_rewrite_in_place() -> None:
