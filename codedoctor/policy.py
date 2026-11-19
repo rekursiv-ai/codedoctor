@@ -64,6 +64,13 @@ def defaults(
         }
     }
     table(result, key="mutmut")["source_paths"] = ["."]
+    filters = _lookup(result, path=("pytest", "ini_options", "filterwarnings"))
+    if filters is not None:
+        _set(
+            result,
+            path=("pytest", "ini_options", "filterwarnings"),
+            value=[f for f in from_plain(filters, list[str]) if _portable_filter(f)],
+        )
     ruff = table(result, key="ruff")
     ruff["target-version"] = "py" + python_version.replace(".", "")
     lint = table(ruff, key="lint")
@@ -266,6 +273,31 @@ def _assign(
         if chain[depth]:
             return
         del chain[depth - 1][path[depth - 1]]
+
+
+def _set(
+    tree: dict[str, MutablePlainTree],
+    *,
+    path: tuple[str, ...],
+    value: MutablePlainTree,
+) -> None:
+    """Assign ``value`` at an existing ``path`` of plain nested dicts."""
+    parent = tree
+    for segment in path[:-1]:
+        child = parent[segment]
+        assert isinstance(child, dict)
+        parent = child
+    parent[path[-1]] = value
+
+
+# Pytest imports a filter's category, but matches its module field as a regex. A
+# category from a package the client lacks fails every run under `error`: the
+# monorepo's starlette filter broke codedoctor's own CI (2026-11-19).
+def _portable_filter(spec: str) -> bool:
+    """Whether a ``filterwarnings`` entry's category exists without extra packages."""
+    parts = spec.split(":")
+    category = parts[2] if len(parts) > 2 else ""
+    return "." not in category or category.split(".")[0] in {"pytest", "warnings"}
 
 
 def _packaged_pyproject() -> str:

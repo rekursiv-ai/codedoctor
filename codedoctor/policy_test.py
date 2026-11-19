@@ -71,6 +71,37 @@ def test_defaults_read_a_given_template_and_keep_each_checker_table(
     assert "unrelated" not in defaults
 
 
+def test_defaults_drop_warning_filters_whose_category_a_client_may_lack(
+    tmp_path: Path,
+) -> None:
+    """Pytest imports a filter's category; under ``error`` a missing one fails."""
+    template = tmp_path / "pyproject.toml"
+    template.write_text(
+        "[tool.pytest.ini_options]\nfilterwarnings = [\n"
+        '    "error",\n'
+        '    "ignore::pytest.PytestUnraisableExceptionWarning",\n'
+        '    "ignore:x:UserWarning",\n'
+        '    "ignore:x:DeprecationWarning:torch._dynamo",\n'
+        '    "ignore:x:warnings.WarningMessage",\n'
+        '    "ignore:x:starlette.exceptions.StarletteDeprecationWarning",\n'
+        "]\n",
+    )
+
+    defaults = policy.defaults(name="x", template=template)
+
+    assert defaults["pytest"] == {
+        "ini_options": {
+            "filterwarnings": [
+                "error",
+                "ignore::pytest.PytestUnraisableExceptionWarning",
+                "ignore:x:UserWarning",
+                "ignore:x:DeprecationWarning:torch._dynamo",
+                "ignore:x:warnings.WarningMessage",
+            ],
+        },
+    }
+
+
 def test_packaged_policy_is_the_source_of_new_rules(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
