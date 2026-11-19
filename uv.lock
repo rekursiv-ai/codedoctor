@@ -255,7 +255,6 @@ wheels = [
 
 [[package]]
 name = "codedoctor"
-version = "0.1.6"
 source = { editable = "." }
 default-groups = ["cuda", "dev"]
 dependencies = [
@@ -430,7 +429,7 @@ requires-dist = [
     { name = "typing-extensions", specifier = ">=4.16.0" },
     { name = "wrapt", marker = "extra == 'mutation'", specifier = ">=2.5.2" },
 ]
-provides-extras = ["cpu", "cu126", "cu128", "cu130", "cu132", "cu134", "coverage", "mutation", "notebook"]
+provides-extras = ["coverage", "cpu", "cu126", "cu128", "cu130", "cu132", "cu134", "mutation", "notebook"]
 
 [package.metadata.requires-dev]
 cuda = [

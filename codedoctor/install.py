@@ -181,7 +181,10 @@ def hook_config(text: str, *, notebooks: bool = False) -> str:
         }
         for repo in _hook_repos()
     ]
-    text = _upgrade_hooks(text, expected=expected)
+    text = _replace_owned_hooks(
+        _upgrade_hooks(text, expected=expected),
+        expected=expected,
+    )
     document = from_plain(
         yaml.safe_load(text),
         dict[str, object],
@@ -275,7 +278,7 @@ def _upgrade_hooks(text: str, *, expected: list[dict[str, object]]) -> str:
                         values["id"] = "codedoctor-lint"
                         name = fields.get("name")
                         if isinstance(name, ScalarNode) and name.value == "houselint":
-                            values["name"] = "codedoctor lint"
+                            values["name"] = "codedoctor-lint"
                     for key, value in values.items():
                         scalar = fields[key]
                         assert isinstance(scalar, ScalarNode)
@@ -294,6 +297,118 @@ def _upgrade_hooks(text: str, *, expected: list[dict[str, object]]) -> str:
     for start, end, replacement in sorted(changes, reverse=True):
         text = text[:start] + replacement + text[end:]
     return text
+
+
+# Codedoctor owns every field of its hooks but `args` (`_hook_identity`), so a hook an
+# older release wrote is rewritten to this release's definition. Refusing instead left
+# every client of 0.1.5 unable to install 0.1.6 (2026-11-18). Hooks pair by repository
+# and id, in order, since one id may run twice (ruff-format before and after the fix).
+def _replace_owned_hooks(text: str, *, expected: list[dict[str, object]]) -> str:
+    """Rewrite in place each Codedoctor hook whose definition differs, keeping `args`."""
+    wanted: dict[
+        tuple[object, object],
+        list[tuple[dict[str, object], dict[str, object]]],
+    ]
+    wanted = {}
+    for repo in expected:
+        for hook in from_plain(repo["hooks"], list[dict[str, object]]):
+            wanted.setdefault((repo["repo"], hook["id"]), []).append((repo, hook))
+    seen: dict[tuple[object, object], int] = {}
+    changes: dict[int, tuple[int, str]] = {}
+    for repo_node in _block_repos(text):
+        repo_fields = _scalar_fields(repo_node)
+        hooks = {
+            key.value: value
+            for key, value in repo_node.value
+            if isinstance(key, ScalarNode)
+        }.get("hooks")
+        if "repo" not in repo_fields or not isinstance(hooks, SequenceNode):
+            continue
+        for hook_node in hooks.value:
+            if not isinstance(hook_node, MappingNode) or hook_node.flow_style:
+                continue
+            present = from_plain(
+                yaml.safe_load(_node_text(text, hook_node)),
+                dict[str, object],
+            )
+            key = (repo_fields["repo"].value, present.get("id"))
+            index = seen.get(key, 0)
+            seen[key] = index + 1
+            if index >= len(wanted.get(key, [])):
+                continue
+            owner, hook = wanted[key][index]
+            for field, value in owner.items():
+                scalar = repo_fields.get(field)
+                if (
+                    isinstance(value, str)
+                    and scalar is not None
+                    and scalar.value != value
+                ):
+                    changes[scalar.start_mark.index] = (
+                        scalar.end_mark.index,
+                        json.dumps(value),
+                    )
+            replacement = {k: v for k, v in hook.items() if k != "args"}
+            if "args" in present:
+                replacement["args"] = present["args"]
+            if replacement != present:
+                changes[hook_node.start_mark.index] = _hook_text(
+                    text,
+                    node=hook_node,
+                    hook=replacement,
+                )
+    for start, (end, value) in sorted(changes.items(), reverse=True):
+        text = text[:start] + value + text[end:]
+    return text
+
+
+def _block_repos(text: str) -> list[MappingNode]:
+    """Return the block-style repository mappings under the top-level `repos`."""
+    loader = yaml.SafeLoader(text)
+    try:
+        tree = loader.get_single_node()
+    finally:
+        loader.dispose()
+    if not isinstance(tree, MappingNode):
+        return []
+    repos = {
+        key.value: value for key, value in tree.value if isinstance(key, ScalarNode)
+    }.get("repos")
+    if not isinstance(repos, SequenceNode) or repos.flow_style:
+        return []
+    return [
+        node
+        for node in repos.value
+        if isinstance(node, MappingNode) and not node.flow_style
+    ]
+
+
+def _scalar_fields(node: MappingNode) -> dict[str, ScalarNode]:
+    """Return a mapping's scalar-valued fields by key."""
+    return {
+        key.value: value
+        for key, value in node.value
+        if isinstance(key, ScalarNode) and isinstance(value, ScalarNode)
+    }
+
+
+def _node_text(text: str, node: MappingNode) -> str:
+    """Return a block mapping's source, its first line dedented to match the rest."""
+    start, end = node.start_mark, node.value[-1][1].end_mark
+    return " " * int(start.column) + text[int(start.index) : int(end.index)]
+
+
+def _hook_text(
+    text: str,
+    *,
+    node: MappingNode,
+    hook: dict[str, object],
+) -> tuple[int, str]:
+    """Return the end index and block YAML replacing ``node`` with ``hook``."""
+    end = int(node.value[-1][1].end_mark.index)
+    dumped = yaml.safe_dump(hook, sort_keys=False, width=1 << 30)
+    body = textwrap.indent(dumped, " " * int(node.start_mark.column)).lstrip(" ")
+    return end, body if text[end - 1] == "\n" else body.rstrip("\n")
 
 
 def _hook_identity(
