@@ -2201,8 +2201,9 @@ def _mutant_function_name(
 
 def _failure_guide() -> None:
     sys.stdout.flush()
+    guide = _THIS.with_name("README.md").resolve().as_uri()
     sys.stderr.write(
-        f"mutation: guide: {_THIS.with_name('README.md').resolve().as_uri()}\n",
+        f"mutation: FAILED: read {guide} before changing code or tests\n",
     )
 
 
