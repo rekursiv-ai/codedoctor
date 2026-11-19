@@ -276,7 +276,7 @@ def test_appending_repositories_preserves_leading_whitespace(
     )
 
 
-def test_hook_config_preserves_project_owned_arguments(
+def test_hook_config_takes_the_packaged_arguments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     defaults: list[dict[str, object]] = [
@@ -291,7 +291,9 @@ def test_hook_config_preserves_project_owned_arguments(
         "repos:\n- repo: checks\n  rev: v1\n  hooks:\n"
         "  - id: size\n    args: [--maxkb=5000, --enforce-all]\n"
     )
-    assert install.hook_config(original) == original
+    configured = install.hook_config(original)
+    assert yaml.safe_load(configured) == {"repos": defaults}
+    assert install.hook_config(configured) == configured
 
 
 @pytest.mark.parametrize("flow", [False, True])
@@ -299,7 +301,7 @@ def test_hook_config_preserves_project_owned_arguments(
     "prefix",
     ["uv run", "uv --quiet run --frozen --group pre-commit"],
 )
-def test_hook_config_upgrades_stage_commands_without_losing_custom_arguments(
+def test_hook_config_upgrades_stage_commands(
     monkeypatch: pytest.MonkeyPatch,
     flow: bool,
     prefix: str,
@@ -321,8 +323,7 @@ def test_hook_config_upgrades_stage_commands_without_losing_custom_arguments(
     original = (
         "# Keep this comment.\nrepos:\n- repo: local\n  hooks:\n"
         "  - &lint\n    id: houselint\n    name: houselint\n    language: system\n"
-        "    entry: uv run python -m codedoctor.lint\n"
-        "    args: [--fix, '']  # Report only.\n"
+        "    entry: uv run python -m codedoctor.lint  # Keep this too.\n"
         "  - *lint\n"
         "  - id: codegraph-sync\n    entry: >-\n"
         "      uv run python -m codedoctor.affected.codegraph_sync\n"
@@ -334,20 +335,9 @@ def test_hook_config_upgrades_stage_commands_without_losing_custom_arguments(
             default_flow_style=True,
         )
     configured = install.hook_config(original)
-    expected = [
-        {
-            "repo": "local",
-            "hooks": [
-                {**hooks[0], "args": ["--fix", ""]},
-                {**hooks[0], "args": ["--fix", ""]},
-                *hooks[1:],
-            ],
-        },
-    ]
+    expected = [{"repo": "local", "hooks": [hooks[0], hooks[0], *hooks[1:]]}]
     assert yaml.safe_load(configured) == {"repos": expected}
     assert "# Keep this comment." in configured
-    if not flow:
-        assert "# Report only." in configured
     assert install.hook_config(configured) == configured
 
 
@@ -436,7 +426,7 @@ def test_hook_config_rejects_a_hook_moved_to_another_repository() -> None:
         install.hook_config(original)
 
 
-def test_hook_config_upgrades_owned_hooks_keeping_project_arguments(
+def test_hook_config_upgrades_every_field_of_an_owned_hook(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     defaults: list[dict[str, object]] = [
@@ -464,18 +454,18 @@ def test_hook_config_upgrades_owned_hooks_keeping_project_arguments(
 
     configured = install.hook_config(original)
 
-    # A project that dropped an owned hook's `args` keeps them dropped.
+    # Arguments included: an older release's hook without `--check` gains it.
     assert yaml.safe_load(configured) == {
         "repos": [
             {
                 "repo": "checks",
                 "rev": "v2",
                 "hooks": [
-                    {"id": "size", "exclude": "new", "args": ["--maxkb=5000"]},
+                    {"id": "size", "exclude": "new", "args": ["--maxkb=800"]},
                     {"id": "mine", "entry": "mine"},
                     {"id": "fmt", "name": "fmt-pre", "stages": ["pre-commit"]},
                     {"id": "fmt", "name": "fmt-mid"},
-                    {"id": "fmt", "name": "fmt"},
+                    {"id": "fmt", "name": "fmt", "args": ["--check"]},
                 ],
             },
         ],
@@ -483,6 +473,27 @@ def test_hook_config_upgrades_owned_hooks_keeping_project_arguments(
     assert "# Keep this comment." in configured
     assert "# Keep the project's hook." in configured
     assert install.hook_config(configured) == configured
+
+
+@pytest.mark.parametrize("last", ["types:\n    - text\n", "types: [text]\n"])
+def test_replacing_a_hook_ending_in_a_block_list_keeps_the_next_key(last: str) -> None:
+    """A block list's end mark sits past the newline and the next line's indent."""
+    expected: list[dict[str, object]] = [
+        {"repo": "local", "hooks": [{"id": "b", "types": ["text"], "args": ["--x"]}]},
+    ]
+    original = f"repos:\n- hooks:\n  - id: b\n    {last}  repo: local\n- repo: other\n"
+
+    replaced = install._replace_owned_hooks(original, expected=expected)
+
+    assert yaml.safe_load(replaced) == {
+        "repos": [
+            {
+                "hooks": [{"id": "b", "types": ["text"], "args": ["--x"]}],
+                "repo": "local",
+            },
+            {"repo": "other"},
+        ],
+    }
 
 
 def test_replacing_owned_hooks_skips_what_it_cannot_rewrite_in_place() -> None:

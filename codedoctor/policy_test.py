@@ -34,17 +34,11 @@ def test_defaults_use_the_canonical_checker_policy() -> None:
     assert defaults["mutmut"]["source_paths"] == ["."]
     assert defaults["coverage-floor"]["floor"] == ["=100"]
     assert defaults["pytest"]["ini_options"]["filterwarnings"][0] == "error"
-    assert "*_test.py" in defaults["coverage"]["run"]["omit"]
     assert "executionEnvironments" not in defaults["basedpyright"]
     assert (
         "pathlib.Path.home"
         not in defaults["ruff"]["lint"]["flake8-tidy-imports"]["banned-api"]
     )
-    assert defaults["ruff"]["lint"]["flake8-tidy-imports"]["banned-api"][
-        "unittest.mock"
-    ] == {
-        "msg": "Write a fake or a plain function; a mock answers calls no test scripted.",
-    }
     assert defaults["codedoctor"]["lint"]["set"] == [
         "import-alias.first-party=netv",
         "test-footer.runner=codedoctor.lib.testing.runner",
@@ -56,6 +50,25 @@ def test_defaults_use_the_canonical_checker_policy() -> None:
     assert "loop/" not in rendered
     assert "loop." not in rendered
     assert "website/" not in rendered
+
+
+def test_defaults_read_a_given_template_and_keep_each_checker_table(
+    tmp_path: Path,
+) -> None:
+    template = tmp_path / "pyproject.toml"
+    template.write_text(
+        '[tool.coverage.run]\nomit = ["*_given.py"]\n'
+        "[tool.coverage.report]\nshow_missing = true\n"
+        "[tool.unrelated]\nkept = false\n",
+    )
+
+    defaults = policy.defaults(name="x", template=template)
+
+    assert defaults["coverage"] == {
+        "run": {"omit": ["*_given.py"]},
+        "report": {"show_missing": True},
+    }
+    assert "unrelated" not in defaults
 
 
 def test_packaged_policy_is_the_source_of_new_rules(
@@ -229,6 +242,31 @@ def test_refresh_preserves_an_overridden_table() -> None:
     policy.apply(document, defaults={"ruff": {"lint": {"select": ["ALL"]}}})
     assert document["tool"]["ruff"]["lint"] == "custom"
     assert policy.overrides(document) == ("ruff.lint.select",)
+
+
+def test_refresh_removes_the_tables_a_retired_setting_empties() -> None:
+    """Ruff rejects a banned-api entry left without its ``msg``."""
+    keep: MutablePlainTree = {"keep": {"msg": "k"}}
+    both: MutablePlainTree = {"keep": {"msg": "k"}, "retired": {"msg": "r"}}
+    select: MutablePlainTree = ["ALL"]
+    document = tomlkit.document()
+
+    def lint(banned: MutablePlainTree, **more: MutablePlainTree) -> MutablePlainTree:
+        return {"lint": {"flake8-tidy-imports": {"banned-api": banned}, **more}}
+
+    policy.apply(document, defaults={"ruff": lint(both)})
+    policy.apply(document, defaults={"ruff": lint(keep, select=select)})
+    text = tomlkit.dumps(document)
+    assert tomllib.loads(text)["tool"]["ruff"]["lint"] == {
+        "flake8-tidy-imports": {"banned-api": {"keep": {"msg": "k"}}},
+        "select": ["ALL"],
+    }
+    assert "retired" not in text
+    policy.apply(document, defaults={"ruff": {"lint": {"select": select}}})
+    assert "flake8-tidy-imports" not in tomlkit.dumps(document)
+    # Retiring a checker's last setting removes the checker's table as well.
+    policy.apply(document, defaults={"ty": {"a": True}})
+    assert "ruff" not in tomllib.loads(tomlkit.dumps(document))["tool"]
 
 
 def test_refresh_removes_nested_retired_settings() -> None:
