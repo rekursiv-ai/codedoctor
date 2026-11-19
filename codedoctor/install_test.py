@@ -307,7 +307,7 @@ def test_hook_config_upgrades_stage_commands_without_losing_custom_arguments(
     hooks: list[dict[str, object]] = [
         {
             "id": "codedoctor-lint",
-            "name": "codedoctor lint",
+            "name": "codedoctor-lint",
             "entry": "uv run python -m codedoctor lint",
             "language": "system",
         },
@@ -427,13 +427,83 @@ def test_hook_migration_visits_recursive_metadata_once() -> None:
     assert install._upgrade_hooks(original, expected=[]) == original
 
 
-def test_hook_config_rejects_conflicting_hook_before_writing() -> None:
+def test_hook_config_rejects_a_hook_moved_to_another_repository() -> None:
     original = (
-        "repos:\n  - repo: local\n    hooks:\n      - id: ty-check\n"
-        "        entry: different\n"
+        "repos:\n  - repo: https://example.invalid/mine\n    rev: v1\n    hooks:\n"
+        "      - id: ty-check\n        entry: different\n"
     )
     with pytest.raises(ValueError, match="ty-check"):
         install.hook_config(original)
+
+
+def test_hook_config_upgrades_owned_hooks_keeping_project_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    defaults: list[dict[str, object]] = [
+        {
+            "repo": "checks",
+            "rev": "v2",
+            "hooks": [
+                {"id": "size", "exclude": "new", "args": ["--maxkb=800"]},
+                {"id": "fmt", "name": "fmt-pre", "stages": ["pre-commit"]},
+                {"id": "fmt", "name": "fmt-mid"},
+                {"id": "fmt", "name": "fmt", "args": ["--check"]},
+            ],
+        },
+    ]
+    monkeypatch.setattr(install, "_hook_repos", lambda: defaults)
+    original = (
+        "# Keep this comment.\nrepos:\n- repo: checks\n  rev: v1  # Pinned.\n  hooks:\n"
+        "  - id: size\n    exclude: |\n      old\n    args: [--maxkb=5000]\n"
+        "  # Keep the project's hook.\n"
+        "  - id: mine\n    entry: mine\n"
+        "  - id: fmt\n    name: fmt-pre\n"
+        "  - id: fmt\n    name: old-mid\n"
+        "  - id: fmt\n    name: old\n"
+    )
+
+    configured = install.hook_config(original)
+
+    # A project that dropped an owned hook's `args` keeps them dropped.
+    assert yaml.safe_load(configured) == {
+        "repos": [
+            {
+                "repo": "checks",
+                "rev": "v2",
+                "hooks": [
+                    {"id": "size", "exclude": "new", "args": ["--maxkb=5000"]},
+                    {"id": "mine", "entry": "mine"},
+                    {"id": "fmt", "name": "fmt-pre", "stages": ["pre-commit"]},
+                    {"id": "fmt", "name": "fmt-mid"},
+                    {"id": "fmt", "name": "fmt"},
+                ],
+            },
+        ],
+    }
+    assert "# Keep this comment." in configured
+    assert "# Keep the project's hook." in configured
+    assert install.hook_config(configured) == configured
+
+
+def test_replacing_owned_hooks_skips_what_it_cannot_rewrite_in_place() -> None:
+    expected: list[dict[str, object]] = [
+        {
+            "repo": "checks",
+            "hooks": [{"id": "a", "name": "new"}, {"id": "b", "name": "new"}],
+        },
+    ]
+    original = (
+        "repos:\n"
+        "- hooks: [{id: a, name: old}]\n"
+        "- repo: bare\n"
+        "- repo: checks\n  hooks:\n"
+        "  - {id: a, name: old}\n"
+        "  - id: b\n    name: old\n"
+    )
+
+    replaced = install._replace_owned_hooks(original, expected=expected)
+
+    assert replaced == original.replace("    name: old\n", "    name: new\n")
 
 
 _PACKAGED_HOOKS = """\
