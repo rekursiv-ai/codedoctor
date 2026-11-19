@@ -3564,7 +3564,7 @@ def test_an_unparsable_paired_test_fails_its_file_in_one_line(
     assert capsys.readouterr().err == (
         "[mutated] 1/1 pkg/mod.py: FAILED\n"
         "mutation: pkg/mod.py: t_test.py:1: invalid syntax\n"
-        f"mutation: guide: {Path(mutated.__file__).with_name('README.md').resolve().as_uri()}\n"
+        f"mutation: FAILED: read {Path(mutated.__file__).with_name('README.md').resolve().as_uri()} before changing code or tests\n"
     )
     assert snapshot_calls == []
 
@@ -3600,7 +3600,7 @@ def test_main_fails_when_the_template_cannot_be_copied(
     assert mutated.main() == 1
     assert capsys.readouterr().err == (
         f"mutation: cannot prepare the snapshot: {error}\n"
-        f"mutation: guide: {Path(mutated.__file__).with_name('README.md').resolve().as_uri()}\n"
+        f"mutation: FAILED: read {Path(mutated.__file__).with_name('README.md').resolve().as_uri()} before changing code or tests\n"
     )
 
 
@@ -5540,7 +5540,7 @@ def test_remainder_requires_retained_identity(
     assert run_calls == []
     assert capsys.readouterr().err == (
         "mutation: cannot select functions: remainder manifest must include retained identity\n"
-        f"mutation: guide: {Path(mutated.__file__).with_name('README.md').resolve().as_uri()}\n"
+        f"mutation: FAILED: read {Path(mutated.__file__).with_name('README.md').resolve().as_uri()} before changing code or tests\n"
     )
 
 
@@ -5571,7 +5571,7 @@ def test_remainder_cannot_be_combined_with_paths(
     assert run_calls == []
     assert capsys.readouterr().err.endswith(
         "error: remainder manifests cannot be combined with paths\n"
-        f"mutation: guide: {Path(mutated.__file__).with_name('README.md').resolve().as_uri()}\n",
+        f"mutation: FAILED: read {Path(mutated.__file__).with_name('README.md').resolve().as_uri()} before changing code or tests\n",
     )
 
 
@@ -5863,7 +5863,9 @@ def test_arguments_do_not_require_mutmut_configuration(
     assert completed.stderr.count(guide) == (1 if status else 0)
     if status:
         assert "unrecognized arguments: --invalid-packaging-proof" in completed.stderr
-        assert completed.stderr.endswith(f"mutation: guide: {guide}\n")
+        assert completed.stderr.endswith(
+            f"mutation: FAILED: read {guide} before changing code or tests\n",
+        )
 
 
 def test_failure_guide_follows_buffered_diagnostics(
@@ -5882,7 +5884,7 @@ def test_failure_guide_follows_buffered_diagnostics(
         stdout.flush()
         guide = Path(mutated.__file__).with_name("README.md").resolve().as_uri()
         assert output.getvalue().decode() == (
-            f"survivor diagnostic\nmutation: guide: {guide}\n"
+            f"survivor diagnostic\nmutation: FAILED: read {guide} before changing code or tests\n"
         )
 
 
