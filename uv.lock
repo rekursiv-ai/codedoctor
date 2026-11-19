@@ -255,7 +255,7 @@ wheels = [
 
 [[package]]
 name = "codedoctor"
-version = "0.1.5"
+version = "0.1.6"
 source = { editable = "." }
 default-groups = ["cuda", "dev"]
 dependencies = [
@@ -1999,7 +1999,7 @@ wheels = [
 [[package]]
 name = "rekursiv-ai-typings"
 version = "0.1.18"
-source = { git = "https://github.com/rekursiv-ai/typings?branch=main#87f12ae6eabdf68b90107a02a02da15884af92b0" }
+source = { git = "https://github.com/rekursiv-ai/typings?branch=main#14727d63f6b52b8c423f04257511cc6149449cc6" }
 
 [[package]]
 name = "requests"
