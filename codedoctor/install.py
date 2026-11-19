@@ -299,13 +299,14 @@ def _upgrade_hooks(text: str, *, expected: list[dict[str, object]]) -> str:
     return text
 
 
-# Codedoctor owns every field of its hooks, `args` included, so a hook an older release
-# wrote is rewritten to this release's definition. Refusing left every client of 0.1.5
-# unable to install 0.1.6; keeping a project's `args` kept `biome-check` without the
-# flags the monorepo runs it with (2026-11-18/19). Hooks pair by repository and id, in
-# order, since one id may run twice (ruff-format before and after the fix).
+# Codedoctor owns what its hooks run, `args` included, so a hook an older release wrote
+# is rewritten to this release's definition. Refusing left every client of 0.1.5 unable
+# to install 0.1.6; keeping a project's `args` kept `biome-check` without the flags the
+# monorepo runs it with (2026-11-18/19). Which paths a hook skips is the project's:
+# `exclude` stays as the project wrote it. Hooks pair by repository and id, in order,
+# since one id may run twice (ruff-format before and after the fix).
 def _replace_owned_hooks(text: str, *, expected: list[dict[str, object]]) -> str:
-    """Rewrite in place each Codedoctor hook whose definition differs."""
+    """Rewrite in place each Codedoctor hook whose definition differs, but `exclude`."""
     wanted: dict[
         tuple[object, object],
         list[tuple[dict[str, object], dict[str, object]]],
@@ -349,11 +350,14 @@ def _replace_owned_hooks(text: str, *, expected: list[dict[str, object]]) -> str
                         scalar.end_mark.index,
                         json.dumps(value),
                     )
-            if hook != present:
+            replacement = {k: v for k, v in hook.items() if k != "exclude"}
+            if "exclude" in present:
+                replacement["exclude"] = present["exclude"]
+            if replacement != present:
                 changes[hook_node.start_mark.index] = _hook_text(
                     text,
                     node=hook_node,
-                    hook=hook,
+                    hook=replacement,
                 )
     for start, (end, value) in sorted(changes.items(), reverse=True):
         text = text[:start] + value + text[end:]
@@ -416,8 +420,11 @@ def _hook_identity(
     *,
     hook: dict[str, object],
 ) -> tuple[dict[str, object], dict[str, object]]:
-    """Match hook definitions field for field."""
-    return ({key: value for key, value in repo.items() if key != "hooks"}, hook)
+    """Match hook definitions field for field, but the project's ``exclude``."""
+    return (
+        {key: value for key, value in repo.items() if key != "hooks"},
+        {key: value for key, value in hook.items() if key != "exclude"},
+    )
 
 
 def _hook_repos() -> list[dict[str, object]]:
