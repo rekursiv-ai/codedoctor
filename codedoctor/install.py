@@ -299,12 +299,13 @@ def _upgrade_hooks(text: str, *, expected: list[dict[str, object]]) -> str:
     return text
 
 
-# Codedoctor owns every field of its hooks but `args` (`_hook_identity`), so a hook an
-# older release wrote is rewritten to this release's definition. Refusing instead left
-# every client of 0.1.5 unable to install 0.1.6 (2026-11-18). Hooks pair by repository
-# and id, in order, since one id may run twice (ruff-format before and after the fix).
+# Codedoctor owns every field of its hooks, `args` included, so a hook an older release
+# wrote is rewritten to this release's definition. Refusing left every client of 0.1.5
+# unable to install 0.1.6; keeping a project's `args` kept `biome-check` without the
+# flags the monorepo runs it with (2026-11-18/19). Hooks pair by repository and id, in
+# order, since one id may run twice (ruff-format before and after the fix).
 def _replace_owned_hooks(text: str, *, expected: list[dict[str, object]]) -> str:
-    """Rewrite in place each Codedoctor hook whose definition differs, keeping `args`."""
+    """Rewrite in place each Codedoctor hook whose definition differs."""
     wanted: dict[
         tuple[object, object],
         list[tuple[dict[str, object], dict[str, object]]],
@@ -348,14 +349,11 @@ def _replace_owned_hooks(text: str, *, expected: list[dict[str, object]]) -> str
                         scalar.end_mark.index,
                         json.dumps(value),
                     )
-            replacement = {k: v for k, v in hook.items() if k != "args"}
-            if "args" in present:
-                replacement["args"] = present["args"]
-            if replacement != present:
+            if hook != present:
                 changes[hook_node.start_mark.index] = _hook_text(
                     text,
                     node=hook_node,
-                    hook=replacement,
+                    hook=hook,
                 )
     for start, (end, value) in sorted(changes.items(), reverse=True):
         text = text[:start] + value + text[end:]
@@ -405,10 +403,12 @@ def _hook_text(
     hook: dict[str, object],
 ) -> tuple[int, str]:
     """Return the end index and block YAML replacing ``node`` with ``hook``."""
-    end = int(node.value[-1][1].end_mark.index)
+    # A block list's end mark sits past its newline and the next line's indent;
+    # end the span at its last character so what follows keeps its line.
+    end = len(text[: int(node.value[-1][1].end_mark.index)].rstrip())
     dumped = yaml.safe_dump(hook, sort_keys=False, width=1 << 30)
     body = textwrap.indent(dumped, " " * int(node.start_mark.column)).lstrip(" ")
-    return end, body if text[end - 1] == "\n" else body.rstrip("\n")
+    return end, body.rstrip("\n")
 
 
 def _hook_identity(
@@ -416,19 +416,15 @@ def _hook_identity(
     *,
     hook: dict[str, object],
 ) -> tuple[dict[str, object], dict[str, object]]:
-    """Match hook definitions without taking ownership of project arguments."""
-    return (
-        {key: value for key, value in repo.items() if key != "hooks"},
-        {key: value for key, value in hook.items() if key != "args"},
-    )
+    """Match hook definitions field for field."""
+    return ({key: value for key, value in repo.items() if key != "hooks"}, hook)
 
 
 def _hook_repos() -> list[dict[str, object]]:
-    """Read Codedoctor's hooks, the source of truth for every installed repository."""
-    config = from_plain(
-        yaml.safe_load(_THIS.with_name("install_hooks.yaml").read_text()),
-        dict[str, object],
-    )
+    """Read the hooks every installed repository runs: the monorepo's, as exported."""
+    packaged = _THIS.with_name("install_hooks.yaml")
+    text = packaged.read_text() if packaged.is_file() else ""
+    config = from_plain(yaml.safe_load(text), dict[str, object])
     return from_plain(config["repos"], list[dict[str, object]])
 
 

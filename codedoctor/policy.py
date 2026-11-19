@@ -25,25 +25,24 @@ _THIS: Final[Path] = Path(__file__).resolve()
 type TomlTable = Table | InlineTable | OutOfOrderTableProxy
 
 
-def defaults(*, name: str, python_version: str = "3.12") -> dict[str, MutablePlainTree]:
+def defaults(
+    *,
+    name: str,
+    python_version: str = "3.12",
+    template: Path | None = None,
+) -> dict[str, MutablePlainTree]:
     """Read portable policy from the same configuration this package checks itself.
 
     Args:
       name: Consumer's first-party package and user-directory namespace.
       python_version: Oldest supported Python major/minor version.
+      template: A ``pyproject.toml`` to read instead of the packaged one.
 
     Returns:
       tools: Native checker tables, with checkout-specific settings removed.
 
     """
-    template = _THIS.with_name("install_defaults.toml")
-    if not template.is_file():
-        template = next(
-            folder / "pyproject.toml"
-            for folder in _THIS.parents
-            if (folder / "pyproject.toml").is_file()
-        )
-    content = template.read_text()
+    content = template.read_text() if template else _packaged_pyproject()
     # Read, never edited: tomllib parses it in a tenth of tomlkit's time.
     tools = table(
         from_plain(tomllib.loads(content), dict[str, MutablePlainTree]),
@@ -249,15 +248,33 @@ def _assign(
     path: tuple[str, ...],
     value: MutablePlainTree,
 ) -> None:
-    parent = tools
+    chain = [tools]
     for segment in path[:-1]:
-        if segment in parent and not isinstance(
-            parent[segment],
+        if segment in chain[-1] and not isinstance(
+            chain[-1][segment],
             (Table, InlineTable, OutOfOrderTableProxy),
         ):
             return
-        parent = table(parent, key=segment)
-    if value is None:
-        del parent[path[-1]]
-    else:
-        parent[path[-1]] = value
+        chain.append(table(chain[-1], key=segment))
+    if value is not None:
+        chain[-1][path[-1]] = value
+        return
+    del chain[-1][path[-1]]
+    # A table the deletion empties goes too: ruff rejects a banned-api entry
+    # left as a bare header without its `msg` (netv, 2026-11-19).
+    for depth in range(len(chain) - 1, 0, -1):
+        if chain[depth]:
+            return
+        del chain[depth - 1][path[depth - 1]]
+
+
+def _packaged_pyproject() -> str:
+    """Return the ``pyproject.toml`` this package publishes."""
+    template = _THIS.with_name("install_defaults.toml")
+    if not template.is_file():
+        template = next(
+            folder / "pyproject.toml"
+            for folder in _THIS.parents
+            if (folder / "pyproject.toml").is_file()
+        )
+    return template.read_text()

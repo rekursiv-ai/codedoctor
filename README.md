@@ -21,9 +21,10 @@ uv run --group pre-commit pre-commit run --all-files
 ## Repository setup
 
 `codedoctor install` adds a locked `pre-commit` dependency group and installs
-the pre-commit Git hook. It creates missing configuration and preserves
-existing hooks, comments, hook arguments, and the project's Python support range.
-Running it again does not duplicate hooks.
+the pre-commit Git hook. It creates missing configuration, rewrites each of its
+own hooks to this release's definition, arguments included, and preserves the
+project's other hooks, comments, and Python support range. Running it again does
+not duplicate hooks.
 Notebook tooling is opt-in: `codedoctor install --notebooks` adds the notebook
 extra and the `nbstripout` and `jupytext-sync` hooks. Default installs add
 neither. Existing hooks are preserved, including previously added notebook
