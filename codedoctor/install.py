@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Final
 
 import fnmatch
+import itertools
 import json
 import re
 import shutil
@@ -222,9 +223,9 @@ def hook_config(text: str, *, notebooks: bool = False) -> str:
         ]
         if hooks:
             missing.append({**repo, "hooks": hooks})
-    if not missing:
-        return text
-    return _append_repos(text, repos=missing)
+    if missing:
+        text = _append_repos(text, repos=missing)
+    return _order_owned_repos(text, expected=expected)
 
 
 def _upgrade_hooks(text: str, *, expected: list[dict[str, object]]) -> str:
@@ -357,6 +358,64 @@ def _replace_owned_hooks(text: str, *, expected: list[dict[str, object]]) -> str
     for start, (end, value) in sorted(changes.items(), reverse=True):
         text = text[:start] + value + text[end:]
     return text
+
+
+def _order_owned_repos(text: str, *, expected: list[dict[str, object]]) -> str:
+    """Move the repositories holding only Codedoctor hooks into the packaged order."""
+    positions: dict[tuple[object, object], list[int]] = {}
+    for rank, key in enumerate(
+        (repo["repo"], hook["id"])
+        for repo in expected
+        for hook in from_plain(repo["hooks"], list[dict[str, object]])
+    ):
+        positions.setdefault(key, []).append(rank)
+    # An id can appear twice (ruff-format); each copy gets its own rank.
+    ranks = {key: iter(value) for key, value in positions.items()}
+    nodes = _block_repos(text)
+    owned: list[tuple[int, int]] = []
+    for index, node in enumerate(nodes):
+        repo = _scalar_fields(node).get("repo")
+        hooks = {
+            key.value: value for key, value in node.value if isinstance(key, ScalarNode)
+        }.get("hooks")
+        node_ranks: list[int | None] = []
+        for hook in hooks.value if isinstance(hooks, SequenceNode) else []:
+            assert isinstance(hook, MappingNode)
+            key = (repo and repo.value, _scalar_fields(hook)["id"].value)
+            node_ranks.append(next(ranks.get(key, iter(())), None))
+        first = node_ranks[0] if node_ranks else None
+        if first is not None and None not in node_ranks:
+            owned.append((first, index))
+    slots = [index for _, index in owned]
+    moved = [index for _, index in sorted(owned)]
+    if moved == slots:
+        return text
+    first_mark = nodes[0].start_mark
+    bounds = [
+        _content_end(text, index=first_mark.index - first_mark.column),
+        *(_content_end(text, index=node.end_mark.index) for node in nodes),
+    ]
+    chunks = [text[start:end] for start, end in itertools.pairwise(bounds)]
+    if not chunks[-1].endswith("\n"):
+        chunks[-1] += "\n"
+    order = iter(moved)
+    return (
+        text[: bounds[0]]
+        + "".join(
+            chunks[next(order)] if index in slots else chunk
+            for index, chunk in enumerate(chunks)
+        )
+        + text[bounds[-1] :]
+    )
+
+
+def _content_end(text: str, *, index: int) -> int:
+    """Return the index past the last line before ``index`` that is not blank or comment."""
+    # A node's end mark lies past any comments after it.
+    lines = text[:index].splitlines(keepends=True)
+    while lines and (not lines[-1].strip() or lines[-1].lstrip().startswith("#")):
+        lines.pop()
+    return sum(map(len, lines))
 
 
 def _block_repos(text: str) -> list[MappingNode]:

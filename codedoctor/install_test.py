@@ -229,6 +229,7 @@ def test_hook_config_creates_valid_empty_config(notebooks: bool | None) -> None:
         "repos: [{repo: local, hooks: [{id: custom, entry: custom, language: system, name: custom}]}]\n",
         "repos:\n- repo: local\n  hooks: []\nfail_fast: true\n",
         "repos: [{repo: local}]\n",
+        "repos:\n- repo: local\n",
         "\n# Keep the leading blank line.\nfail_fast: true\n\n",
         "\n# Keep the leading blank line.\nrepos:\n- repo: local\n  hooks: []\n\n",
     ],
@@ -294,6 +295,93 @@ def test_hook_config_takes_the_packaged_arguments(
     configured = install.hook_config(original)
     assert yaml.safe_load(configured) == {"repos": defaults}
     assert install.hook_config(configured) == configured
+
+
+def _repo_hook_ids(text: str) -> list[tuple[object, list[str]]]:
+    """Return each repository and its hook ids, in file order."""
+    config = from_plain(yaml.safe_load(text), dict[str, MutablePlainTree])
+    return [
+        (
+            repo["repo"],
+            [hook["id"] for hook in from_plain(repo["hooks"], list[dict[str, str]])],
+        )
+        for repo in from_plain(config["repos"], list[dict[str, MutablePlainTree]])
+    ]
+
+
+@pytest.mark.parametrize(
+    ("original", "kept"),
+    [
+        # An older release's config lacks `b`, so it is appended after `c`.
+        (
+            (
+                "repos:\n- repo: local\n  hooks:\n  - id: a\n"
+                "- repo: mine\n  hooks:\n  - id: m\n"
+                "# About c.\n- repo: local\n  hooks:\n  - id: c\n"
+            ),
+            "# About c.\n- repo: local\n  hooks:\n  - id: c\n",
+        ),
+        # The project holds `b` last.
+        (
+            (
+                "repos:\n- repo: local\n  hooks:\n  - id: a\n"
+                "- repo: mine\n  hooks:\n  - id: m\n"
+                "# About c.\n- repo: local\n  hooks:\n  - id: c\n"
+                "- repo: local\n  hooks:\n  - id: b\n"
+            ),
+            "# About c.\n- repo: local\n  hooks:\n  - id: c\n",
+        ),
+        # The first repository moves, and the file ends without a newline.
+        (
+            (
+                "\n# Lead.\nrepos:\n  # About b.\n  - repo: local\n    hooks:\n      - id: b\n"
+                "  - repo: mine\n    hooks:\n      - id: m\n"
+                "  - repo: local\n    hooks:\n      - id: a\n"
+                "  - repo: local\n    hooks:\n      - id: c"
+            ),
+            (
+                "\n# Lead.\nrepos:\n  - repo: local\n    hooks:\n      - id: a\n"
+                "  - repo: mine\n    hooks:\n      - id: m\n"
+                "  # About b.\n  - repo: local\n    hooks:\n      - id: b\n"
+            ),
+        ),
+    ],
+)
+def test_hook_config_puts_owned_repositories_in_the_packaged_order(
+    original: str,
+    kept: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    defaults: list[dict[str, object]] = [
+        {"repo": "local", "hooks": [{"id": hook}]} for hook in ("a", "b", "c")
+    ]
+    monkeypatch.setattr(install, "_hook_repos", lambda: defaults)
+    configured = install.hook_config(original)
+    assert _repo_hook_ids(configured) == [
+        ("local", ["a"]),
+        ("mine", ["m"]),
+        ("local", ["b"]),
+        ("local", ["c"]),
+    ]
+    assert kept in configured
+    assert configured.endswith("\n")
+    assert "\n\n" not in configured
+    assert install.hook_config(configured) == configured
+
+
+def test_hook_config_ranks_each_occurrence_of_a_repeated_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    defaults: list[dict[str, object]] = [
+        {"repo": "local", "hooks": [{"id": hook}]} for hook in ("a", "b", "a", "a")
+    ]
+    monkeypatch.setattr(install, "_hook_repos", lambda: defaults)
+    original = "repos:\n" + "".join(
+        f"- repo: local\n  hooks:\n  - id: {hook}\n" for hook in ("a", "a", "b", "a")
+    )
+    assert _repo_hook_ids(install.hook_config(original)) == [
+        ("local", [hook]) for hook in ("a", "b", "a", "a")
+    ]
 
 
 @pytest.mark.parametrize("flow", [False, True])
