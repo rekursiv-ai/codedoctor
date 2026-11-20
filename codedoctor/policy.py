@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast, overload
 
+import functools
 import tomllib
 
 from tomlkit.container import OutOfOrderTableProxy
@@ -42,7 +43,7 @@ def defaults(
       tools: Native checker tables, with checkout-specific settings removed.
 
     """
-    content = template.read_text() if template else _packaged_pyproject()
+    content = template.read_text() if template else _packaged_pyproject(_THIS)
     # Read, never edited: tomllib parses it in a tenth of tomlkit's time.
     tools = table(
         from_plain(tomllib.loads(content), dict[str, MutablePlainTree]),
@@ -300,13 +301,14 @@ def _portable_filter(spec: str) -> bool:
     return "." not in category or category.split(".")[0] in {"pytest", "warnings"}
 
 
-def _packaged_pyproject() -> str:
-    """Return the ``pyproject.toml`` this package publishes."""
-    template = _THIS.with_name("install_defaults.toml")
+@functools.cache
+def _packaged_pyproject(module: Path) -> str:
+    """Return the ``pyproject.toml`` the package of ``module`` publishes."""
+    template = module.with_name("install_defaults.toml")
     if not template.is_file():
         template = next(
             folder / "pyproject.toml"
-            for folder in _THIS.parents
+            for folder in module.parents
             if (folder / "pyproject.toml").is_file()
         )
     return template.read_text()

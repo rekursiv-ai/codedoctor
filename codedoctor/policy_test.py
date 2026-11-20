@@ -124,6 +124,19 @@ def test_packaged_policy_is_the_source_of_new_rules(
     assert defaults["mutmut"]["mutate_only_covered_lines"] is True
 
 
+def test_packaged_policy_is_read_once_per_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rendering it again on each call cost every ``project_config`` ~45 ms."""
+    template = tmp_path / "install_defaults.toml"
+    template.write_text("[tool.ruff]\nline-length = 77\n")
+    monkeypatch.setattr(policy, "_THIS", tmp_path / "policy.py")
+    first = policy.defaults(name="app")
+    template.write_text("[tool.ruff]\nline-length = 99\n")
+    assert policy.defaults(name="app") == first
+
+
 def test_defaults_drop_checkout_settings_and_name_the_consumer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
