@@ -417,6 +417,30 @@ def test_hook_migration_visits_recursive_metadata_once() -> None:
     assert install._upgrade_hooks(original, expected=[]) == original
 
 
+@pytest.mark.parametrize("libyaml", [False, True])
+def test_hook_config_edits_in_place_with_either_yaml_parser(
+    monkeypatch: pytest.MonkeyPatch,
+    libyaml: bool,
+) -> None:
+    """Both parsers mark characters, not bytes, so ``é`` shifts no edit."""
+    monkeypatch.setattr(yaml, "__with_libyaml__", libyaml)
+    defaults: list[dict[str, object]] = [
+        {"repo": "checks", "rev": "v2", "hooks": [{"id": "size"}]},
+    ]
+    monkeypatch.setattr(install, "_hook_repos", lambda: defaults)
+    original = (
+        "# Café ☕.\nrepos:\n- repo: checks\n  rev: v1\n  hooks:\n"
+        "  - id: size  # Größe.\n    args: [x]\n"
+    )
+
+    configured = install.hook_config(original)
+
+    assert install._safe_loader() is (yaml.CSafeLoader if libyaml else yaml.SafeLoader)
+    assert configured == (
+        '# Café ☕.\nrepos:\n- repo: checks\n  rev: "v2"\n  hooks:\n  - id: size\n'
+    )
+
+
 def test_hook_config_rejects_a_hook_moved_to_another_repository() -> None:
     original = (
         "repos:\n  - repo: https://example.invalid/mine\n    rev: v1\n    hooks:\n"

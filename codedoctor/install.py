@@ -186,7 +186,7 @@ def hook_config(text: str, *, notebooks: bool = False) -> str:
         expected=expected,
     )
     document = from_plain(
-        yaml.safe_load(text),
+        _document(text),
         dict[str, object],
         default=dict[str, object](),
     )
@@ -242,13 +242,8 @@ def _upgrade_hooks(text: str, *, expected: list[dict[str, object]]) -> str:
                     "check-pr-text": "export_leaks.check_pr_text",
                 }.get(command, command.replace("-", "_"))
                 commands[module] = command
-    loader = yaml.SafeLoader(text)
-    try:
-        tree = loader.get_single_node()
-    finally:
-        loader.dispose()
     changes: list[tuple[int, int, str]] = []
-    pending = [tree]
+    pending = [yaml.compose(text, Loader=_safe_loader())]
     visited: set[int] = set()
     while pending:
         node = pending.pop()
@@ -330,7 +325,7 @@ def _replace_owned_hooks(text: str, *, expected: list[dict[str, object]]) -> str
             if not isinstance(hook_node, MappingNode) or hook_node.flow_style:
                 continue
             present = from_plain(
-                yaml.safe_load(_node_text(text, hook_node)),
+                _document(_node_text(text, hook_node)),
                 dict[str, object],
             )
             key = (repo_fields["repo"].value, present.get("id"))
@@ -366,11 +361,7 @@ def _replace_owned_hooks(text: str, *, expected: list[dict[str, object]]) -> str
 
 def _block_repos(text: str) -> list[MappingNode]:
     """Return the block-style repository mappings under the top-level `repos`."""
-    loader = yaml.SafeLoader(text)
-    try:
-        tree = loader.get_single_node()
-    finally:
-        loader.dispose()
+    tree = yaml.compose(text, Loader=_safe_loader())
     if not isinstance(tree, MappingNode):
         return []
     repos = {
@@ -383,6 +374,23 @@ def _block_repos(text: str) -> list[MappingNode]:
         for node in repos.value
         if isinstance(node, MappingNode) and not node.flow_style
     ]
+
+
+def _safe_loader() -> type[yaml.SafeLoader | yaml.CSafeLoader]:
+    """Return libyaml's safe loader where PyYAML has it, else the pure-Python one."""
+    # libyaml's marks count characters, as the pure loader's do, so the edits that
+    # slice the text at them hold under either. The pure loader cost each
+    # `hook_config` a quarter second under the gate's coverage tracer.
+    return yaml.CSafeLoader if yaml.__with_libyaml__ else yaml.SafeLoader
+
+
+def _document(text: str) -> object:
+    """Return the YAML document ``text`` as plain data, as ``yaml.safe_load`` does."""
+    loader = _safe_loader()(text)
+    try:
+        return loader.get_single_data()
+    finally:
+        loader.dispose()
 
 
 def _scalar_fields(node: MappingNode) -> dict[str, ScalarNode]:
@@ -431,17 +439,13 @@ def _hook_repos() -> list[dict[str, object]]:
     """Read the hooks every installed repository runs: the monorepo's, as exported."""
     packaged = _THIS.with_name("install_hooks.yaml")
     text = packaged.read_text() if packaged.is_file() else ""
-    config = from_plain(yaml.safe_load(text), dict[str, object])
+    config = from_plain(_document(text), dict[str, object])
     return from_plain(config["repos"], list[dict[str, object]])
 
 
 def _append_repos(text: str, *, repos: list[dict[str, object]]) -> str:
     """Insert repositories without reserializing existing configuration."""
-    loader = yaml.SafeLoader(text)
-    try:
-        tree = loader.get_single_node()
-    finally:
-        loader.dispose()
+    tree = yaml.compose(text, Loader=_safe_loader())
     if tree is None:
         return (
             text

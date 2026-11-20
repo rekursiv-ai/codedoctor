@@ -13,8 +13,9 @@ import json
 import subprocess
 import sys
 import tempfile
+import tomllib
 
-from treekle import json_dumps, json_loads
+from treekle import from_plain, json_dumps, json_loads
 from treekle.types import ReadError
 
 import pytest
@@ -790,18 +791,21 @@ def test_a_crashed_ty_fails_the_run_and_deletes_nothing(
     assert (tmp_path / "m.py").read_text() == _SOURCE
 
 
+_BINDS = (
+    "def f(x: object) -> str:\n"
+    '    __probe__ = "ok"\n'
+    "    assert isinstance(x, int)\n"
+    "    return __probe__\n"
+)
+
+
 @pytest.mark.cli_node
+@pytest.mark.usefixtures("shared_basedpyright")
 def test_the_probe_binds_no_name_the_source_may_use(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text(
         '[tool.basedpyright]\ntypeCheckingMode = "recommended"\n',
     )
-    source = (
-        "def f(x: object) -> str:\n"
-        '    __probe__ = "ok"\n'
-        "    assert isinstance(x, int)\n"
-        "    return __probe__\n"
-    )
-    (tmp_path / "m.py").write_text(source)
+    (tmp_path / "m.py").write_text(_BINDS)
     with unnecessary_assert_isinstance.probed(
         tmp_path,
         files=[tmp_path / "m.py"],
@@ -892,6 +896,7 @@ def test_excluded_and_unlintable_sources_do_not_end_the_scan(
 
 
 @pytest.mark.cli_node
+@pytest.mark.usefixtures("shared_basedpyright")
 def test_no_paths_checks_the_projects_loop_package(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -968,6 +973,7 @@ def test_warnings_fail_and_notes_are_counted(
 
 
 @pytest.mark.cli_node
+@pytest.mark.usefixtures("shared_basedpyright")
 def test_check_reports_what_a_plain_run_would_at_checkout_columns(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1111,6 +1117,7 @@ def test_the_project_root_is_the_nearest_basedpyright_config(tmp_path: Path) -> 
 
 
 @pytest.mark.cli_node
+@pytest.mark.usefixtures("shared_basedpyright")
 def test_the_replayed_report_is_what_basedpyright_says(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1314,7 +1321,152 @@ def shared_pyrefly(
     monkeypatch.setattr(subprocess, "run", replay)
 
 
-@pytest.mark.usefixtures("shared_pyrefly")
+@pytest.fixture(scope="module")
+def basedpyright_reports(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[tuple[str, str], list[dict[str, object]]]:
+    """Run the real basedpyright once per checking mode over every distinct file.
+
+    Returns each file's diagnostics, keyed by ``(typeCheckingMode, text)``, without
+    the ``file`` a replay fills in. Every file is checked on its own terms: no input
+    imports another.
+    """
+    narrowed = _FLAGS_NARROWED.split("\n").index("    assert isinstance(flags, _Flags)")
+    inputs = {
+        "recommended": [
+            (
+                "m.py",
+                unnecessary_assert_isinstance.probe(_SOURCE, checker="basedpyright"),
+            ),
+            (
+                "m.py",
+                unnecessary_assert_isinstance.probe(_BINDS, checker="basedpyright"),
+            ),
+            ("m.py", _SOURCE),
+            ("m.py", _passed(_SOURCE, line=2)),
+            ("need.py", _NEEDED),
+            ("need.py", _passed(_NEEDED, line=2)),
+            ("m.py", "x = 1\n"),
+            (
+                "overlap.py",
+                unnecessary_assert_isinstance.probe(_OVERLAP, checker="basedpyright"),
+            ),
+        ],
+        "all": [
+            ("m.py", _FLAGS_NARROWED),
+            ("m.py", _passed(_FLAGS_NARROWED, line=narrowed + 1)),
+        ],
+    }
+    reports: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for mode, files in inputs.items():
+        root = tmp_path_factory.mktemp(f"basedpyright-{mode}")
+        (root / "pyproject.toml").write_text(
+            f'[tool.basedpyright]\ntypeCheckingMode = "{mode}"\n',
+        )
+        paths: dict[Path, str] = {}
+        for index, (name, text) in enumerate(files):
+            path = root.resolve() / f"case{index}" / name
+            path.parent.mkdir()
+            path.write_text(text)
+            paths[path] = text
+        done = subprocess.run(  # noqa: S603 -- No shell; the venv's own basedpyright.
+            [
+                Path(sys.executable).parent / "basedpyright",
+                "--threads=1",
+                "--outputjson",
+                *map(str, paths),
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert done.returncode in (0, 1), done.stderr
+        items = from_plain(
+            json_loads(done.stdout, dict[str, object])["generalDiagnostics"],
+            list[dict[str, object]],
+        )
+        for path, text in paths.items():
+            reports[mode, text] = [
+                {key: value for key, value in item.items() if key != "file"}
+                for item in items
+                if item["file"] == str(path)
+            ]
+    return reports
+
+
+@pytest.fixture
+def shared_basedpyright(
+    basedpyright_reports: dict[tuple[str, str], list[dict[str, object]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Answer each basedpyright run from the shared one, per file it names."""
+    run = subprocess.run
+
+    def replay(
+        argv: Sequence[Path | str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        text: bool,
+        check: bool,
+    ) -> CompletedProcess[str]:
+        if Path(argv[0]).name != "basedpyright":
+            return cast(
+                "CompletedProcess[str]",
+                run(
+                    argv,
+                    cwd=cwd,
+                    capture_output=capture_output,
+                    text=text,
+                    check=check,
+                ),
+            )
+        config = from_plain(
+            tomllib.loads((cwd / "pyproject.toml").read_text()),
+            dict[str, object],
+        )
+        tool = from_plain(config["tool"], dict[str, object])
+        mode = from_plain(
+            from_plain(tool["basedpyright"], dict[str, object])["typeCheckingMode"],
+            str,
+        )
+        items = [
+            {**item, "file": str(path)}
+            for path in _named(argv, cwd=cwd)
+            for item in basedpyright_reports[mode, path.read_text()]
+        ]
+        errors = any(item["severity"] == "error" for item in items)
+        return CompletedProcess(
+            argv,
+            int(errors),
+            stdout=json.dumps({"generalDiagnostics": items}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", replay)
+
+
+def _passed(text: str, *, line: int) -> str:
+    """Return ``text`` with the assert on 1-based ``line`` made ``pass``, as checked."""
+    lines = text.split("\n")
+    assert_line = lines[line - 1]
+    lines[line - 1] = (
+        assert_line[: len(assert_line) - len(assert_line.lstrip())] + "pass"
+    )
+    return "\n".join(lines)
+
+
+def _named(argv: Sequence[Path | str], *, cwd: Path) -> list[Path]:
+    """Return each source file a basedpyright ``argv`` names, as it reports them."""
+    files: list[Path] = []
+    for target in (Path(part) for part in argv[1:] if not str(part).startswith("--")):
+        path = target if target.is_absolute() else cwd.resolve() / target
+        files.extend(sorted(path.rglob("*.py")) if path.is_dir() else [path])
+    return files
+
+
+@pytest.mark.usefixtures("shared_pyrefly", "shared_basedpyright")
 @pytest.mark.parametrize(
     ("typechecker", "kept"),
     [
@@ -1888,6 +2040,7 @@ def test_basedpyright_cross_checks_accept_optional_diagnostic_fields(
 
 
 @pytest.mark.cli_node
+@pytest.mark.usefixtures("shared_basedpyright")
 @pytest.mark.parametrize("checker", ["basedpyright", "pyrefly"])
 def test_real_cross_checkers_distinguish_necessary_and_redundant_asserts(
     tmp_path: Path,
