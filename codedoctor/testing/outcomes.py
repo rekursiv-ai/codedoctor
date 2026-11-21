@@ -99,12 +99,10 @@ def invalid_tests(data: Path) -> set[str]:
         )
         if not exists:
             return set()
-        rows = [
-            cast(tuple[str], row)
-            for row in list[object](
-                connection.execute(
-                    "SELECT path FROM codedoctor_invalid_tests",  # pragma: no mutate[case-insensitive]
-                ).fetchall(),
-            )
-        ]
+        rows = cast(
+            list[tuple[str]],
+            connection.execute(
+                "SELECT path FROM codedoctor_invalid_tests",  # pragma: no mutate[case-insensitive]
+            ).fetchall(),
+        )
         return {row[0] for row in rows}
