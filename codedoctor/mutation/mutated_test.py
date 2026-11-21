@@ -5837,35 +5837,44 @@ def test_failure_guide_is_installed_relative_and_printed_once(
         assert f"{failure} detail" in output
 
 
-@pytest.mark.parametrize(
-    ("flag", "status"),
-    [("--help", 0), ("--invalid-packaging-proof", 2)],
-)
-def test_arguments_do_not_require_mutmut_configuration(
-    tmp_path: Path,
-    flag: str,
-    status: int,
-) -> None:
+def test_arguments_do_not_require_mutmut_configuration(tmp_path: Path) -> None:
+    """A fresh interpreter, as imports that read cwd configuration run only once."""
     module = mutated.__name__
     root = Path(mutated.__file__).resolve().parents[len(module.split(".")) - 1]
     completed = subprocess.run(  # noqa: S603 -- Interpreter, package, and flags are test-owned.
-        [sys.executable, "-m", module.rpartition(".")[0], flag],
+        [sys.executable, "-m", module.rpartition(".")[0], "--invalid-packaging-proof"],
         cwd=tmp_path,
         env={**os.environ, "PYTHONPATH": str(root), "MUTANT_UNDER_TEST": ""},
         capture_output=True,
         text=True,
         check=False,
     )
-    assert completed.returncode == status, completed.stderr
-    assert "usage:" in completed.stdout + completed.stderr
+    assert completed.returncode == 2, completed.stderr
+    assert "usage:" in completed.stderr
     assert "Traceback" not in completed.stderr
     guide = Path(mutated.__file__).with_name("README.md").resolve().as_uri()
-    assert completed.stderr.count(guide) == (1 if status else 0)
-    if status:
-        assert "unrecognized arguments: --invalid-packaging-proof" in completed.stderr
-        assert completed.stderr.endswith(
-            f"mutation: FAILED: read {guide} before changing code or tests\n",
-        )
+    assert "unrecognized arguments: --invalid-packaging-proof" in completed.stderr
+    assert completed.stderr.endswith(
+        f"mutation: FAILED: read {guide} before changing code or tests\n",
+    )
+
+
+def test_help_exits_cleanly_without_the_failure_guide(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["mutated", "--help"])
+
+    with pytest.raises(SystemExit) as stopped:
+        mutated.main()
+
+    assert stopped.value.code == 0
+    captured = capsys.readouterr()
+    guide = Path(mutated.__file__).with_name("README.md").resolve().as_uri()
+    assert "usage:" in captured.out
+    assert guide not in captured.out + captured.err
 
 
 def test_failure_guide_follows_buffered_diagnostics(
