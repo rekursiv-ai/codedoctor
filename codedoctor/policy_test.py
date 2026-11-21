@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 
 
 def test_defaults_use_the_canonical_checker_policy() -> None:
+    # Rendered here, not taken from a cache another test in the process filled.
+    policy._packaged_pyproject.cache_clear()
     defaults = tomllib.loads(tomlkit.dumps(policy.defaults(name="netv")))
     assert defaults["ruff"]["lint"]["select"] == ["ALL"]
     assert "E501" in defaults["ruff"]["lint"]["ignore"]

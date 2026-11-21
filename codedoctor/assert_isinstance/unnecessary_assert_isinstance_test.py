@@ -1466,7 +1466,7 @@ def _named(argv: Sequence[Path | str], *, cwd: Path) -> list[Path]:
     return files
 
 
-@pytest.mark.usefixtures("shared_pyrefly", "shared_basedpyright")
+@pytest.mark.usefixtures("shared_pyrefly")
 @pytest.mark.parametrize(
     ("typechecker", "kept"),
     [
@@ -1484,10 +1484,15 @@ def test_typechecker_basedpyright_keeps_an_assert_it_still_narrows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    request: pytest.FixtureRequest,
+    *,
     typechecker: list[str],
     kept: bool,
 ) -> None:
     """Pyrefly calls it redundant; basedpyright reads ``Namespace`` fields as ``Any``."""
+    # Only basedpyright keeps it; pyrefly alone skips the ~1.2 s real basedpyright run.
+    if kept:
+        request.getfixturevalue("shared_basedpyright")
     _pyrefly_project(tmp_path, monkeypatch, _FLAGS_NARROWED)
     _replay_clean_ty(monkeypatch)
     with (tmp_path / "pyproject.toml").open("a") as config:
