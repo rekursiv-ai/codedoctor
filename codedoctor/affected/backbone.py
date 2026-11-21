@@ -203,9 +203,11 @@ def stamped(database: Path) -> Stamp | None:
         )
         paths = [
             cast(tuple[str], row)
-            for row in connection.execute(
-                """SELECT path FROM codedoctor_changed ORDER BY path""",
-            ).fetchall()
+            for row in list[object](
+                connection.execute(
+                    """SELECT path FROM codedoctor_changed ORDER BY path""",
+                ).fetchall(),
+            )
         ]
     except sqlite3.Error:
         return None
@@ -440,10 +442,12 @@ def _missing_columns(database: Path) -> list[str]:
                 for table in REQUIRED_COLUMNS
                 for (column,) in [
                     cast(tuple[str], row)
-                    for row in connection.execute(
-                        """SELECT name FROM pragma_table_info(?)""",
-                        (table,),
-                    ).fetchall()
+                    for row in list[object](
+                        connection.execute(
+                            """SELECT name FROM pragma_table_info(?)""",
+                            (table,),
+                        ).fetchall(),
+                    )
                 ]
             }
         finally:

@@ -2821,10 +2821,12 @@ def test_the_walk_builds_no_index_per_query(tmp_path: Path) -> None:
         affected._touched_table(connection, [])
         rows = [
             cast("tuple[int, int, int, str]", row)
-            for row in connection.execute(
-                "EXPLAIN QUERY PLAN " + affected._walk(),
-                {"seed": "lib.py", "depth": 1, "scoped": 0},
-            ).fetchall()
+            for row in list[object](
+                connection.execute(
+                    "EXPLAIN QUERY PLAN " + affected._walk(),
+                    {"seed": "lib.py", "depth": 1, "scoped": 0},
+                ).fetchall(),
+            )
         ]
         plan = [detail for *_, detail in rows]
     finally:
