@@ -101,8 +101,10 @@ def invalid_tests(data: Path) -> set[str]:
             return set()
         rows = [
             cast(tuple[str], row)
-            for row in connection.execute(
-                "SELECT path FROM codedoctor_invalid_tests",  # pragma: no mutate[case-insensitive]
-            ).fetchall()
+            for row in list[object](
+                connection.execute(
+                    "SELECT path FROM codedoctor_invalid_tests",  # pragma: no mutate[case-insensitive]
+                ).fetchall(),
+            )
         ]
         return {row[0] for row in rows}
