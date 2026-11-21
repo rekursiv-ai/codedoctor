@@ -782,13 +782,13 @@ def _reachable(
         return []
     try:
         _touched_table(connection, lines)
-        return cast(
-            list[tuple[str, str, str, str]],
-            connection.execute(
+        return [
+            cast(tuple[str, str, str, str], row)
+            for row in connection.execute(
                 _walk(),
                 {"seed": seed, "depth": depth, "scoped": bool(lines)},
-            ).fetchall(),
-        )
+            ).fetchall()
+        ]
     except sqlite3.Error:
         return []
 
@@ -1090,25 +1090,25 @@ def _lay_over(connection: sqlite3.Connection, overlay: Path | None) -> None:
     connection.executemany(
         """INSERT INTO temp.omodules VALUES (?, ?, ?)""",
         _module_rows(
-            cast(
-                list[tuple[str]],
-                connection.execute(
+            [
+                cast(tuple[str], row)
+                for row in connection.execute(
                     """SELECT DISTINCT file_path FROM overlay.nodes
                     WHERE file_path LIKE '%.py' OR file_path LIKE '%.pyi'""",
-                ).fetchall(),
-            ),
+                ).fetchall()
+            ],
         ),
     )
     connection.executemany(
         """INSERT INTO temp.oimports VALUES (?, ?, ?)""",
         _import_rows(
-            cast(
-                list[tuple[str, str]],
-                connection.execute(
+            [
+                cast(tuple[str, str], row)
+                for row in connection.execute(
                     """SELECT file_path, qualified_name FROM overlay.nodes
                     WHERE kind = 'import'""",
-                ).fetchall(),
-            ),
+                ).fetchall()
+            ],
         ),
     )
     # The inserts opened an implicit transaction, which holds the overlay attached.
@@ -1153,13 +1153,13 @@ def _build_derived(connection: sqlite3.Connection) -> None:
     connection.executemany(
         """INSERT INTO modules VALUES (?, ?, ?)""",
         _module_rows(
-            cast(
-                list[tuple[str]],
-                connection.execute(
+            [
+                cast(tuple[str], row)
+                for row in connection.execute(
                     """SELECT DISTINCT file_path FROM source.nodes
                     WHERE file_path LIKE '%.py' OR file_path LIKE '%.pyi'""",
-                ).fetchall(),
-            ),
+                ).fetchall()
+            ],
         ),
     )
     connection.executescript(
@@ -1183,13 +1183,13 @@ def _build_derived(connection: sqlite3.Connection) -> None:
     connection.executemany(
         """INSERT INTO imports VALUES (?, ?, ?)""",
         _import_rows(
-            cast(
-                list[tuple[str, str]],
-                connection.execute(
+            [
+                cast(tuple[str, str], row)
+                for row in connection.execute(
                     """SELECT file_path, qualified_name FROM source.nodes
                     WHERE kind = 'import'""",
-                ).fetchall(),
-            ),
+                ).fetchall()
+            ],
         ),
     )
 
