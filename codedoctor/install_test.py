@@ -247,7 +247,14 @@ def test_hook_config_accepts_empty_repositories(original: str) -> None:
 
 @pytest.mark.parametrize(
     "original",
-    ["repos: broken\n", "repos: null\n", "repos: [\n", "[]\n"],
+    [
+        "repos: broken\n",
+        "repos: null\n",
+        "repos: [\n",
+        "[]\n",
+        # A key that is no string: YAML refuses it, never Python.
+        "repos:\n- repo: local\n  ? [a]\n  : b\n  hooks: []\n",
+    ],
 )
 def test_hook_config_rejects_invalid_config(original: str) -> None:
     with pytest.raises((ValueError, yaml.YAMLError)):
@@ -384,6 +391,34 @@ def test_hook_config_ranks_each_occurrence_of_a_repeated_hook(
     ]
 
 
+def test_a_flow_style_repository_keeps_its_place() -> None:
+    """Only block-style repositories move: a flow one has no lines of its own."""
+    expected: list[dict[str, object]] = [
+        {"repo": "a", "hooks": [{"id": "x"}]},
+        {"repo": "b", "hooks": [{"id": "y"}]},
+    ]
+    original = "repos:\n- {repo: b, hooks: [{id: y}]}\n- repo: a\n  hooks:\n  - id: x\n"
+    assert install._order_owned_repos(original, expected=expected) == original
+
+
+def test_a_replaced_hook_keeps_its_field_order_and_long_lines() -> None:
+    entry = "uv run python -m codedoctor lint" + " --flag" * 20
+    expected: list[dict[str, object]] = [
+        {
+            "repo": "local",
+            "hooks": [{"id": "b", "name": "b", "entry": entry, "args": ["--x", "--y"]}],
+        },
+    ]
+    original = "repos:\n- repo: local\n  hooks:\n  - id: b\n    name: old\n"
+
+    replaced = install._replace_owned_hooks(original, expected=expected)
+
+    assert replaced == (
+        "repos:\n- repo: local\n  hooks:\n  - id: b\n    name: b\n"
+        f"    entry: {entry}\n    args:\n    - --x\n    - --y\n"
+    )
+
+
 @pytest.mark.parametrize("flow", [False, True])
 @pytest.mark.parametrize(
     "prefix",
@@ -516,6 +551,17 @@ def test_hook_config_edits_in_place_with_either_yaml_parser(
         {"repo": "checks", "rev": "v2", "hooks": [{"id": "size"}]},
     ]
     monkeypatch.setattr(install, "_hook_repos", lambda: defaults)
+    compose = yaml.compose
+    composed: list[type[yaml.SafeLoader | yaml.CSafeLoader]] = []
+
+    def recorded(
+        stream: str,
+        Loader: type[yaml.SafeLoader | yaml.CSafeLoader],  # noqa: N803 -- PyYAML's name.
+    ) -> yaml.Node | None:
+        composed.append(Loader)
+        return compose(stream, Loader=Loader)
+
+    monkeypatch.setattr(yaml, "compose", recorded)
     original = (
         "# Café ☕.\nrepos:\n- repo: checks\n  rev: v1\n  hooks:\n"
         "  - id: size  # Größe.\n    args: [x]\n"
@@ -523,7 +569,10 @@ def test_hook_config_edits_in_place_with_either_yaml_parser(
 
     configured = install.hook_config(original)
 
-    assert install._safe_loader() is (yaml.CSafeLoader if libyaml else yaml.SafeLoader)
+    loader = yaml.CSafeLoader if libyaml else yaml.SafeLoader
+    assert install._safe_loader() is loader
+    assert composed
+    assert set(composed) == {loader}
     assert configured == (
         '# Café ☕.\nrepos:\n- repo: checks\n  rev: "v2"\n  hooks:\n  - id: size\n'
     )
@@ -1077,6 +1126,24 @@ def test_install_propagates_dependency_failure(
 def test_project_config_rejects_invalid_tables(text: str) -> None:
     with pytest.raises(TypeError, match="TOML table"):
         install.project_config(text, name="demo")
+
+
+def test_the_monorepo_s_hooks_match_paths_as_its_export_does(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``**/`` matches no directory under the export's ``zero_or_more``."""
+    module = tmp_path / "codedoctor" / "install.py"
+    module.parent.mkdir()
+    module.with_name("copy.barista.toml").write_text(
+        '[workflow]\nname = "codedoctor"\nmode = "squash"\nsource_root = "codedoctor"\n'
+        'globstar = "zero_or_more"\n\n[files]\ninclude = ["**"]\n\n'
+        '[[transform]]\ntype = "replace"\npath = "**/codedoctor/install_hooks.yaml"\n'
+        'before = "repos: []"\nafter = "repos: [] # exported"\n',
+    )
+    (tmp_path / ".pre-commit-config.yaml").write_text("repos: []\n")
+    monkeypatch.setattr(install, "_THIS", module)
+    assert install._exported_hooks() == "repos: [] # exported\n"
 
 
 def test_packaged_hook_template_is_read(
