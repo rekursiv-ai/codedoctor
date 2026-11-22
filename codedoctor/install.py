@@ -11,6 +11,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import textwrap
 
 from treekle import MutablePlainTree, from_plain
@@ -20,6 +21,7 @@ import tomlkit
 import yaml
 
 from codedoctor import codegraph, policy
+from codedoctor.lib.yaml import position
 
 
 _THIS: Final[Path] = Path(__file__).resolve()
@@ -244,7 +246,7 @@ def _upgrade_hooks(text: str, *, expected: list[dict[str, object]]) -> str:
                 }.get(command, command.replace("-", "_"))
                 commands[module] = command
     changes: list[tuple[int, int, str]] = []
-    pending = [yaml.compose(text, Loader=_safe_loader())]
+    pending = [_compose(text)]
     visited: set[int] = set()
     while pending:
         node = pending.pop()
@@ -284,8 +286,8 @@ def _upgrade_hooks(text: str, *, expected: list[dict[str, object]]) -> str:
                             replacement += "\n"
                         changes.append(
                             (
-                                scalar.start_mark.index,
-                                scalar.end_mark.index,
+                                position(scalar).index,
+                                position(scalar, end=True).index,
                                 replacement,
                             ),
                         )
@@ -342,15 +344,15 @@ def _replace_owned_hooks(text: str, *, expected: list[dict[str, object]]) -> str
                     and scalar is not None
                     and scalar.value != value
                 ):
-                    changes[scalar.start_mark.index] = (
-                        scalar.end_mark.index,
+                    changes[position(scalar).index] = (
+                        position(scalar, end=True).index,
                         json.dumps(value),
                     )
             replacement = {k: v for k, v in hook.items() if k != "exclude"}
             if "exclude" in present:
                 replacement["exclude"] = present["exclude"]
             if replacement != present:
-                changes[hook_node.start_mark.index] = _hook_text(
+                changes[position(hook_node).index] = _hook_text(
                     text,
                     node=hook_node,
                     hook=replacement,
@@ -390,10 +392,10 @@ def _order_owned_repos(text: str, *, expected: list[dict[str, object]]) -> str:
     moved = [index for _, index in sorted(owned)]
     if moved == slots:
         return text
-    first_mark = nodes[0].start_mark
+    first = position(nodes[0])
     bounds = [
-        _content_end(text, index=first_mark.index - first_mark.column),
-        *(_content_end(text, index=node.end_mark.index) for node in nodes),
+        _content_end(text, index=first.index - first.column),
+        *(_content_end(text, index=position(node, end=True).index) for node in nodes),
     ]
     chunks = [text[start:end] for start, end in itertools.pairwise(bounds)]
     if not chunks[-1].endswith("\n"):
@@ -420,7 +422,7 @@ def _content_end(text: str, *, index: int) -> int:
 
 def _block_repos(text: str) -> list[MappingNode]:
     """Return the block-style repository mappings under the top-level `repos`."""
-    tree = yaml.compose(text, Loader=_safe_loader())
+    tree = _compose(text)
     if not isinstance(tree, MappingNode):
         return []
     repos = {
@@ -443,6 +445,11 @@ def _safe_loader() -> type[yaml.SafeLoader | yaml.CSafeLoader]:
     return yaml.CSafeLoader if yaml.__with_libyaml__ else yaml.SafeLoader
 
 
+def _compose(text: str) -> yaml.Node | None:
+    """Return the YAML document ``text`` as nodes, each marked where it is written."""
+    return yaml.compose(text, Loader=_safe_loader())
+
+
 def _document(text: str) -> object:
     """Return the YAML document ``text`` as plain data, as ``yaml.safe_load`` does."""
     loader = _safe_loader()(text)
@@ -463,8 +470,8 @@ def _scalar_fields(node: MappingNode) -> dict[str, ScalarNode]:
 
 def _node_text(text: str, node: MappingNode) -> str:
     """Return a block mapping's source, its first line dedented to match the rest."""
-    start, end = node.start_mark, node.value[-1][1].end_mark
-    return " " * int(start.column) + text[int(start.index) : int(end.index)]
+    start, end = position(node), position(node.value[-1][1], end=True)
+    return " " * start.column + text[start.index : end.index]
 
 
 def _hook_text(
@@ -476,10 +483,18 @@ def _hook_text(
     """Return the end index and block YAML replacing ``node`` with ``hook``."""
     # A block list's end mark sits past its newline and the next line's indent;
     # end the span at its last character so what follows keeps its line.
-    end = len(text[: int(node.value[-1][1].end_mark.index)].rstrip())
-    dumped = yaml.safe_dump(hook, sort_keys=False, width=1 << 30)
-    body = textwrap.indent(dumped, " " * int(node.start_mark.column)).lstrip(" ")
-    return end, body.rstrip("\n")
+    end = len(text[: position(node.value[-1][1], end=True).index].rstrip())
+    # Unbounded width: a long `entry` stays on its line.
+    dumped = yaml.safe_dump(
+        hook,
+        sort_keys=False,  # pragma: no mutate[truthiness]
+        width=sys.maxsize,
+    )
+    # The first line takes the hook's own place; each after it, the hook's indent.
+    return end, dumped.removesuffix("\n").replace(
+        "\n",
+        "\n" + " " * position(node).column,
+    )
 
 
 def _hook_identity(
@@ -504,7 +519,7 @@ def _hook_repos() -> list[dict[str, object]]:
 
 def _append_repos(text: str, *, repos: list[dict[str, object]]) -> str:
     """Insert repositories without reserializing existing configuration."""
-    tree = yaml.compose(text, Loader=_safe_loader())
+    tree = _compose(text)
     if tree is None:
         return (
             text
@@ -528,14 +543,12 @@ def _append_repos(text: str, *, repos: list[dict[str, object]]) -> str:
             {"repos": repos},
             default_flow_style=True,
         ).strip()[1:-1]
-        position = (
-            tree.value[-1][1].end_mark.index
+        at = (
+            position(tree.value[-1][1], end=True).index
             if tree.value
-            else tree.start_mark.index + 1
+            else position(tree).index + 1
         )
-        return (
-            text[:position] + (", " if tree.value else "") + fragment + text[position:]
-        )
+        return text[:at] + (", " if tree.value else "") + fragment + text[at:]
     return text.rstrip() + "\nrepos:\n" + textwrap.indent(yaml.safe_dump(repos), "  ")
 
 
@@ -547,22 +560,22 @@ def _append_repo(
 ) -> str:
     """Insert repositories without reserializing the user's YAML."""
     if node.flow_style:
-        position = (
-            node.value[-1].end_mark.index if node.value else node.start_mark.index + 1
+        at = (
+            position(node.value[-1], end=True).index
+            if node.value
+            else position(node).index + 1
         )
         fragment = yaml.safe_dump(
             repos,
             default_flow_style=True,
         ).strip()[1:-1]
-        return (
-            text[:position] + (", " if node.value else "") + fragment + text[position:]
-        )
-    position = node.end_mark.index
+        return text[:at] + (", " if node.value else "") + fragment + text[at:]
+    at = position(node, end=True).index
     fragment = textwrap.indent(
         yaml.safe_dump(repos),
-        " " * node.start_mark.column,
+        " " * position(node).column,
     )
-    return text[:position].rstrip() + "\n" + fragment + text[position:]
+    return text[:at].rstrip() + "\n" + fragment + text[at:]
 
 
 def _bootstrap_hooks(root: Path) -> None:
