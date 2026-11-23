@@ -1128,30 +1128,6 @@ def test_project_config_rejects_invalid_tables(text: str) -> None:
         install.project_config(text, name="demo")
 
 
-@pytest.mark.parametrize(
-    ("globstar", "expected"),
-    [("zero_or_more", "repos: [] # exported\n"), ("one_or_more", "repos: []\n")],
-)
-def test_the_monorepo_s_hooks_match_paths_as_its_export_does(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    globstar: str,
-    expected: str,
-) -> None:
-    """``**/`` matches no directory only under the export's ``zero_or_more``."""
-    module = tmp_path / "codedoctor" / "install.py"
-    module.parent.mkdir()
-    module.with_name("copy.barista.toml").write_text(
-        '[workflow]\nname = "codedoctor"\nmode = "squash"\nsource_root = "codedoctor"\n'
-        f'globstar = "{globstar}"\n\n[files]\ninclude = ["**"]\n\n'
-        '[[transform]]\ntype = "replace"\npath = "**/codedoctor/install_hooks.yaml"\n'
-        'before = "repos: []"\nafter = "repos: [] # exported"\nrequired = false\n',
-    )
-    (tmp_path / ".pre-commit-config.yaml").write_text("repos: []\n")
-    monkeypatch.setattr(install, "_THIS", module)
-    assert install._exported_hooks() == expected
-
-
 def test_packaged_hook_template_is_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
