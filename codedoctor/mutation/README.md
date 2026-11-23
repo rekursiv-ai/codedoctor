@@ -32,22 +32,24 @@ through formatting. A pragma after the final `)` targets the statement's first l
 
 ```python
 text = raw.decode(
-    "utf-8",  # pragma: no mutate[case-insensitive]
+    "utf-8",  # pragma: no mutate[case-insensitive] -- Codec names ignore case.
     errors="replace",
 )
 
-# pragma: no mutate[diagnostic-text] start
+# pragma: no mutate[diagnostic-text] start -- Only a person reads it.
 raise ValueError("Cannot load the requested configuration.")
 # pragma: no mutate end
 
 
-def validate(name: str) -> None:  # pragma: no mutate[diagnostic-text] block
+def validate(name: str) -> None:  # pragma: no mutate[diagnostic-text] block -- Wording.
     if not name:
         raise ValueError("A name is required.")
 ```
 
+- End every pragma with `-- Explanation.`, as every suppression does: why the
+  declaration holds on this line. The gate reads only what precedes `--`.
 - Combine applicable labels as `[diagnostic-text, case-insensitive]`. Order and
-  duplicates do not matter; any matching label skips. Append no justification prose.
+  duplicates do not matter; any matching label skips.
 - Matching candidates never execute; other mutations remain active.
 - Unknown labels, empty brackets, malformed scopes, and examined unused labels
   fail. Label observed findings, not speculation.

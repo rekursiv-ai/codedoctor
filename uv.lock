@@ -2010,8 +2010,8 @@ wheels = [
 
 [[package]]
 name = "rekursiv-ai-typings"
-version = "0.1.28.dev2+g2e6ca5130"
-source = { git = "https://github.com/rekursiv-ai/typings?branch=main#2e6ca51304398ed07db7492201d7a346d4ca6d4c" }
+version = "0.1.28.dev3+gf55d0f4ac"
+source = { git = "https://github.com/rekursiv-ai/typings?branch=main#f55d0f4ac560a6ebfb3c5c3ac6a45eb9b1bfd898" }
 
 [[package]]
 name = "requests"
