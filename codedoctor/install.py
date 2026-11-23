@@ -487,7 +487,7 @@ def _hook_text(
     # Unbounded width: a long `entry` stays on its line.
     dumped = yaml.safe_dump(
         hook,
-        sort_keys=False,  # pragma: no mutate[truthiness]
+        sort_keys=False,  # pragma: no mutate[truthiness] -- PyYAML reads only its truth.
         width=sys.maxsize,
     )
     # The first line takes the hook's own place; each after it, the hook's indent.
