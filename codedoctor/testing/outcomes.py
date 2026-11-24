@@ -1,18 +1,19 @@
-"""Record failed or unfinished own tests alongside a gate's coverage data."""
+"""Record failed or unfinished own tests, and the sources run, in a gate's coverage data."""
 
 from __future__ import annotations
 
 from contextlib import closing
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+import hashlib
 import sqlite3
 
 from _pytest.config import hookimpl
 
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-    from pathlib import Path
+    from collections.abc import Mapping, Sequence
 
     import pytest
 
@@ -50,7 +51,19 @@ class Outcomes:
             handle.writelines(f"{event}\t{nodeid}\n" for nodeid in nodeids)
 
 
-def save(data: Path, *, events: Path, tests: Sequence[str], status: int) -> None:
+def fingerprint(path: Path) -> str:
+    """Return ``path``'s contents' digest; empty when no file is there."""
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else ""
+
+
+def save(
+    data: Path,
+    *,
+    events: Path,
+    tests: Sequence[str],
+    status: int,
+    sources: Mapping[str, str],
+) -> None:
     """Store failed and unfinished test files inside the coverage SQLite hand-off.
 
     Args:
@@ -58,6 +71,7 @@ def save(data: Path, *, events: Path, tests: Sequence[str], status: int) -> None
       events: Controller's collection and test-phase event log.
       tests: Selected own test files.
       status: Own pytest process exit status.
+      sources: Each measured source's ``fingerprint`` before its tests ran.
 
     """
     rows = events.read_text().splitlines() if events.is_file() else []
@@ -72,12 +86,45 @@ def save(data: Path, *, events: Path, tests: Sequence[str], status: int) -> None
         invalid.update(set(tests) - completed_files)
     with closing(sqlite3.connect(data)) as connection, connection:
         connection.execute(
-            "CREATE TABLE codedoctor_invalid_tests (path TEXT PRIMARY KEY)",  # pragma: no mutate[case-insensitive]
+            "CREATE TABLE codedoctor_invalid_tests (path TEXT PRIMARY KEY)",  # pragma: no mutate[case-insensitive] -- SQLite reads keywords and names in any case.
         )
         connection.executemany(
-            "INSERT INTO codedoctor_invalid_tests VALUES (?)",  # pragma: no mutate[case-insensitive]
+            "INSERT INTO codedoctor_invalid_tests VALUES (?)",  # pragma: no mutate[case-insensitive] -- SQLite reads keywords and names in any case.
             [(path,) for path in sorted(invalid)],
         )
+        connection.execute(
+            "CREATE TABLE codedoctor_sources (path TEXT PRIMARY KEY, digest TEXT)",  # pragma: no mutate[case-insensitive] -- SQLite reads keywords and names in any case.
+        )
+        connection.executemany(
+            "INSERT INTO codedoctor_sources VALUES (?, ?)",  # pragma: no mutate[case-insensitive] -- SQLite reads keywords and names in any case.
+            sorted(sources.items()),
+        )
+
+
+def changed_sources(data: Path) -> set[str]:
+    """Read the sources whose contents changed since their tests ran.
+
+    Their recorded lines no longer match the file: an edit above a line moves it,
+    and the data would report the moved line as missed.
+
+    Args:
+      data: Coverage database, optionally annotated by ``save``; paths are read
+        relative to the working directory.
+
+    Returns:
+      paths: Each source ``save`` fingerprinted whose ``fingerprint`` differs now.
+
+    """
+    with closing(sqlite3.connect(data)) as connection:
+        if not _has_table(connection, "codedoctor_sources"):
+            return set()
+        rows = cast(
+            list[tuple[str, str]],
+            connection.execute(
+                "SELECT path, digest FROM codedoctor_sources",  # pragma: no mutate[case-insensitive] -- SQLite reads keywords and names in any case.
+            ).fetchall(),
+        )
+    return {path for path, digest in rows if fingerprint(Path(path)) != digest}
 
 
 def invalid_tests(data: Path) -> set[str]:
@@ -91,18 +138,22 @@ def invalid_tests(data: Path) -> set[str]:
 
     """
     with closing(sqlite3.connect(data)) as connection:
-        exists = cast(
-            tuple[int] | None,
-            connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE name = 'codedoctor_invalid_tests'",  # pragma: no mutate -- SQLite SQL keywords are case-insensitive.
-            ).fetchone(),
-        )
-        if not exists:
+        if not _has_table(connection, "codedoctor_invalid_tests"):
             return set()
         rows = cast(
             list[tuple[str]],
             connection.execute(
-                "SELECT path FROM codedoctor_invalid_tests",  # pragma: no mutate[case-insensitive]
+                "SELECT path FROM codedoctor_invalid_tests",  # pragma: no mutate[case-insensitive] -- SQLite reads keywords and names in any case.
             ).fetchall(),
         )
         return {row[0] for row in rows}
+
+
+def _has_table(connection: sqlite3.Connection, name: str) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = ?",  # pragma: no mutate[case-insensitive] -- SQLite reads keywords and names in any case.
+            (name,),
+        ).fetchone()
+        is not None
+    )

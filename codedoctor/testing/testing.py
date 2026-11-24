@@ -55,7 +55,7 @@ else:
 
 def pytest_addoption(parser: Parser) -> None:
     """Register the gate's private own-test outcome log."""
-    parser.addoption("--gate-outcomes", type=Path, default=None)
+    parser.addoption("--gate-outcomes", type=Path)
 
 
 def pytest_configure(config: Config) -> None:
@@ -126,6 +126,9 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
         left.write_text("the pytest hook found no tests\n")
         return 0
     sources = _floored(files, root=context.root)
+    # Taken before the tests run: an edit during the run would shift the lines
+    # they record, and ``coverage-floor`` would report the shifted ones as missed.
+    fingerprints = {path: outcomes.fingerprint(context.root / path) for path in sources}
     directories = sorted({Path(path).parent.as_posix() for path in sources})
     measured = context.installed("pytest_cov")
     collect_coverage = not gate.skipped(context.environ, "coverage-floor")
@@ -174,6 +177,7 @@ def pytest(context: gate.Context, *, dependents: str | None) -> int:
                     events=Path(temp) / _OUTCOMES,
                     tests=tests,
                     status=status,
+                    sources=fingerprints,
                 )
             if status not in {0, 5}:
                 failure = status
@@ -411,11 +415,7 @@ def _floored(files: Sequence[str], *, root: Path) -> list[str]:
         {
             owned.as_posix()
             for path in files
-            for owned in (
-                sidecars.related(path, root=root)
-                if sidecars.is_test(root / path)
-                else [Path(path)]
-            )
+            for owned in sidecars.related(path, root=root)
             if not sidecars.is_test(root / owned)
         },
     )

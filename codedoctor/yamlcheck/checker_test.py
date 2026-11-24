@@ -145,6 +145,8 @@ def test_help_description(
 ) -> None:
     monkeypatch.setattr(checker, "__doc__", docstring)
     monkeypatch.setattr(sys, "argv", ["check-yaml", "--help"])
+    # Argparse wraps help to the terminal's width; a narrow one splits the line.
+    monkeypatch.setenv("COLUMNS", "200")
     with pytest.raises(SystemExit) as exit_info:
         checker.main()
     assert exit_info.value.code == 0

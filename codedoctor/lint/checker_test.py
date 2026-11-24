@@ -489,6 +489,17 @@ def test_a_setting_is_coerced_to_the_declared_field_type() -> None:
     assert not isinstance(rule.min_digits, str)
 
 
+def test_a_setting_that_will_not_coerce_names_its_field_type() -> None:
+    pattern = r"^--set digits\.min_digits: cannot read 'abc' as int \("
+    with pytest.raises(ValueError, match=pattern):
+        checker.select_rules(
+            checker.default_rules(),
+            select="digits",
+            fix="",
+            settings=["digits.min-digits=abc"],
+        )
+
+
 def test_a_misspelled_setting_is_rejected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -971,6 +982,23 @@ def test_exclude_matches_a_repo_relative_path(tmp_path: Path) -> None:
         fixing=frozenset(),
         exclude=(_exclusion("sub/mod.py"),),
         root=tmp_path,
+    )
+
+    assert findings == ()
+
+
+def test_exclude_matches_a_path_outside_the_root_by_its_own_spelling(
+    tmp_path: Path,
+) -> None:
+    """A path the root does not contain is matched as it was given."""
+    path = _write(tmp_path, "BAD\n")
+
+    findings, _ = run(
+        [path.absolute()],
+        active=(_Counting(),),
+        fixing=frozenset(),
+        exclude=(_exclusion(str(path.absolute())),),
+        root=tmp_path / "elsewhere",
     )
 
     assert findings == ()

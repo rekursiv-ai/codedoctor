@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -864,6 +865,128 @@ def test_checker_lines_maps_each_ty_diagnostic_to_its_absolute_file(
     }
 
 
+def _fake_checker_run(
+    report: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[Sequence[Path | str]]:
+    """Answer every checker run with ``report``, and record each argv."""
+    seen: list[Sequence[Path | str]] = []
+
+    def run(
+        argv: Sequence[Path | str],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        text: bool,
+        check: bool,
+    ) -> CompletedProcess[str]:
+        del cwd, capture_output, text, check
+        seen.append(argv)
+        return CompletedProcess(argv, 0, stdout=report, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("name", "report", "options"),
+    [
+        ("ty", "", ["check", "--output-format", "concise"]),
+        (
+            "basedpyright",
+            '{"generalDiagnostics": []}',
+            ["--threads=1", "--outputjson"],
+        ),
+        (
+            "pyrefly",
+            '{"errors": []}',
+            ["check", "--output-format=json", "--summary=none"],
+        ),
+    ],
+)
+def test_checker_lines_runs_each_checker_in_its_report_format(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    report: str,
+    options: list[str],
+) -> None:
+    seen = _fake_checker_run(report, monkeypatch)
+
+    found = unnecessary_assert_isinstance._checker_lines(
+        Path(name),
+        tmp_path,
+        files=[Path("m.py")],
+    )
+
+    assert seen == [[Path(name), *options, "m.py"]]
+    assert found == {}
+
+
+def test_basedpyright_keys_default_a_missing_position_and_rule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    located = _item(tmp_path / "m.py", line=2, character=4, rule="reportX")
+    bare = {"file": str(tmp_path / "m.py"), "severity": "error", "message": "m"}
+    _fake_checker_run(
+        json.dumps({"generalDiagnostics": [located, bare, located]}),
+        monkeypatch,
+    )
+
+    found = unnecessary_assert_isinstance._checker_lines(
+        Path("basedpyright"),
+        tmp_path,
+        files=[Path("m.py")],
+    )
+
+    assert found == {
+        tmp_path / "m.py": Counter({"2:4: reportX m": 2, "0:0:  m": 1}),
+    }
+
+
+def test_pyrefly_keys_join_each_error_to_its_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = {"path": "m.py", "line": 3, "column": 7, "name": "r", "description": "d"}
+    _fake_checker_run(json.dumps({"errors": [error]}), monkeypatch)
+
+    found = unnecessary_assert_isinstance._checker_lines(
+        Path("pyrefly"),
+        tmp_path,
+        files=[Path("m.py")],
+    )
+
+    assert found == {tmp_path / "m.py": Counter({"3:7: r d": 1})}
+
+
+@pytest.mark.parametrize("name", ["basedpyright", "pyrefly"])
+def test_checker_lines_requires_a_mapping_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    _fake_checker_run("[]", monkeypatch)
+
+    with pytest.raises(ReadError):
+        _ = unnecessary_assert_isinstance._checker_lines(
+            Path(name),
+            tmp_path,
+            files=[Path("m.py")],
+        )
+
+
+def test_a_checker_crash_names_its_exit_status() -> None:
+    error = unnecessary_assert_isinstance.CheckerCrashError(2, "panic\n")
+    assert str(error) == "checker exited 2"
+
+
+def test_a_deleted_source_is_changed_whatever_it_held(tmp_path: Path) -> None:
+    with pytest.raises(unnecessary_assert_isinstance.SourceChangedError):
+        unnecessary_assert_isinstance._unchanged({tmp_path / "gone.py": ""})
+
+
 def test_an_assert_ty_needs_is_not_reported(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -946,6 +1069,16 @@ def test_help_shows_the_docstring_after_the_shell_preamble(
     assert "\nPyright deliberately skips ``reportUnnecessaryIsInstance``" in out
     assert "\nExamples:\n" in out
     assert "exec uv" not in out
+
+
+def test_help_without_a_docstring_prints_no_description(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(unnecessary_assert_isinstance, "__doc__", None)
+    with pytest.raises(SystemExit):
+        _main(monkeypatch, "--help")
+    assert capsys.readouterr().out.split("\n\n")[1].startswith("positional arguments:")
 
 
 @pytest.mark.parametrize(
@@ -1092,9 +1225,66 @@ def test_the_paths_come_from_the_gates_argfile(
     _project(tmp_path, monkeypatch=monkeypatch)
     (tmp_path / "fixer.args").write_text("m.py\n")
     _replay(monkeypatch, flagged=True)
+    replay = subprocess.run
+    seen: list[Sequence[Path]] = []
+
+    def record(
+        argv: Sequence[Path],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        text: Literal[True],
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        if argv[0].name == "basedpyright":
+            seen.append(argv)
+        return replay(
+            argv,
+            cwd=cwd,
+            capture_output=capture_output,
+            text=text,
+            check=check,
+        )
+
+    monkeypatch.setattr(subprocess, "run", record)
 
     assert _main(monkeypatch, "--", "@fixer.args") == 1
+    assert seen[0][-1] == Path("m.py")
     assert capsys.readouterr().out == _FINDING + _SUMMARY
+
+
+def test_a_path_starting_with_x_is_not_an_argfile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project(tmp_path, monkeypatch=monkeypatch)
+    (tmp_path / "Xm.py").write_text("x = 1\n")
+    _replay(monkeypatch, flagged=False)
+    replay = subprocess.run
+    seen: list[Sequence[Path]] = []
+
+    def record(
+        argv: Sequence[Path],
+        *,
+        cwd: Path,
+        capture_output: bool,
+        text: Literal[True],
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        if argv[0].name == "basedpyright":
+            seen.append(argv)
+        return replay(
+            argv,
+            cwd=cwd,
+            capture_output=capture_output,
+            text=text,
+            check=check,
+        )
+
+    monkeypatch.setattr(subprocess, "run", record)
+
+    assert _main(monkeypatch, "Xm.py") == 0
+    assert seen[0][-1] == Path("Xm.py")
 
 
 def test_the_project_root_is_the_nearest_basedpyright_config(tmp_path: Path) -> None:

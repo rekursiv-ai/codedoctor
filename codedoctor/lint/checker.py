@@ -355,7 +355,7 @@ def main() -> int:
     rules = default_rules()
     # Help text is presentation, and a None for either False flag reads the
     # same; test_an_abbreviated_flag_is_rejected pins allow_abbrev itself.
-    # pragma: no mutate start
+    # pragma: no mutate start -- Help text is presentation only.
     parser = argparse.ArgumentParser(
         description=_DESCRIPTION,
         epilog=textwrap.fill(

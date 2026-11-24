@@ -163,7 +163,13 @@ def test_handoff_keeps_failures_and_incomplete_collections(
     log = tmp_path / "events"
     if events is not None:
         log.write_text(events)
-    outcomes.save(data, events=log, tests=["a_test.py", "b_test.py"], status=status)
+    outcomes.save(
+        data,
+        events=log,
+        tests=["a_test.py", "b_test.py"],
+        status=status,
+        sources={},
+    )
     assert outcomes.invalid_tests(data) == invalid
     recorded.read()
     assert recorded.lines(str(tmp_path / "a.py")) == [1]
@@ -177,6 +183,56 @@ def test_plain_coverage_data_has_no_test_failures(tmp_path: Path) -> None:
     recorded.write()
     recorded.close()
     assert outcomes.invalid_tests(data) == set()
+    assert outcomes.changed_sources(data) == set()
+
+
+@pytest.mark.parametrize(
+    ("edit", "changed"),
+    [("kept", set[str]()), ("edited", {"a.py"}), ("deleted", {"a.py"})],
+)
+def test_a_source_changed_since_its_tests_ran_is_named(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    edit: Literal["kept", "edited", "deleted"],
+    changed: set[str],
+) -> None:
+    """Its lines no longer match the data: an edit shifts every line below it."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / "b.py").write_text("y = 1\n")
+    data = tmp_path / "coverage"
+    recorded = coverage.CoverageData(basename=str(data))
+    recorded.add_lines({str(tmp_path / "a.py"): [1]})
+    recorded.write()
+    recorded.close()
+    before = {name: outcomes.fingerprint(tmp_path / name) for name in ("a.py", "b.py")}
+    outcomes.save(
+        data,
+        events=tmp_path / "events",
+        tests=[],
+        status=0,
+        sources=before,
+    )
+    if edit == "edited":
+        (tmp_path / "a.py").write_text("\nx = 1\n")
+    elif edit == "deleted":
+        (tmp_path / "a.py").unlink()
+
+    assert outcomes.changed_sources(data) == changed
+
+
+def test_a_fingerprint_is_the_contents_and_empty_for_no_file(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / "b.py").write_text("x = 1\n")
+    (tmp_path / "c.py").write_text("x = 2\n")
+
+    assert outcomes.fingerprint(tmp_path / "a.py") == outcomes.fingerprint(
+        tmp_path / "b.py",
+    )
+    assert outcomes.fingerprint(tmp_path / "a.py") != outcomes.fingerprint(
+        tmp_path / "c.py",
+    )
+    assert outcomes.fingerprint(tmp_path / "gone.py") == ""
 
 
 if __name__ == "__main__":

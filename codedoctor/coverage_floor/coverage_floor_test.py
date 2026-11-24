@@ -239,7 +239,7 @@ def test_failures_are_scoped_to_own_tests_without_hiding_coverage(
             "failed\tpkg/m_split_test.py::test_g\n" if failed == "pkg/m_test.py" else ""
         ),
     )
-    outcomes.save(data, events=events, tests=["pkg/m_test.py"], status=1)
+    outcomes.save(data, events=events, tests=["pkg/m_test.py"], status=1, sources={})
 
     assert _main(monkeypatch, "--floor", "pkg/=100", "--", "pkg/m.py") == int(
         failed == "pkg/m_test.py" or executed == _CALLED,
@@ -257,6 +257,45 @@ def test_failures_are_scoped_to_own_tests_without_hiding_coverage(
             if executed == _CALLED
             else ""
         )
+    )
+
+
+def test_a_source_edited_after_its_tests_ran_is_rerun_not_floored(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Its recorded lines would land on the edit's shifted ones as misses."""
+    _tree(tmp_path, {"pkg/m.py": _SOURCE, "pkg/m_test.py": "", "pkg/n.py": _SOURCE})
+    monkeypatch.chdir(tmp_path)
+    data = tmp_path / ".coverage"
+    every = [1, 2, 3, 4]
+    _measured(
+        tmp_path,
+        {"pkg/m_test.py::test_f|run": {"pkg/m.py": every, "pkg/n.py": every}},
+        data=data,
+    )
+    outcomes.save(
+        data,
+        events=tmp_path / "events",
+        tests=[],
+        status=0,
+        sources={
+            name: outcomes.fingerprint(tmp_path / name)
+            for name in ("pkg/m.py", "pkg/n.py")
+        },
+    )
+    (tmp_path / "pkg/m.py").write_text(f"# A line above.\n{_SOURCE}")
+
+    assert coverage_floor.report(
+        data,
+        sources=["pkg/m.py", "pkg/n.py"],
+        floors={"pkg/": 100.0},
+        scope="file",
+        owners={"pkg/m.py": ["pkg/m_test.py"], "pkg/n.py": ["pkg/m_test.py"]},
+    )
+    assert capsys.readouterr().out == (
+        "coverage-floor: pkg/m.py changed after its tests ran; rerun\n"
     )
 
 

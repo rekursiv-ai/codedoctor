@@ -3837,6 +3837,38 @@ def test_suppression_form_accepts_two_reasoned_suppressions_on_one_line(
     )
 
 
+def test_suppression_form_flags_a_mutation_pragma_without_its_explanation(
+    tmp_path: Path,
+) -> None:
+    """Each form the mutation gate reads; a block's closing ``end`` needs none."""
+    findings = _findings(
+        tmp_path,
+        SuppressionFormRule(),
+        "a = 1  # pragma: no mutate\n"
+        "b = 2  # pragma: no mutate[truthiness]\n"
+        "# pragma: no mutate start\n"
+        "c = 3\n"
+        "# pragma: no mutate end\n"
+        "# pragma: no mutate[diagnostic-text] start\n"
+        "d = 4\n"
+        "# pragma: no mutate end\n"
+        "def f():  # pragma: no mutate[diagnostic-text] block\n"
+        "    return 5\n"
+        "e = 6  # pragma: no mutate -- Only -OO drops it.\n"
+        "g = 7  # pragma: no mutate[truthiness] -- Only its truth is read.\n"
+        "# pragma: no mutate start -- Any name in a private dir.\n"
+        "h = 8\n"
+        "# pragma: no mutate end\n"
+        "def k():  # pragma: no mutate[diagnostic-text] block -- Wording.\n"
+        "    return 9\n",
+    )
+    assert [f.line for f in findings] == [1, 2, 3, 6, 9]
+    assert findings[0].message == (
+        "`# pragma: no mutate` needs a trailing `-- Reason.` saying why the check"
+        " cannot be satisfied"
+    )
+
+
 def test_suppression_form_ignores_prose_mentioning_noqa(tmp_path: Path) -> None:
     """A docstring that explains the marker is not itself a marker."""
     assert not _findings(
@@ -11064,6 +11096,647 @@ def test_the_module_itself_is_not_at_module_scope() -> None:
     """Only a node the module holds is at its scope; the module has no parent."""
     tree = ast.parse("x = 1\n")
     assert not rules._is_module_scope(tree, {})
+
+
+# -- survivors of the full-rate mutation run, by helper --------------------------
+
+
+def _parent_map(tree: ast.AST) -> dict[ast.AST, ast.AST]:
+    """Map every node of ``tree`` to its parent."""
+    return {
+        child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
+    }
+
+
+def _expr(source: str) -> ast.expr:
+    """Parse one expression."""
+    return ast.parse(source, mode="eval").body
+
+
+def _func(source: str) -> ast.FunctionDef:
+    """Parse one ``def``."""
+    node = ast.parse(source).body[0]
+    assert isinstance(node, ast.FunctionDef)
+    return node
+
+
+@pytest.mark.parametrize(
+    ("source", "want"),
+    [
+        ("import a.b.c", [("a", True)]),
+        ("import a.b as c", [("c", False)]),
+        ("from a import b", [("b", False)]),
+        ("from a import b as c", [("c", False)]),
+    ],
+)
+def test_bindings_names_what_an_import_binds(
+    source: str,
+    want: list[tuple[str, bool]],
+) -> None:
+    assert list(rules._bindings(ast.parse(source).body[0])) == want
+
+
+def test_continued_to_stops_at_the_last_line() -> None:
+    assert rules._continued_to(["a \\"], 0) == 1
+    assert rules._continued_to(["a \\", "b \\", "c"], 0) == 3
+
+
+def test_a_statement_dominates_only_a_later_one() -> None:
+    tree = ast.parse("a = 1\nb = 2\n")
+    first, second = tree.body
+    parents = _parent_map(tree)
+    assert rules._dominates(first, later=second, parents=parents)
+    assert not rules._dominates(second, later=first, parents=parents)
+    assert not rules._dominates(first, later=first, parents=parents)
+
+
+@pytest.mark.parametrize(
+    ("source", "want"),
+    [
+        ('__all__: list[str] = ["a"]\n', {"a"}),
+        ('x = ["a"]\n__all__ = ["b"]\n', {"b"}),
+        ('__all__ = ["a", foo, 1]\n', {"a"}),
+        ('__all__ = ("a",)\n', {"a"}),
+        ("__all__ = foo\n", set[str]()),
+        ("__all__: list[str]\n", set[str]()),
+    ],
+)
+def test_dunder_all_lists_the_string_names(source: str, want: set[str]) -> None:
+    assert rules._dunder_all(ast.parse(source)) == want
+
+
+@pytest.mark.parametrize(
+    ("source", "want"),
+    [
+        ("x: a.b = 1", True),
+        ("x: int = a.b", False),
+        ("def f(p: a.b): pass", True),
+        ("def f() -> a.b: pass", True),
+        ("async def f() -> a.b: pass", True),
+        ("y = a.b", False),
+        ("def f(p=a.b): pass", False),
+        ("def f(p: int):\n    return a.b", False),
+    ],
+)
+def test_a_name_is_an_annotation_only_inside_one(source: str, *, want: bool) -> None:
+    tree = ast.parse(source)
+    node = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "b"
+    )
+    assert rules._in_annotation(node, parents=_parent_map(tree)) is want
+
+
+@pytest.mark.parametrize(
+    ("marker", "ignored"),
+    [
+        ("import a.b  # house-ignore[other,dotted-import]\nx = a.b.c\n", True),
+        (
+            (
+                "# house-ignore[other]\nimport a.b  # house-ignore[dotted-import]\n"
+                "x = a.b.c\n"
+            ),
+            True,
+        ),
+        ("import a.b\n\nx = 1  # house-ignore[dotted-import]\ny = a.b.c\n", False),
+        (
+            (
+                "import a.b, \\\n    c.d  # house-ignore[dotted-import]\n"
+                "x = a.b.z + c.d.z\n"
+            ),
+            True,
+        ),
+    ],
+)
+def test_dotted_import_obeys_a_marker_only_where_it_covers_the_import(
+    tmp_path: Path,
+    marker: str,
+    *,
+    ignored: bool,
+) -> None:
+    messages = [m for _, m in _messages(tmp_path, DottedImportRule(), marker)]
+    assert all("house-ignore[dotted-import] marker" in m for m in messages) is ignored
+
+
+@pytest.mark.parametrize(
+    ("source", "index", "want"),
+    [
+        ("import a.b  # note\n", 0, (10, 18, "# note")),
+        ("import a.b  # note", 0, (10, 18, "# note")),
+        ("1\n# c\n", 0, None),
+        ("é = 1  # c\n", 0, (5, 10, "# c")),
+        ("x = 1; import a.b  # c\n", 1, None),
+        ("import a.b\nx = 1\n", 0, None),
+    ],
+)
+def test_trailing_comment_spans_the_comment_after_a_statement(
+    source: str,
+    index: int,
+    want: tuple[int, int, str] | None,
+) -> None:
+    node = ast.parse(source).body[index]
+    got = rules._trailing_comment(source, starts=rules._line_starts(source), node=node)
+    assert got == want
+
+
+@pytest.mark.parametrize(
+    ("value", "want"),
+    [(None, []), ("a", []), ([1, "b"], [1, "b"]), ({"k": 1}, [])],
+)
+def test_listed_reads_only_a_json_array(value: object, want: list[object]) -> None:
+    assert rules._listed(value) == want
+
+
+@pytest.mark.parametrize(
+    ("source", "calls", "want"),
+    [
+        ("f() + 1", ["f"], True),
+        ("1 + f()", ["f"], True),
+        ("1 + g()", ["f"], False),
+        ("g() + 1", ["f"], False),
+    ],
+)
+def test_declarative_value_reads_both_operands_with_the_calls(
+    source: str,
+    calls: list[str],
+    *,
+    want: bool,
+) -> None:
+    assert rules._is_declarative_value(_expr(source), calls) is want
+
+
+@pytest.mark.parametrize(
+    ("source", "want"),
+    [
+        ("def f(x):\n    return g(x)\n", True),
+        ("def f(x):\n    return g(x)\n    y = 1\n", False),
+        ('def f(x):\n    "doc"\n', False),
+        ("def f(x):\n    y = 1\n", False),
+    ],
+)
+def test_is_forwarder_wants_exactly_one_return_of_a_call(
+    source: str,
+    *,
+    want: bool,
+) -> None:
+    assert rules._is_forwarder(_func(source)) is want
+
+
+@pytest.mark.parametrize(
+    ("source", "want"),
+    [
+        ("torch.load(p)", True),
+        ("cast(T, torch.load(p))", True),
+        ("torch.load(p, m)", True),
+        ("f(a, torch.load(b))", False),
+        ("cast(T, x)", False),
+        ("x", False),
+    ],
+)
+def test_is_torch_load_sees_through_a_cast_only(source: str, *, want: bool) -> None:
+    assert rules._is_torch_load(_expr(source)) is want
+
+
+@pytest.mark.parametrize(
+    ("source", "want"),
+    [
+        ("{1: 2}", True),
+        ("{}", False),
+        ("{1: 2, 3: x}", False),
+        ("{x: 1, 2: 3}", False),
+        ("{**a}", False),
+        ("{1: 2, **a}", False),
+    ],
+)
+def test_literal_value_needs_every_dict_key_and_value_literal(
+    source: str,
+    *,
+    want: bool,
+) -> None:
+    assert _is_literal_value(_expr(source)) is want
+
+
+def _keeps(tmp_path: Path, source: str) -> bool:
+    """Run ``_keeps_bindings`` on the module's ``def`` and the call to it."""
+    unit = _unit(tmp_path, source)
+    tree = unit.tree
+    assert isinstance(tree, ast.Module)
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef))
+    call = next(
+        c
+        for c in unit.nodes(ast.Call)
+        if isinstance(c.func, ast.Name) and c.func.id == node.name
+    )
+    return rules._keeps_bindings(node, call, unit)
+
+
+def test_inlining_a_free_name_into_a_class_body_keeps_its_binding(
+    tmp_path: Path,
+) -> None:
+    source = (
+        "def t(xs):\n    return [K + x for x in xs]\n\n\nclass C:\n    v = t(items)\n"
+    )
+    assert _keeps(tmp_path, source)
+
+
+def test_inlining_a_parameter_read_in_a_lambda_into_a_class_body_loses_it(
+    tmp_path: Path,
+) -> None:
+    source = "def t(a):\n    return lambda: a\n\n\nclass C:\n    v = t(q)\n"
+    assert not _keeps(tmp_path, source)
+
+
+def test_importers_reach_a_name_through_the_package_path(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "a_none.py").write_text("x = 1\n", encoding="utf-8")
+    (pkg / "mod.py").write_text("_abs = 1\n", encoding="utf-8")
+    (pkg / "user.py").write_text(
+        "from pkg import mod\nx = mod._abs\n",
+        encoding="utf-8",
+    )
+    reached = rules._names_reached_by_importers(pkg / "mod.py", {"_abs"})
+    assert reached == {"_abs"}
+
+
+def test_importers_of_a_sibling_package_do_not_reach_a_nested_module(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "sub").mkdir(parents=True)
+    (tmp_path / "pkg" / "sub" / "mod.py").write_text("_abs = 1\n", encoding="utf-8")
+    (tmp_path / "pkg" / "other.py").write_text(
+        "from pkg import x\nmod = 1.5\nvalue = _abs\n",
+        encoding="utf-8",
+    )
+    reached = rules._names_reached_by_importers(
+        tmp_path / "pkg" / "sub" / "mod.py",
+        {"_abs"},
+    )
+    assert reached == frozenset()
+
+
+def test_probed_proxy_is_empty_when_no_name_is_a_proxy() -> None:
+    annotation = _expr("x")
+    assert rules._probed_proxy(annotation, frozenset(), probed=None) == ""
+    assert rules._probed_proxy(annotation, frozenset({"x"}), probed=None) == "x"
+    assert rules._probed_proxy(annotation, frozenset({"mod"}), probed="mod.x") == ""
+
+
+@pytest.mark.parametrize(
+    ("source", "want"),
+    [("f()", ""), ("x", "x"), ("x.y[0]", "x"), ("cast(T, x.get(1))", "x")],
+)
+def test_read_root_names_the_variable_a_read_starts_from(
+    source: str,
+    want: str,
+) -> None:
+    assert rules._read_root(_expr(source)) == want
+
+
+def test_sectioned_defs_skips_a_def_without_a_docstring(tmp_path: Path) -> None:
+    unit = _unit(
+        tmp_path,
+        'def f():\n    pass\n\n\ndef g():\n    """Doc.\n\n    Args:\n      x: y.\n    """\n',
+    )
+    assert [(n.name, s) for n, s in rules._sectioned_defs(unit, 0)] == [
+        ("g", {"Args"}),
+    ]
+
+
+def test_segment_falls_back_to_the_unparsed_node_when_its_span_is_empty() -> None:
+    empty = ast.Name(
+        id="x",
+        ctx=ast.Load(),
+        lineno=1,
+        col_offset=0,
+        end_lineno=1,
+        end_col_offset=0,
+    )
+    assert rules._segment("x", empty) == "x"
+    assert rules._segment("(x)", _expr("(x)")) == "x"
+
+
+def test_statements_in_goes_past_a_nested_def() -> None:
+    stmt = ast.parse(
+        "if c:\n    a = 1\n    def inner():\n        b = 2\n    d = 3\n",
+    ).body[0]
+    assert sorted(s.lineno for s in rules._statements_in(stmt)) == [1, 2, 5]
+
+
+def test_staticmethod_fix_finds_the_paren_below_a_def_after_a_class_paren(
+    tmp_path: Path,
+) -> None:
+    source = (
+        "class A(B):\n    @staticmethod\n    def f \\\n(*args):\n        return 1\n"
+    )
+    assert StaticMethodRule().fix(_unit(tmp_path, source)) == (
+        "class A(B):\n    @classmethod\n    def f \\\n(cls, *args):\n        return 1\n"
+    )
+
+
+def test_fluent_name_leaves_a_dunder(tmp_path: Path) -> None:
+    assert not _findings(tmp_path, FluentNameRule(), "def __schema_of(): ...\n")
+
+
+def test_forwarder_helper_leaves_a_name_the_test_reaches_and_inlines_the_next(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "mod_test.py").write_text("_abs\n", encoding="utf-8")
+    source = (
+        "def run(a):\n    return _abs(a) + _neg(a)\n\n\n"
+        "def _abs(x):\n    return abs(x)\n\n\n"
+        "def _neg(x):\n    return neg(x)\n"
+    )
+    findings = _findings(tmp_path, ForwarderHelperRule(), source)
+    assert [f.line for f in findings] == [9]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def run(a):\n    return __h(a)\n\n\ndef __h(x):\n    return abs(x)\n",
+        (
+            "def run(a):\n    return [_is(a), _is(a)]\n\n\n"
+            "def _is(x) -> TypeGuard[int]:\n    return check(x, TypeGuard[int])\n"
+        ),
+        (
+            "def run(a):\n    return [_is(a), _is(a)]\n\n\n"
+            "def _is(x) -> TypeIs[int]:\n    return check(x, TypeIs[int])\n"
+        ),
+        (
+            "def run(a):\n    return [_f(a), _f(a)]\n\n\n"
+            "@deco\ndef _f(x):\n    return g(x)\n"
+        ),
+        "def run():\n    return [_f(), _f()]\n\n\ndef _f(*args):\n    return g(*args)\n",
+        "def run():\n    return [_f(), _f()]\n\n\ndef _f(**kw):\n    return g(**kw)\n",
+    ],
+    ids=["dunder", "type-guard", "type-is", "decorated", "vararg", "kwarg"],
+)
+def test_forwarder_helper_leaves_what_inlining_would_change(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    assert not _findings(tmp_path, ForwarderHelperRule(), source)
+    assert _fixed(tmp_path, ForwarderHelperRule(), source) is None
+
+
+def test_forwarder_helper_inlines_adjacent_defs_in_one_pass(tmp_path: Path) -> None:
+    source = (
+        "def run(a):\n    return _abs(a) + _neg(a)\n\n\n"
+        "def _abs(x):\n    return abs(x)\n\n\n"
+        "def _neg(x):\n    return neg(x)\n"
+    )
+    assert _fixed(tmp_path, ForwarderHelperRule(), source) == (
+        "def run(a):\n    return abs(a) + neg(a)\n"
+    )
+
+
+def test_forwarder_helper_keeps_going_past_a_deferred_forwarder(
+    tmp_path: Path,
+) -> None:
+    source = (
+        "def run(a):\n    return _outer(a) + _third(a)\n\n\n"
+        "def _inner(x):\n    return abs(x)\n\n\n"
+        "def _outer(y):\n    return _inner(y)\n\n\n"
+        "def _third(z):\n    return neg(z)\n"
+    )
+    fixed = _fixed(tmp_path, ForwarderHelperRule(), source)
+    assert fixed is not None
+    assert "def _third" not in fixed
+    assert "neg(a)" in fixed
+
+
+@pytest.mark.parametrize(
+    ("source", "want"),
+    [
+        (
+            (
+                "def f(a: int) -> int:\n    return _abs(a) + 1  \n\n\n"
+                "def _abs(x: int):\n    return abs(x)\n"
+            ),
+            "def f(a: int) -> int:\n    return abs(a) + 1  \n",
+        ),
+        (
+            (
+                "def f(a: int) -> int:\n    return _abs(a) + MAX\n\n\n"
+                "def _abs(x: int):\n    return abs(x)\n"
+            ),
+            "def f(a: int) -> int:\n    return abs(a) + MAX\n",
+        ),
+        (
+            (
+                "def f(a):\n    return _abs(a)\n\n\n"
+                "def _abs(x):\n    return abs(x)\n\n\n"
+                "def g(b):\n    return b\n"
+            ),
+            "def f(a):\n    return abs(a)\n\n\ndef g(b):\n    return b\n",
+        ),
+    ],
+)
+def test_forwarder_helper_fix_ends_the_file_with_one_newline(
+    tmp_path: Path,
+    source: str,
+    want: str,
+) -> None:
+    assert _fixed(tmp_path, ForwarderHelperRule(), source) == want
+
+
+def test_import_alias_claims_a_name_once(tmp_path: Path) -> None:
+    source = "import loop.kernel as a\nimport loop.kernel as b\n"
+    assert [f.line for f in _findings(tmp_path, ImportAliasRule(), source)] == [1]
+
+
+def test_import_alias_check_reads_nothing_of_a_file_that_does_not_parse(
+    tmp_path: Path,
+) -> None:
+    assert not _findings(tmp_path, ImportAliasRule(), "import (\n")
+
+
+@pytest.mark.parametrize(
+    ("source", "want"),
+    [
+        (
+            "import loop.kernel as k\nx = k.f()\n",
+            "from loop import kernel\nx = kernel.f()\n",
+        ),
+        ("import loop as lp\nx = lp.f()\n", "import loop\nx = loop.f()\n"),
+        ("from .mod import y as z\nfrom .other import w\n", None),
+    ],
+)
+def test_import_alias_fix_drops_the_alias_of_a_first_party_name(
+    tmp_path: Path,
+    source: str,
+    want: str | None,
+) -> None:
+    assert _fixed(tmp_path, ImportAliasRule(), source) == want
+
+
+def test_import_hoist_moves_an_import_with_a_trailing_comment(tmp_path: Path) -> None:
+    source = "def f():\n    import os  # note\n    return os\n"
+    assert _fixed(tmp_path, ImportHoistRule(), source) == (
+        "import os  # note\n\n\ndef f():\n    return os\n"
+    )
+
+
+def test_returns_named_reads_past_a_def_without_a_docstring(tmp_path: Path) -> None:
+    source = (
+        "def a():\n    pass\n\n\n"
+        'def b():\n    """Doc.\n\n    Returns:\n      int.\n    """\n'
+    )
+    assert [f.line for f in _findings(tmp_path, ReturnsNamedRule(), source)] == [5]
+
+
+def test_cli_names_the_function_that_should_hold_the_flags(tmp_path: Path) -> None:
+    body = (
+        "import argparse\n\n\ndef main() -> int:\n"
+        '    parser = argparse.ArgumentParser(description=(__doc__ or "").strip())\n'
+        '    parser.add_argument("--x")\n    return 0\n'
+    )
+    findings, _ = _cli(tmp_path, body)
+    message = next(m for _, m in findings if m.startswith("(e)"))
+    assert message.endswith("group flags in _add_arguments")
+
+
+def test_cli_fix_skips_a_wrapped_description_and_rewrites_the_next(
+    tmp_path: Path,
+) -> None:
+    body = (
+        "import argparse\n\n\ndef main() -> int:\n"
+        "    argparse.ArgumentParser(\n"
+        "        description=__doc__.strip(\n"
+        '            " ",\n'
+        "        ),\n"
+        "    )\n"
+        "    argparse.ArgumentParser(description=__doc__.strip())\n"
+        "    return 0\n"
+    )
+    _, fixed = _cli(tmp_path, body)
+    assert fixed is not None
+    assert 'argparse.ArgumentParser(description=(__doc__ or "").strip())' in fixed
+    assert "__doc__.strip(\n" in fixed
+
+
+@pytest.mark.parametrize(
+    ("source", "want"),
+    [
+        (
+            "import a.b.c\nx = a.b.c.z\n",
+            (
+                "import a.b.c binds a; write `from a.b import c` "
+                "(rerun with --fix dotted-import)"
+            ),
+        ),
+        (
+            "import a.b.id\nx = a.b.id.z\n",
+            (
+                "import a.b.id binds a; write `from a.b import id as <qualifier>_id` "
+                "(not autofixed: `id` is a builtin)"
+            ),
+        ),
+    ],
+)
+def test_dotted_import_message_names_the_parent_and_the_leaf(
+    tmp_path: Path,
+    source: str,
+    want: str,
+) -> None:
+    assert _messages(tmp_path, DottedImportRule(), source) == [(1, want)]
+
+
+@pytest.mark.parametrize(
+    ("source", "reason"),
+    [
+        (
+            "import a.b.c\nsetattr(a.b, 'c', 1)\nx = a.b.c.z\n",
+            "`a.b.c` is swapped on `a.b` at runtime",
+        ),
+        (
+            "from __future__ import annotations\nimport a\nx = a.b.Z\nimport a.b\n",
+            "a read of `a.b` can run where this import has not",
+        ),
+        (
+            "import a\nx: a.b.Z = 1\nimport a.b\n",
+            "a read of `a.b` can run where this import has not",
+        ),
+        (
+            "import a.b\n\n\ndef a():\n    pass\n\n\nx = a.b.c\n",
+            "`a` is also bound another way in this scope",
+        ),
+        (
+            "import a.b\nvals = [(a := i) for i in range(3)]\nx = a.b.c\n",
+            "`a` is also bound another way in this scope",
+        ),
+    ],
+)
+def test_dotted_import_leaves_an_import_it_cannot_prove_safe(
+    tmp_path: Path,
+    source: str,
+    reason: str,
+) -> None:
+    messages = [m for _, m in _messages(tmp_path, DottedImportRule(), source)]
+    assert any(f"(not autofixed: {reason}" in m for m in messages), messages
+
+
+def test_dotted_import_beside_an_unrelated_import_is_the_sole_binder(
+    tmp_path: Path,
+) -> None:
+    source = "x = a.b.Z\nimport a.b\nimport c\n"
+    messages = [m for _, m in _messages(tmp_path, DottedImportRule(), source)]
+    assert messages == [
+        "import a.b binds a; write `from a import b` (rerun with --fix dotted-import)",
+    ]
+
+
+def test_dotted_imports_build_nothing_without_a_dotted_import(tmp_path: Path) -> None:
+    assert rules._DottedImports.build(_unit(tmp_path, "import os\n")) is None
+    assert rules._DottedImports.build(_unit(tmp_path, "import os.path\n")) is not None
+
+
+def test_dotted_import_rewrite_restores_the_root_of_a_later_group_in_one_pass(
+    tmp_path: Path,
+) -> None:
+    """``fix`` repeats to a fixed point, which hides a pass that stops early."""
+    source = "import a.b\nimport c.d\nprint(c)\nx = a.b.z\ny = c.d.w\n"
+    found = rules._DottedImports.build(_unit(tmp_path, source))
+    assert found is not None
+    assert found.rewrite() == (
+        "from a import b\nimport c\nfrom c import d\nprint(c)\nx = b.z\ny = d.w\n"
+    )
+
+
+def test_forwarder_helper_inlines_defs_with_no_line_between_them(
+    tmp_path: Path,
+) -> None:
+    source = (
+        "def run(a):\n    return _abs(a) + _neg(a)\n\n\n"
+        "def _abs(x):\n    return abs(x)\n"
+        "def _neg(x):\n    return neg(x)\n"
+    )
+    assert _fixed(tmp_path, ForwarderHelperRule(), source) == (
+        "def run(a):\n    return abs(a) + neg(a)\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "want"),
+    [
+        ("time.sleep(RETRY_DELAY)", True),
+        ("time.sleep(Attempt)", True),
+        ("time.sleep(a, backoff)", True),
+        ("time.sleep(1)", False),
+        ("try:\n    pass\nexcept E:\n    time.sleep(1)\n", True),
+        ("def f():\n    time.sleep(1)\n", False),
+    ],
+)
+def test_a_sleep_is_a_backoff_by_its_delay_or_its_handler(
+    source: str,
+    *,
+    want: bool,
+) -> None:
+    tree = ast.parse(source)
+    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call))
+    assert rules._is_backoff(call, _parent_map(tree)) is want
 
 
 if __name__ == "__main__":

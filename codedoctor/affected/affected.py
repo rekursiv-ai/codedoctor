@@ -316,7 +316,7 @@ def _connect(database: Path) -> sqlite3.Connection | None:
         # name there and took `mode=ro` with it. SQLite does not fail on that --
         # it CREATES the truncated name, writable and empty, so the walk read a
         # file that is not the index and left a stray one in the tree.
-        # pragma: no mutate[truthiness] start
+        # pragma: no mutate[truthiness] start -- `sqlite3` reads `check_same_thread` only as a truth value.
         return sqlite3.connect(
             f"file:{pathname2url(str(database))}?mode=ro",
             uri=True,
