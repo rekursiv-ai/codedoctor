@@ -3579,8 +3579,8 @@ class SuppressionFormRule:
     """Every suppression comment carries a ``-- Reason.`` tail.
 
     Applies to ruff (``noqa``), basedpyright (``pyright: ignore``), ty
-    (``ty: ignore``), pyrefly (``pyrefly: ignore``), and the house marker
-    itself. A bare suppression tells
+    (``ty: ignore``), pyrefly (``pyrefly: ignore``), the mutation gate
+    (``pragma: no mutate``), and the house marker itself. A bare suppression tells
     the next reader that a check was silenced and nothing else; the reason is
     what lets them decide whether it still holds. The fix-types skill requires
     the tail already; this makes the gate enforce it.
@@ -4579,8 +4579,7 @@ class SleepRule:
     not resolved to ``time`` and passes, which is what lets an injected fake
     clock through. The one real clock that backs it marks its call::
 
-        # The real clock.
-        time.sleep(delay_sec)  # house-ignore[sleep] -- See above.
+        time.sleep(delay_sec)  # house-ignore[sleep] -- The real clock behind the fake.
     """
 
     name: ClassVar[str] = "sleep"
@@ -5465,16 +5464,18 @@ _CLASS_KEYWORD = re.compile(r"\bclass\b")
 
 
 _SUPPRESSION_PROBE = re.compile(
-    r"noqa|pyright:|ty:|pyrefly:|type:\s*ignore|house-ignore",
+    r"noqa|pyright:|ty:|pyrefly:|type:\s*ignore|house-ignore|no mutate",
 )
 """Necessary-condition probe; a file without any of these has no suppression."""
 
 # One alternation for every checker's inline form. ``noqa`` without a code list
 # is still a suppression (ruff treats it as blanket) and still needs a reason.
+# A mutation block's closing ``end`` suppresses nothing: its ``start`` explains.
 _SUPPRESSION = re.compile(
     r"#\s*(?:noqa(?::\s*[A-Z]+\d+(?:\s*,\s*[A-Z]+\d+)*)?"
     r"|(?:pyright|ty|pyrefly):\s*ignore\[[^\]]*\]"
-    r"|house-ignore\[[^\]]*\])",
+    r"|house-ignore\[[^\]]*\]"
+    r"|pragma:\s*no mutate(?:\[[^\]]*\])?(?!\s+end\b)(?:\s+(?:start|block)\b)?)",
 )
 _FMT_DIRECTIVE = re.compile(r"#\s*fmt:\s*(?:skip|off|on)\b")
 """A ruff/black formatter directive, ``on`` included: it only pairs an ``off``."""
@@ -6378,19 +6379,18 @@ def _keeps_evaluation(
             computed.append(read)
     if not computed:
         return True
-    # On the unconditional path of one scope, source order is evaluation order. A
-    # comprehension runs its calls when it is reached, after its first iterable.
-    # Names, and the arguments they read, never overlap: start and end order alike.
-    computed.sort(key=lambda n: _span(starts, n)[0])  # pragma: no mutate
-    order = [_span(starts, reads[n])[0] for n in computed]  # pragma: no mutate
-    last = _span(starts, computed[-1])[0]  # pragma: no mutate
+    # pragma: no mutate start -- One scope runs in source order; names never overlap.
+    computed.sort(key=lambda n: _span(starts, n)[0])
+    order = [_span(starts, reads[n])[0] for n in computed]
+    last = _span(starts, computed[-1])[0]
+    # pragma: no mutate end
     return order == sorted(order) and not any(
         isinstance(
             n,
             ast.Call | ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp,
         )
         and scopes.owner[n] is node
-        and _span(starts, n)[1] <= last  # pragma: no mutate -- no call ends at a name
+        and _span(starts, n)[1] <= last  # pragma: no mutate -- No call ends at a name.
         and any(isinstance(m, ast.Call) for m in ast.walk(n))
         for n in ast.walk(expr)
     )

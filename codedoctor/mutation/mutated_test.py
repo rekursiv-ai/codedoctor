@@ -3906,8 +3906,7 @@ def test_a_mutmut_run_past_its_limit_is_stopped_with_what_it_started(
             os.kill(pid, 0)
         except ProcessLookupError:
             break
-        # Not our child: no event marks its exit.
-        time.sleep(0.01)  # house-ignore[sleep] -- See above.
+        time.sleep(0.01)  # house-ignore[sleep] -- Not our child: no exit event.
     else:
         pytest.fail(f"the job {pid} outlived its run's limit")
 

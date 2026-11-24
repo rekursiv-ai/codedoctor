@@ -39,7 +39,7 @@ import coverage
 from codedoctor.gate.gate import skipped
 from codedoctor.lib import pyproject_flags
 from codedoctor.lib.sidecars import is_test, paired
-from codedoctor.testing.outcomes import invalid_tests
+from codedoctor.testing.outcomes import changed_sources, invalid_tests
 
 
 if TYPE_CHECKING:
@@ -147,13 +147,15 @@ def report(
         source's import, count.
 
     Returns:
-      below: Whether any source lacks measurements, has failed or unfinished
-        own tests, or belongs to a unit below its floor.
+      below: Whether any source lacks measurements, changed after its tests
+        ran, has failed or unfinished own tests, or belongs to a unit below its
+        floor.
 
     """
     measurement = _own_measurement(data, sources=sources, owners=owners)
     measured = measurement.get_data().measured_files()
     invalid = invalid_tests(data)
+    changed = changed_sources(data)
     below = False
     for source in sources:
         failed = sorted(invalid.intersection(owners[source]))
@@ -163,11 +165,20 @@ def report(
                 f"{', '.join(failed)}\n",
             )
             below = True
-        if str(Path(source).resolve()) not in measured:
+        if source in changed:
+            sys.stdout.write(
+                f"coverage-floor: {source} changed after its tests ran; rerun\n",
+            )
+            below = True
+        elif str(Path(source).resolve()) not in measured:
             sys.stdout.write(f"coverage-floor: {source} has no coverage measurement\n")
             below = True
     # `morfs`, not `include`: one glob per source took 3.7s for 472 sources.
-    morfs = [source for source in sources if str(Path(source).resolve()) in measured]
+    morfs = [
+        source
+        for source in sources
+        if source not in changed and str(Path(source).resolve()) in measured
+    ]
     # No table: printing one re-read every source, 10s of an --all-files run, and
     # each unit below its floor already names its missed lines.
     units: dict[str, tuple[float, int, int, list[str]]] = {}

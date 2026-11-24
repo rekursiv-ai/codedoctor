@@ -565,6 +565,9 @@ def test_pytest_leaves_its_coverage_for_the_floor_and_clears_a_stale_one(
     assert outcomes.invalid_tests(left) == (
         {"a_test.py"} if status == 1 else {"b_test.py"} if status == 2 else set()
     )
+    assert outcomes.changed_sources(left) == set()
+    (root / "a.py").write_text("\nx = 1\n")
+    assert outcomes.changed_sources(left) == {"a.py"}
 
 
 @pytest.mark.parametrize(

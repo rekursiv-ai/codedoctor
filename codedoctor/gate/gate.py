@@ -317,7 +317,7 @@ def run_argv(argv: Sequence[str]) -> int:
     try:
         return subprocess.run(  # noqa: S603 -- gate argv.
             argv,
-            check=False,  # pragma: no mutate[truthiness]
+            check=False,  # pragma: no mutate[truthiness] -- Subprocess reads check only as a truth value.
         ).returncode
     except FileNotFoundError:
         return _missing(argv[0])
@@ -425,7 +425,7 @@ def output_argv(argv: Sequence[str]) -> str | None:
             argv,
             stdout=subprocess.PIPE,
             text=True,
-            check=False,  # pragma: no mutate[truthiness]
+            check=False,  # pragma: no mutate[truthiness] -- Subprocess reads check only as a truth value.
         )
     except FileNotFoundError:
         _missing(argv[0])
@@ -459,7 +459,7 @@ def _process(pid: int) -> tuple[int, str] | None:
         ],
         capture_output=True,
         text=True,
-        check=False,  # pragma: no mutate[truthiness]
+        check=False,  # pragma: no mutate[truthiness] -- Subprocess reads check only as a truth value.
     )
     parent, _, command = done.stdout.strip().partition(" ")
     return (int(parent), command) if parent.isdigit() else None

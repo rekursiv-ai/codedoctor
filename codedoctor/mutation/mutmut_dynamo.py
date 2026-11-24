@@ -47,7 +47,7 @@ _is_compiling: list[Callable[[], bool]] = []
 
 # Never mutated: a trampoline wrapped around the lookup every trampoline calls
 # recurses until the stats phase dies.
-def pytest_configure() -> None:  # pragma: no mutate block
+def pytest_configure() -> None:  # pragma: no mutate block -- Mutating it kills stats.
     """Route every trampoline through the Dynamo-traceable lookup; keep ``stats`` here."""
     trampoline.get_mutant_under_test = _traceable_mutant_under_test  # ty: ignore[invalid-assignment] -- Monkeypatching mutmut's module function is this plugin's purpose.
     # The lookup falls back to the process-local copy once the variable is gone.
@@ -56,13 +56,13 @@ def pytest_configure() -> None:  # pragma: no mutate block
         del os.environ["MUTANT_UNDER_TEST"]
 
 
-def _traceable_mutant_under_test() -> str:  # pragma: no mutate block
+def _traceable_mutant_under_test() -> str:  # pragma: no mutate block -- Stats recurse.
     """Return the active mutant, hiding the ``stats`` phase from Dynamo."""
     name = _mutant_under_test()
     return "" if name == "stats" and _compiling() else name
 
 
-def _compiling() -> bool:  # pragma: no mutate block
+def _compiling() -> bool:  # pragma: no mutate block -- A mutant here kills stats runs.
     """Return whether Dynamo is tracing; ``False`` while torch is unimported."""
     if not _is_compiling:
         if "torch" not in sys.modules:

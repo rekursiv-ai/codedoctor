@@ -306,7 +306,7 @@ def _pragma_source(
 def _ignored_scope(
     source: str,
     *,
-    filename: str = "",  # pragma: no mutate[diagnostic-text]
+    filename: str = "",  # pragma: no mutate[diagnostic-text] -- A person reads the filename in PragmaVisitor's error text.
 ) -> frozenset[int]:
     visitor = PragmaVisitor(filename)
     try:
@@ -378,7 +378,7 @@ class _SelectiveVisitor(MutationVisitor):
             for label in ("diagnostic-text", "case-insensitive"):
                 if _matches_label(original, mutant=mutant, label=label):
                     matches[label] = {line}
-        matched = False  # pragma: no mutate[truthiness]
+        matched = False  # pragma: no mutate[truthiness] -- Only `if not self._matches(...)` reads it, as a truth value.
         for index, scope in enumerate(self.policy.scopes):
             labels = {
                 label
