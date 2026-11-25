@@ -156,22 +156,51 @@ def test_worktree_sync_uses_current_files_without_a_backbone(tmp_path: Path) -> 
     assert (root / ".codegraph").resolve() == home / "cli"
 
 
-def test_worktree_sync_relinks_an_index_whose_cache_was_deleted(tmp_path: Path) -> None:
-    """Cleaning /opt/scratch left ``.codegraph`` dangling, and every sync failed."""
+@pytest.mark.parametrize("prefix", ["caches", "moved"])
+def test_worktree_sync_relinks_its_own_index_whose_cache_was_deleted(
+    tmp_path: Path,
+    prefix: str,
+) -> None:
+    """Cleaning /opt/scratch left ``.codegraph`` dangling, and every sync failed.
+
+    ``moved`` stands for the same caches reached by another path, as
+    ``/opt/scratch`` and ``/data/opt/scratch`` are one directory.
+    """
     root = tmp_path / "root"
     root.mkdir()
     caches = tmp_path / "caches"
-    (root / ".codegraph").symlink_to(tmp_path / "deleted" / "cli")
+    home = backbone.overlay_database(caches, root=root).parent
+    (root / ".codegraph").symlink_to(
+        tmp_path / prefix / home.relative_to(caches) / "cli",
+    )
     calls: list[Path] = []
 
     def run(argv: Sequence[str]) -> int:
         return _indexer(calls)(Path(argv[-1]))
 
     assert backbone.sync_worktree(root, caches=caches, run=run) == ""
-    home = backbone.overlay_database(caches, root=root).parent
-    assert (root / ".codegraph").resolve() == home / "cli"
+    assert (root / ".codegraph").readlink() == (home / "cli").resolve()
     assert (home / "cli" / "codegraph.db").is_file()
     assert calls == [root]
+
+
+def test_worktree_sync_keeps_a_dead_index_it_does_not_own(tmp_path: Path) -> None:
+    """A user's index on an unmounted disk must survive until the disk returns."""
+    root = tmp_path / "root"
+    root.mkdir()
+    own = tmp_path / "unmounted" / "codegraph"
+    (root / ".codegraph").symlink_to(own)
+    calls: list[Path] = []
+
+    def run(argv: Sequence[str]) -> int:
+        return _indexer(calls)(Path(argv[-1]))
+
+    assert backbone.sync_worktree(root, caches=tmp_path / "caches", run=run) == (
+        f"{root / '.codegraph'} points to missing {own}, which is not this "
+        "worktree's CodeGraph index; remove the link to have it relinked."
+    )
+    assert (root / ".codegraph").readlink() == own
+    assert calls == []
 
 
 def test_worktree_sync_reuses_cached_state_and_locks_the_writer(tmp_path: Path) -> None:

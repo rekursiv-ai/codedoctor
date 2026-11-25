@@ -421,15 +421,29 @@ def test_a_link_whose_cache_was_deleted_is_reseeded(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
     caches = tmp_path / "caches"
-    (root / ".codegraph").symlink_to(tmp_path / "deleted" / "cli")
+    home = backbone.overlay_database(caches, root=root).parent / "cli"
+    (root / ".codegraph").symlink_to(tmp_path / "moved" / home.relative_to(caches))
 
     assert codegraph_sync.link_cli_index(root, caches=caches) == ""
 
-    overlay = backbone.overlay_database(caches, root=root)
-    assert (root / ".codegraph").resolve() == overlay.parent / "cli"
+    assert (root / ".codegraph").readlink() == home.resolve()
     assert backbone.stamped(root / ".codegraph" / "codegraph.db") == (
         backbone.stamped(backbone.backbone_database(caches))
     )
+
+
+def test_a_dead_link_not_to_this_worktrees_index_is_kept(tmp_path: Path) -> None:
+    _refresh(tmp_path, _Tools())
+    root = tmp_path / "root"
+    root.mkdir()
+    own = tmp_path / "unmounted" / "codegraph"
+    (root / ".codegraph").symlink_to(own)
+
+    assert codegraph_sync.link_cli_index(root, caches=tmp_path / "caches") == (
+        f"{root / '.codegraph'} points to missing {own}, which is not this "
+        "worktree's CodeGraph index; remove the link to have it relinked."
+    )
+    assert (root / ".codegraph").readlink() == own
 
 
 def test_an_existing_cli_index_is_left_alone(tmp_path: Path) -> None:
