@@ -91,7 +91,9 @@ def sync_worktree(
     with (home / "current.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         index = root / ".codegraph"
-        if not index.exists() and not index.is_symlink():
+        if not index.exists():
+            # A link into caches someone cleaned dangles; replacing it is the repair.
+            index.unlink(missing_ok=True)
             target = home / "cli"
             target.mkdir(exist_ok=True)
             index.symlink_to(target.resolve())
