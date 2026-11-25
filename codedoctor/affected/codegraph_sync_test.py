@@ -538,13 +538,13 @@ def test_default_type_scopes_need_sync() -> None:
 
 
 @pytest.mark.parametrize(
-    "name",
-    ["TY_CHECK", "PYREFLY_CHECK", "BASEDPYRIGHT", "PYTEST", "MUTATION"],
+    "hook",
+    ["ty-check", "pyrefly-check", "basedpyright", "pytest", "mutation"],
 )
-def test_each_affected_hook_needs_sync(name: str) -> None:
+def test_each_affected_hook_needs_sync_unless_skipped(hook: str) -> None:
     environ = {
-        f"PRECOMMIT_SCOPE_{hook}": "sidecar"
-        for hook in (
+        f"PRECOMMIT_SCOPE_{name}": "sidecar"
+        for name in (
             "TY_CHECK",
             "PYREFLY_CHECK",
             "BASEDPYRIGHT",
@@ -552,8 +552,9 @@ def test_each_affected_hook_needs_sync(name: str) -> None:
             "MUTATION",
         )
     }
-    environ[f"PRECOMMIT_SCOPE_{name}"] = "affected:2"
+    environ[f"PRECOMMIT_SCOPE_{hook.replace('-', '_').upper()}"] = "affected:2"
     assert codegraph_sync.opted_in(environ)
+    assert not codegraph_sync.opted_in({**environ, "SKIP": hook})
 
 
 @pytest.mark.parametrize(
