@@ -156,6 +156,24 @@ def test_worktree_sync_uses_current_files_without_a_backbone(tmp_path: Path) -> 
     assert (root / ".codegraph").resolve() == home / "cli"
 
 
+def test_worktree_sync_relinks_an_index_whose_cache_was_deleted(tmp_path: Path) -> None:
+    """Cleaning /opt/scratch left ``.codegraph`` dangling, and every sync failed."""
+    root = tmp_path / "root"
+    root.mkdir()
+    caches = tmp_path / "caches"
+    (root / ".codegraph").symlink_to(tmp_path / "deleted" / "cli")
+    calls: list[Path] = []
+
+    def run(argv: Sequence[str]) -> int:
+        return _indexer(calls)(Path(argv[-1]))
+
+    assert backbone.sync_worktree(root, caches=caches, run=run) == ""
+    home = backbone.overlay_database(caches, root=root).parent
+    assert (root / ".codegraph").resolve() == home / "cli"
+    assert (home / "cli" / "codegraph.db").is_file()
+    assert calls == [root]
+
+
 def test_worktree_sync_reuses_cached_state_and_locks_the_writer(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()

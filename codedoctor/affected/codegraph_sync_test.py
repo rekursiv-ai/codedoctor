@@ -415,6 +415,23 @@ def test_a_removed_link_is_relinked_to_the_index_it_had(tmp_path: Path) -> None:
     assert (root / ".codegraph").resolve() == overlay.parent / "cli"
 
 
+def test_a_link_whose_cache_was_deleted_is_reseeded(tmp_path: Path) -> None:
+    """Cleaning /opt/scratch left ``.codegraph`` dangling; --cli once kept it so."""
+    _refresh(tmp_path, _Tools())
+    root = tmp_path / "root"
+    root.mkdir()
+    caches = tmp_path / "caches"
+    (root / ".codegraph").symlink_to(tmp_path / "deleted" / "cli")
+
+    assert codegraph_sync.link_cli_index(root, caches=caches) == ""
+
+    overlay = backbone.overlay_database(caches, root=root)
+    assert (root / ".codegraph").resolve() == overlay.parent / "cli"
+    assert backbone.stamped(root / ".codegraph" / "codegraph.db") == (
+        backbone.stamped(backbone.backbone_database(caches))
+    )
+
+
 def test_an_existing_cli_index_is_left_alone(tmp_path: Path) -> None:
     _refresh(tmp_path, _Tools())
     own = tmp_path / "root" / ".codegraph"

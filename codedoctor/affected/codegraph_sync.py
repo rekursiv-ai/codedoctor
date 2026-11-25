@@ -191,7 +191,7 @@ def link_cli_index(root: Path, *, caches: Path) -> str:
 
     """
     index = root / ".codegraph"
-    if index.exists() or index.is_symlink():
+    if index.exists():
         return ""
     database = backbone.backbone_database(caches)
     home = backbone.overlay_database(caches, root=root).parent / "cli"
@@ -205,6 +205,8 @@ def link_cli_index(root: Path, *, caches: Path) -> str:
         home.mkdir(parents=True, exist_ok=True)
         if not seeded.exists():
             shutil.copyfile(database, seeded)
+        # A link into caches someone cleaned dangles; replacing it is the repair.
+        index.unlink(missing_ok=True)
         index.symlink_to(home)
     except OSError as error:
         return f"Linking {index} to {home} failed: {error}"
