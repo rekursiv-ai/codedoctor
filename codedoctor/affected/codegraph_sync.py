@@ -190,6 +190,8 @@ def link_cli_index(root: Path, *, caches: Path) -> str:
       problem: Why ``root`` has no CLI index; empty when it has one.
 
     """
+    if problem := backbone.unlink_dead_index(root, caches=caches):
+        return problem
     index = root / ".codegraph"
     if index.exists():
         return ""
@@ -205,9 +207,7 @@ def link_cli_index(root: Path, *, caches: Path) -> str:
         home.mkdir(parents=True, exist_ok=True)
         if not seeded.exists():
             shutil.copyfile(database, seeded)
-        # A link into caches someone cleaned dangles; replacing it is the repair.
-        index.unlink(missing_ok=True)
-        index.symlink_to(home)
+        index.symlink_to(home.resolve())
     except OSError as error:
         return f"Linking {index} to {home} failed: {error}"
     return ""

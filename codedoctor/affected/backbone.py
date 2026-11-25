@@ -90,10 +90,10 @@ def sync_worktree(
     home.mkdir(parents=True, exist_ok=True)
     with (home / "current.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        if problem := unlink_dead_index(root, caches=caches):
+            return problem
         index = root / ".codegraph"
         if not index.exists():
-            # A link into caches someone cleaned dangles; replacing it is the repair.
-            index.unlink(missing_ok=True)
             target = home / "cli"
             target.mkdir(exist_ok=True)
             index.symlink_to(target.resolve())
@@ -102,6 +102,37 @@ def sync_worktree(
         database = index / "codegraph.db"
         if missing := _missing_columns(database):
             return _renamed(database, missing)
+    return ""
+
+
+def unlink_dead_index(root: Path, *, caches: Path) -> str:
+    """Remove worktree ``root``'s ``.codegraph`` when it is its own index's dead link.
+
+    Caches are rebuildable, so cleaning them leaves the link dangling; removing it
+    lets the caller link a fresh index. Ownership is the link's last three parts,
+    ``overlays/<name>-<hash>/cli``: the hash names this worktree, and the prefix
+    varies, as ``/opt/scratch`` and ``/data/opt/scratch`` are one directory.
+
+    Args:
+      root: The worktree.
+      caches: The CodeGraph cache directory.
+
+    Returns:
+      problem: Why a dead ``.codegraph`` that is not this worktree's was kept;
+        empty otherwise.
+
+    """
+    index = root / ".codegraph"
+    if index.exists() or not index.is_symlink():
+        return ""
+    target = index.readlink()
+    cli = overlay_database(caches, root=root).parent / "cli"
+    if target.parts[-3:] != cli.parts[-3:]:
+        return (
+            f"{index} points to missing {target}, which is not this worktree's "
+            "CodeGraph index; remove the link to have it relinked."
+        )
+    index.unlink()
     return ""
 
 
